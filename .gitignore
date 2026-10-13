@@ -139,3 +139,7 @@ cython_debug/
 
 # Project-specific files
 sandbox/
+.devcontainer/
+.claude/
+_specs/
+_plans/
