@@ -43,12 +43,15 @@ OUTPUT_DIR = REPO_ROOT / "data" / "embeddings"
 # criteria_retrieval.py lives in a sibling directory with no shared package
 # namespace (neither src/embeddings/ nor src/preprocessing/ has an
 # __init__.py, consistent with both modules being invoked as standalone
-# scripts). Add it to sys.path explicitly so condition_to_slug can't drift
-# between the two pipeline steps.
-sys.path.insert(0, str(REPO_ROOT / "src" / "preprocessing"))
+# scripts). Add the src/ root to sys.path explicitly so this still works
+# when the script is run directly (e.g. `python src/embeddings/
+# criteria_embedding.py`) rather than via the installed package, whose
+# editable-install .pth file would otherwise be the only thing putting
+# src/ on sys.path.
+sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from preprocessing.criteria_retrieval import EligibilityCriteriaFetcher 
-from embeddings.EmbeddingModel import EmbeddingModel, build_embedding_model
+from preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
+from embeddings.embedding_model import EmbeddingModel, build_embedding_model
 
 logger = logging.getLogger(__name__)
 
