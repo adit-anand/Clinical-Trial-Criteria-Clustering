@@ -17,6 +17,10 @@ Pipeline for building embeddings of clinical trial eligibility criteria:
    no fixed cluster count), writing cluster assignments plus performance
    metrics in a parallel format. Read/validate/write logic shared between
    the two clustering approaches lives in `src/clustering/clustering_io.py`.
+5. **`src/clustering/clustering_report.py`** — reads the metrics JSON already
+   written by whichever of the clustering steps above have been run for a
+   condition, and writes one consolidated Markdown report comparing their
+   performance side by side.
 
 ## Setup
 
@@ -213,6 +217,44 @@ files; there is no append/skip-if-exists/merge behavior.
 | `--assignments-output-path`        | no       | Override the default output cluster-assignments Parquet path (`data/clustering/hdbscan/<condition_slug>_trials_hdbscan_clusters.parquet`). |
 | `--metrics-output-path`            | no       | Override the default output metrics JSON path (`data/clustering/hdbscan/<condition_slug>_trials_hdbscan_cluster_metrics.json`). |
 
+## 5. Clustering performance report
+
+```bash
+python -m src.clustering.clustering_report "breast cancer"
+```
+
+This reads whichever of the k-means/HDBSCAN metrics JSON files already exist
+for the condition — it never re-runs clustering — and writes a single
+consolidated Markdown report comparing their performance:
+
+```
+data/clustering/reports/<condition_slug>_clustering_report_<timestamp>.md
+```
+
+The report includes a summary table of each algorithm's availability, a
+shared-metrics comparison table (silhouette score, Davies-Bouldin index,
+Calinski-Harabasz index — the three metrics computed identically by both
+algorithms), and a detailed section per algorithm covering its own
+algorithm-specific fields (e.g. inertia and `k` selection for k-means; noise
+count/fraction for HDBSCAN) plus its `metrics_valid`/`notes` status verbatim.
+The report also calls out which algorithm has the best (highest) silhouette
+score among those with valid metrics, since silhouette score is the only
+metric comparable across every algorithm's schema.
+
+If an algorithm hasn't been run yet for the condition, or its metrics file is
+missing/unreadable, that algorithm's section clearly states so (naming the
+exact path that was checked) instead of being silently omitted or aborting
+the whole report. Each run writes a new timestamped file; prior reports for
+the same condition are never overwritten or appended to.
+
+### Arguments
+
+| Argument       | Required | Description                                                                 |
+| --------------- | -------- | ---------------------------------------------------------------------------- |
+| `condition`      | yes      | Condition to report on, e.g. `"breast cancer"`. Must match the condition passed to `kmeans_clustering.py`/`hdbscan_clustering.py` (used to derive the metrics files to read). |
+| `--output-dir`   | no       | Override the default report output directory (`data/clustering/reports`). |
+| `--print`        | no       | Also print the generated report to stdout, in addition to writing the file. |
+
 ### Example: full pipeline for one condition
 
 ```bash
@@ -220,4 +262,5 @@ python -m src.preprocessing.criteria_retrieval "breast cancer"
 python -m src.embeddings.criteria_embedding "breast cancer" --backend huggingface
 python -m src.clustering.kmeans_clustering "breast cancer"
 python -m src.clustering.hdbscan_clustering "breast cancer"
+python -m src.clustering.clustering_report "breast cancer"
 ```
