@@ -30,25 +30,17 @@ are never overwritten or appended to.
 import argparse
 import json
 import logging
-import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Literal
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+from src.paths import REPO_ROOT
+from src.preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
+
+from . import hdbscan_clustering, kmeans_clustering
+
 DEFAULT_REPORT_OUTPUT_DIR = REPO_ROOT / "data" / "clustering" / "reports"
-
-# clustering_io.py, kmeans_clustering.py, hdbscan_clustering.py, and
-# criteria_retrieval.py live in sibling directories with no shared package
-# namespace (none of src/clustering/, src/preprocessing/ has an __init__.py,
-# consistent with these modules being invoked as standalone scripts). Add the
-# src/ root to sys.path explicitly so this still works when this script is
-# run directly rather than via the installed package.
-sys.path.insert(0, str(REPO_ROOT / "src"))
-
-from clustering import hdbscan_clustering, kmeans_clustering
-from preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
 
 logger = logging.getLogger(__name__)
 

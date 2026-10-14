@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "hdbscan>=0.8.44",
     "pyarrow>=21.0.0",
     "python-dotenv>=1.2.4",
     "requests>=2.34.2",

@@ -13,7 +13,6 @@ algorithm's own module.
 """
 
 import json
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -21,17 +20,10 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+from src.paths import REPO_ROOT
+from src.preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
+
 EMBEDDINGS_INPUT_DIR = REPO_ROOT / "data" / "embeddings"
-
-# criteria_retrieval.py lives in a sibling directory with no shared package
-# namespace (neither src/clustering/ nor src/preprocessing/ has an
-# __init__.py, consistent with both modules being invoked as standalone
-# scripts). Add the src/ root to sys.path explicitly so this still works
-# when a script is run directly rather than via the installed package.
-sys.path.insert(0, str(REPO_ROOT / "src"))
-
-from preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
 
 
 def read_embeddings_parquet(input_path: Path) -> pa.Table:

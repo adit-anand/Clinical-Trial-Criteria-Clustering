@@ -29,29 +29,19 @@ file wholesale — there is no append/skip-if-exists/merge behavior.
 import argparse
 import csv
 import logging
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+from src.paths import REPO_ROOT
+from src.preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
+
+from .embedding_model import EmbeddingModel, build_embedding_model
+
 INPUT_DIR = REPO_ROOT / "data" / "eligibility_criteria"
 OUTPUT_DIR = REPO_ROOT / "data" / "embeddings"
-
-# criteria_retrieval.py lives in a sibling directory with no shared package
-# namespace (neither src/embeddings/ nor src/preprocessing/ has an
-# __init__.py, consistent with both modules being invoked as standalone
-# scripts). Add the src/ root to sys.path explicitly so this still works
-# when the script is run directly (e.g. `python src/embeddings/
-# criteria_embedding.py`) rather than via the installed package, whose
-# editable-install .pth file would otherwise be the only thing putting
-# src/ on sys.path.
-sys.path.insert(0, str(REPO_ROOT / "src"))
-
-from preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
-from embeddings.embedding_model import EmbeddingModel, build_embedding_model
 
 logger = logging.getLogger(__name__)
 

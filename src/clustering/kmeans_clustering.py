@@ -33,7 +33,6 @@ k-means-specific logic (fitting, `k` selection, k-means's own metrics guard).
 import argparse
 import logging
 import math
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -42,18 +41,12 @@ import pyarrow as pa
 from sklearn.cluster import KMeans
 from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score, silhouette_score
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+from src.paths import REPO_ROOT
+from src.preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
+
+from . import clustering_io
+
 OUTPUT_DIR = REPO_ROOT / "data" / "clustering" / "kmeans"
-
-# clustering_io.py and criteria_retrieval.py live in sibling directories with
-# no shared package namespace (none of src/clustering/, src/preprocessing/
-# has an __init__.py, consistent with these modules being invoked as
-# standalone scripts). Add the src/ root to sys.path explicitly so this still
-# works when the script is run directly rather than via the installed package.
-sys.path.insert(0, str(REPO_ROOT / "src"))
-
-from clustering import clustering_io
-from preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
 
 logger = logging.getLogger(__name__)
 
@@ -156,11 +149,11 @@ class KMeansClusterer:
             n_samples: Number of embeddings available to cluster.
 
         Returns:
-            `min(100, floor(sqrt(n_samples / 2)))`, clipped to `n_samples - 1`
+            `min(25, floor(sqrt(n_samples / 2)))`, clipped to `n_samples - 1`
             (silhouette's hard ceiling on `k`).
         """
         heuristic = int(math.sqrt(n_samples / 2))
-        return min(100, heuristic, n_samples - 1)
+        return min(25, heuristic, n_samples - 1)
 
     def validate_k_range(self, n_samples: int, k_min: int, k_max: int) -> None:
         """Confirm a `[k_min, k_max]` search range is usable for this dataset.

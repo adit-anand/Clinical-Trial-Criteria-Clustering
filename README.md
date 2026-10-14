@@ -5,7 +5,10 @@ Pipeline for building embeddings of clinical trial eligibility criteria:
 1. **`src/preprocessing/criteria_retrieval.py`** — fetches NCI-affiliated
    clinical trials for a condition from ClinicalTrials.gov, retrieves their
    eligibility criteria from the NCI CTRP API, parses them into atomic
-   inclusion/exclusion criteria, and writes them to a CSV.
+   inclusion/exclusion criteria, and writes them to a CSV. Each concern lives
+   in its own module (`clinicaltrials_client.py`, `ctrp_client.py`,
+   `criteria_parser.py`); `criteria_retrieval.py` composes them and exposes
+   the CLI.
 2. **`src/embeddings/criteria_embedding.py`** — reads that CSV, embeds each
    criterion's text with a configurable backend, and writes the result to a
    Parquet file.
@@ -21,6 +24,50 @@ Pipeline for building embeddings of clinical trial eligibility criteria:
    written by whichever of the clustering steps above have been run for a
    condition, and writes one consolidated Markdown report comparing their
    performance side by side.
+6. **`src/clustering/hdbscan_sweep.py`** — tries multiple combinations of
+   HDBSCAN's hyperparameters for a condition's existing embeddings, and
+   writes the best-performing combination's cluster assignments and metrics
+   as that condition's HDBSCAN output.
+
+## Project structure
+
+`src/preprocessing/`, `src/embeddings/`, and `src/clustering/` are real
+Python packages (each has an `__init__.py`), so every pipeline module runs
+as `uv run python -m src.<package>.<module>` and imports its siblings as ordinary
+package imports — same-package modules via relative imports (e.g. `from
+. import clustering_io`), cross-package ones via the fully-qualified path
+(e.g. `from src.preprocessing.criteria_retrieval import
+EligibilityCriteriaFetcher`). The one constant every module needs — the
+repo root — is centralized in `src/paths.py` rather than re-derived in each
+file.
+
+```
+src/
+├── paths.py                              # shared REPO_ROOT constant
+├── preprocessing/
+│   ├── clinicaltrials_client.py          # ClinicalTrials.gov search
+│   ├── ctrp_client.py                    # CTRP API fetch + retry
+│   ├── criteria_parser.py                # unstructured-text -> atomic criteria
+│   └── criteria_retrieval.py             # orchestration + CLI (step 1)
+├── embeddings/
+│   ├── embedding_model.py                # EmbeddingModel interface + backends
+│   └── criteria_embedding.py             # orchestration + CLI (step 2)
+└── clustering/
+    ├── clustering_io.py                  # shared read/write logic
+    ├── kmeans_clustering.py              # step 3
+    ├── hdbscan_clustering.py             # step 4
+    ├── clustering_report.py              # step 5
+    └── hdbscan_sweep.py                  # step 6
+```
+
+Within `src/clustering/`, `clustering_io.py` holds everything genuinely
+common to both clustering algorithms (reading/validating embeddings,
+resolving default I/O paths, writing output); `kmeans_clustering.py` and
+`hdbscan_clustering.py` each hold only their own algorithm's fitting and
+metrics logic, so adding a third clustering algorithm means adding one new
+sibling module, not touching the shared I/O layer or the other algorithms.
+`clustering_report.py` and `hdbscan_sweep.py` build on top of that same
+layer without modifying it.
 
 ## Setup
 
@@ -55,7 +102,7 @@ HF_TOKEN=your-token-here
 ## 1. Fetching eligibility criteria
 
 ```bash
-python -m src.preprocessing.criteria_retrieval "breast cancer"
+uv run python -m src.preprocessing.criteria_retrieval "breast cancer"
 ```
 
 This searches ClinicalTrials.gov for interventional trials sponsored/affiliated
@@ -79,7 +126,7 @@ with columns `nct_id`, `study_first_posted_date`, `criterion_text`,
 ## 2. Embedding criteria
 
 ```bash
-python -m src.embeddings.criteria_embedding "breast cancer" --backend huggingface
+uv run python -m src.embeddings.criteria_embedding "breast cancer" --backend huggingface
 ```
 
 This reads the CSV produced by the step above, embeds each row's
@@ -121,14 +168,14 @@ file; there is no append/skip-if-exists/merge behavior.
 ## 3. Clustering criteria
 
 ```bash
-python -m src.clustering.kmeans_clustering "breast cancer"
+uv run python -m src.clustering.kmeans_clustering "breast cancer"
 ```
 
 This reads the Parquet file produced by the step above, drops rows whose
 embedding failed, and clusters the remaining embedding vectors via k-means.
 By default, the number of clusters (`k`) is **selected automatically**:
 k-means is fit once per candidate `k` in a search range (`--k-min` to
-`--k-max`, default `2` to `min(100, floor(sqrt(n_samples / 2)), n_samples - 1)`),
+`--k-max`, default `2` to `min(25, floor(sqrt(n_samples / 2)), n_samples - 1)`),
 and the `k` with the highest silhouette score is kept. Pass `--n-clusters` to
 skip the search and force a specific `k` instead. Either way, it writes:
 
@@ -161,7 +208,7 @@ files; there is no append/skip-if-exists/merge behavior.
 | `condition`                    | yes      | Condition to cluster, e.g. `"breast cancer"`. Must match the condition passed to `criteria_embedding.py` (used to derive default input/output paths). |
 | `--n-clusters`                 | no       | Fix the number of k-means clusters and skip automatic selection (default: auto-select via a silhouette-score sweep). |
 | `--k-min`                      | no       | Minimum `k` to search when auto-selecting; ignored if `--n-clusters` is set (default: `2`). |
-| `--k-max`                      | no       | Maximum `k` to search when auto-selecting; ignored if `--n-clusters` is set (default: `min(100, floor(sqrt(n_samples / 2)), n_samples - 1)`). |
+| `--k-max`                      | no       | Maximum `k` to search when auto-selecting; ignored if `--n-clusters` is set (default: `min(25, floor(sqrt(n_samples / 2)), n_samples - 1)`). |
 | `--random-state`               | no       | Random seed for k-means initialization, for reproducibility (default: `42`). |
 | `--n-init`                     | no       | Number of k-means initializations to run per `k` (default: `10`). |
 | `--max-iter`                   | no       | Maximum k-means iterations per initialization (default: `300`). |
@@ -172,7 +219,7 @@ files; there is no append/skip-if-exists/merge behavior.
 ## 4. HDBSCAN clustering criteria
 
 ```bash
-python -m src.clustering.hdbscan_clustering "breast cancer"
+uv run python -m src.clustering.hdbscan_clustering "breast cancer"
 ```
 
 This reads the same embeddings Parquet file as the k-means step, drops rows
@@ -213,6 +260,7 @@ files; there is no append/skip-if-exists/merge behavior.
 | `--metric`                         | no       | Distance metric to use (default: `euclidean`). |
 | `--cluster-selection-epsilon`      | no       | Distance threshold below which clusters are merged (default: `0.0`). |
 | `--cluster-selection-method`       | no       | `eom` (excess of mass) or `leaf` (default: `eom`). |
+| `--alpha`                          | no       | Distance scaling parameter used in robust single linkage (default: `1.0`). |
 | `--input-path`                     | no       | Override the default input embeddings Parquet path (`data/embeddings/<condition_slug>_trials_embeddings.parquet`). |
 | `--assignments-output-path`        | no       | Override the default output cluster-assignments Parquet path (`data/clustering/hdbscan/<condition_slug>_trials_hdbscan_clusters.parquet`). |
 | `--metrics-output-path`            | no       | Override the default output metrics JSON path (`data/clustering/hdbscan/<condition_slug>_trials_hdbscan_cluster_metrics.json`). |
@@ -220,7 +268,7 @@ files; there is no append/skip-if-exists/merge behavior.
 ## 5. Clustering performance report
 
 ```bash
-python -m src.clustering.clustering_report "breast cancer"
+uv run python -m src.clustering.clustering_report "breast cancer"
 ```
 
 This reads whichever of the k-means/HDBSCAN metrics JSON files already exist
@@ -255,12 +303,64 @@ the same condition are never overwritten or appended to.
 | `--output-dir`   | no       | Override the default report output directory (`data/clustering/reports`). |
 | `--print`        | no       | Also print the generated report to stdout, in addition to writing the file. |
 
+## 6. HDBSCAN hyperparameter sweep
+
+```bash
+uv run python -m src.clustering.hdbscan_sweep "breast cancer" --min-cluster-size 5,10,15 --alpha 0.8,1.0,1.2
+```
+
+This reads the same embeddings Parquet file as the ordinary HDBSCAN step and
+fits HDBSCAN once per combination in the Cartesian product of the supplied
+`--min-cluster-size`/`--min-samples`/`--cluster-selection-epsilon`/`--alpha`
+value lists (`--metric`/`--cluster-selection-method` are held fixed across
+the whole sweep, not swept). Each combination's clustering performance
+metrics are logged as the sweep runs; no separate sweep-results file is
+written. Once every combination has been tried, the single best one — by
+relative validity index (DBCV, higher is better), with noise fraction (lower
+is better) as a tiebreaker — has its cluster assignments and metrics written
+to the condition's normal HDBSCAN output location, exactly as if
+`hdbscan_clustering.py` had been run directly with those parameters:
+
+```
+data/clustering/hdbscan/<condition_slug>_trials_hdbscan_clusters.parquet
+data/clustering/hdbscan/<condition_slug>_trials_hdbscan_cluster_metrics.json
+```
+
+The written metrics JSON has the same schema as an ordinary HDBSCAN run,
+plus one extra field, `relative_validity_index`, recording the DBCV score
+that decided the winner. A combination invalid for the dataset (e.g.
+`--min-samples` exceeding the sample count) is logged as skipped rather than
+aborting the rest of the sweep; a combination that fits but produces a
+degenerate result (e.g. all noise) is logged but never eligible to win. If
+no combination produces a usable relative validity index, nothing is
+written. Re-running the sweep for the same condition overwrites the prior
+HDBSCAN output, exactly as re-running `hdbscan_clustering.py` directly would.
+The total number of combinations (the product of all four swept lists'
+lengths) is capped at 50; exceeding it raises an error before any fitting is
+attempted.
+
+### Arguments
+
+| Argument                        | Required | Description                                                                 |
+| --------------------------------- | -------- | ---------------------------------------------------------------------------- |
+| `condition`                        | yes      | Condition to sweep, e.g. `"breast cancer"`. Must match the condition passed to `criteria_embedding.py` (used to derive default input/output paths). |
+| `--min-cluster-size`               | no       | Comma-separated list of `min_cluster_size` values to try (default: `5`). |
+| `--min-samples`                    | no       | Comma-separated list of `min_samples` values to try (default: `5`). |
+| `--cluster-selection-epsilon`      | no       | Comma-separated list of `cluster_selection_epsilon` values to try (default: `0.0`). |
+| `--alpha`                          | no       | Comma-separated list of `alpha` values to try (default: `1.0`). |
+| `--metric`                         | no       | Distance metric to use, held fixed across the sweep (default: `euclidean`). |
+| `--cluster-selection-method`       | no       | `eom` or `leaf`, held fixed across the sweep (default: `eom`). |
+| `--input-path`                     | no       | Override the default input embeddings Parquet path (`data/embeddings/<condition_slug>_trials_embeddings.parquet`). |
+| `--assignments-output-path`        | no       | Override the default output cluster-assignments Parquet path (`data/clustering/hdbscan/<condition_slug>_trials_hdbscan_clusters.parquet`). |
+| `--metrics-output-path`            | no       | Override the default output metrics JSON path (`data/clustering/hdbscan/<condition_slug>_trials_hdbscan_cluster_metrics.json`). |
+
 ### Example: full pipeline for one condition
 
 ```bash
-python -m src.preprocessing.criteria_retrieval "breast cancer"
-python -m src.embeddings.criteria_embedding "breast cancer" --backend huggingface
-python -m src.clustering.kmeans_clustering "breast cancer"
-python -m src.clustering.hdbscan_clustering "breast cancer"
-python -m src.clustering.clustering_report "breast cancer"
+uv run python -m src.preprocessing.criteria_retrieval "breast cancer"
+uv run python -m src.embeddings.criteria_embedding "breast cancer" --backend huggingface
+uv run python -m src.clustering.kmeans_clustering "breast cancer"
+uv run python -m src.clustering.hdbscan_clustering "breast cancer"
+uv run python -m src.clustering.clustering_report "breast cancer"
+uv run python -m src.clustering.hdbscan_sweep "breast cancer" --min-cluster-size 5,10,15
 ```

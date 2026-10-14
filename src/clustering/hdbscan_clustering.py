@@ -30,7 +30,6 @@ HDBSCAN-specific logic (fitting, noise-aware metrics, probability output).
 
 import argparse
 import logging
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -39,18 +38,12 @@ import pyarrow as pa
 from sklearn.cluster import HDBSCAN
 from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score, silhouette_score
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+from src.paths import REPO_ROOT
+from src.preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
+
+from . import clustering_io
+
 OUTPUT_DIR = REPO_ROOT / "data" / "clustering" / "hdbscan"
-
-# clustering_io.py lives in a sibling module with no shared package
-# namespace (src/clustering/ has no __init__.py, consistent with this
-# module being invoked as a standalone script). Add the src/ root to
-# sys.path explicitly so this still works when run directly rather than
-# via the installed package.
-sys.path.insert(0, str(REPO_ROOT / "src"))
-
-from clustering import clustering_io
-from preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +78,7 @@ class HDBSCANClusterer:
     DEFAULT_METRIC = "euclidean"
     DEFAULT_CLUSTER_SELECTION_EPSILON = 0.0
     DEFAULT_CLUSTER_SELECTION_METHOD = "eom"
+    DEFAULT_ALPHA = 1.0
 
     def __init__(
         self,
@@ -93,6 +87,7 @@ class HDBSCANClusterer:
         metric: str = DEFAULT_METRIC,
         cluster_selection_epsilon: float = DEFAULT_CLUSTER_SELECTION_EPSILON,
         cluster_selection_method: str = DEFAULT_CLUSTER_SELECTION_METHOD,
+        alpha: float = DEFAULT_ALPHA,
     ):
         """Store HDBSCAN configuration for this clusterer.
 
@@ -109,12 +104,14 @@ class HDBSCANClusterer:
             cluster_selection_epsilon: A distance threshold below which
                 clusters are merged (0.0 disables this).
             cluster_selection_method: `"eom"` (excess of mass) or `"leaf"`.
+            alpha: Distance scaling parameter used in robust single linkage.
         """
         self.min_cluster_size = min_cluster_size
         self.min_samples = min_samples
         self.metric = metric
         self.cluster_selection_epsilon = cluster_selection_epsilon
         self.cluster_selection_method = cluster_selection_method
+        self.alpha = alpha
 
     def validate_hyperparameters(self, n_samples: int) -> None:
         """Confirm the configured hyperparameters are usable for this dataset.
@@ -128,14 +125,17 @@ class HDBSCANClusterer:
             n_samples: Number of embeddings available to cluster.
 
         Raises:
-            ValueError: If `min_cluster_size` is less than 1, or if the
-                effective `min_samples` (explicit value, or `min_cluster_size`
-                if unset) exceeds `n_samples` — naming both numbers, pre-empting
-                sklearn's own less-contextualized `ValueError` for the same
-                condition (confirmed empirically to occur otherwise).
+            ValueError: If `min_cluster_size` is less than 1, if `alpha` is
+                not greater than 0, or if the effective `min_samples`
+                (explicit value, or `min_cluster_size` if unset) exceeds
+                `n_samples` — naming both numbers, pre-empting sklearn's own
+                less-contextualized `ValueError` for the same condition
+                (confirmed empirically to occur otherwise).
         """
         if self.min_cluster_size < 1:
             raise ValueError(f"min_cluster_size must be at least 1, got {self.min_cluster_size}")
+        if self.alpha <= 0:
+            raise ValueError(f"alpha must be greater than 0, got {self.alpha}")
         effective_min_samples = self.min_samples if self.min_samples is not None else self.min_cluster_size
         if effective_min_samples > n_samples:
             raise ValueError(
@@ -160,6 +160,7 @@ class HDBSCANClusterer:
             metric=self.metric,
             cluster_selection_epsilon=self.cluster_selection_epsilon,
             cluster_selection_method=self.cluster_selection_method,
+            alpha=self.alpha,
             copy=True,
         )
         model.fit(embedding_matrix)
@@ -324,6 +325,7 @@ class HDBSCANClusterer:
                 "metric": self.metric,
                 "cluster_selection_epsilon": self.cluster_selection_epsilon,
                 "cluster_selection_method": self.cluster_selection_method,
+                "alpha": self.alpha,
             },
             "metrics": metrics_result["metrics"],
             "metrics_valid": metrics_result["metrics_valid"],
@@ -474,6 +476,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Cluster selection method: 'eom' (excess of mass) or 'leaf' (default: eom)",
     )
     parser.add_argument(
+        "--alpha",
+        type=float,
+        default=HDBSCANClusterer.DEFAULT_ALPHA,
+        help="Distance scaling parameter used in robust single linkage (default: 1.0)",
+    )
+    parser.add_argument(
         "--input-path",
         type=Path,
         default=None,
@@ -506,6 +514,7 @@ def main() -> None:
         metric=args.metric,
         cluster_selection_epsilon=args.cluster_selection_epsilon,
         cluster_selection_method=args.cluster_selection_method,
+        alpha=args.alpha,
     )
     clusterer.run(
         args.condition,

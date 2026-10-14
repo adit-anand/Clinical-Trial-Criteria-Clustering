@@ -20,13 +20,12 @@ import logging
 import os
 import time
 from abc import ABC, abstractmethod
-from pathlib import Path
 from typing import ClassVar
 
 import requests
 from dotenv import load_dotenv
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+from src.paths import REPO_ROOT
 
 logger = logging.getLogger(__name__)
 
