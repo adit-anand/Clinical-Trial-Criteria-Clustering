@@ -1,6 +1,6 @@
 """Cluster per-condition eligibility criteria embeddings via HDBSCAN.
 
-Reads the same embeddings Parquet file as `criteria_clustering.py`
+Reads the same embeddings Parquet file as `kmeans_clustering.py`
 (``data/embeddings/<condition>_trials_embeddings.parquet``), drops rows whose
 embedding failed, and fits a `sklearn.cluster.HDBSCAN` model over the
 remaining embedding vectors. Unlike k-means, HDBSCAN discovers clusters of
@@ -24,7 +24,7 @@ Re-running this step on the same condition overwrites both existing output
 files wholesale — there is no append/skip-if-exists/merge behavior.
 
 Read/validate/write logic shared with the k-means clustering pipeline (see
-`criteria_clustering.py`) lives in `clustering_io.py`; this module holds only
+`kmeans_clustering.py`) lives in `clustering_io.py`; this module holds only
 HDBSCAN-specific logic (fitting, noise-aware metrics, probability output).
 """
 
@@ -72,7 +72,7 @@ HDBSCAN_CLUSTER_PARQUET_SCHEMA = pa.schema(
 class HDBSCANClusterer:
     """Orchestrates the read -> filter -> cluster -> score -> write pipeline for one condition.
 
-    Unlike `CriteriaClusterer`, there is no "auto vs. fixed k" branching —
+    Unlike `KMeansClusterer`, there is no "auto vs. fixed k" branching —
     HDBSCAN always discovers its own cluster count from the data; only its
     density hyperparameters are configurable.
 

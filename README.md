@@ -9,7 +9,7 @@ Pipeline for building embeddings of clinical trial eligibility criteria:
 2. **`src/embeddings/criteria_embedding.py`** — reads that CSV, embeds each
    criterion's text with a configurable backend, and writes the result to a
    Parquet file.
-3. **`src/clustering/criteria_clustering.py`** — reads that Parquet file,
+3. **`src/clustering/kmeans_clustering.py`** — reads that Parquet file,
    clusters the embedding vectors via k-means, and writes cluster
    assignments plus clustering performance metrics.
 4. **`src/clustering/hdbscan_clustering.py`** — reads the same Parquet file
@@ -117,7 +117,7 @@ file; there is no append/skip-if-exists/merge behavior.
 ## 3. Clustering criteria
 
 ```bash
-python -m src.clustering.criteria_clustering "breast cancer"
+python -m src.clustering.kmeans_clustering "breast cancer"
 ```
 
 This reads the Parquet file produced by the step above, drops rows whose
@@ -218,6 +218,6 @@ files; there is no append/skip-if-exists/merge behavior.
 ```bash
 python -m src.preprocessing.criteria_retrieval "breast cancer"
 python -m src.embeddings.criteria_embedding "breast cancer" --backend huggingface
-python -m src.clustering.criteria_clustering "breast cancer"
+python -m src.clustering.kmeans_clustering "breast cancer"
 python -m src.clustering.hdbscan_clustering "breast cancer"
 ```

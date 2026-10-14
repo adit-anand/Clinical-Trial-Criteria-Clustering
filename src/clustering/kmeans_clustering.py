@@ -57,7 +57,7 @@ from preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
 
 logger = logging.getLogger(__name__)
 
-CLUSTER_PARQUET_SCHEMA = pa.schema(
+KMEANS_CLUSTER_PARQUET_SCHEMA = pa.schema(
     [
         ("nct_id", pa.string()),
         ("study_first_posted_date", pa.string()),
@@ -71,7 +71,7 @@ CLUSTER_PARQUET_SCHEMA = pa.schema(
 )
 
 
-class CriteriaClusterer:
+class KMeansClusterer:
     """Orchestrates the read -> filter -> cluster -> score -> write pipeline for one condition.
 
     Unlike `CriteriaEmbedder`/`EligibilityCriteriaFetcher`, this class holds
@@ -80,10 +80,10 @@ class CriteriaClusterer:
     constructed and fit per `run()` call since it is stateful per dataset.
 
     Typical usage:
-        clusterer = CriteriaClusterer()  # auto-selects k via silhouette score
+        clusterer = KMeansClusterer()  # auto-selects k via silhouette score
         assignments_path, metrics_path = clusterer.run("breast cancer")
 
-        clusterer = CriteriaClusterer(n_clusters=20)  # fixed k, skips the search
+        clusterer = KMeansClusterer(n_clusters=20)  # fixed k, skips the search
         assignments_path, metrics_path = clusterer.run("breast cancer")
     """
 
@@ -335,7 +335,7 @@ class CriteriaClusterer:
             clustered_at: Wall-clock time this clustering run completed.
 
         Returns:
-            One output dict per row, matching `CLUSTER_PARQUET_SCHEMA`'s columns.
+            One output dict per row, matching `KMEANS_CLUSTER_PARQUET_SCHEMA`'s columns.
         """
         columns = clustering_io.extract_traceability_columns(table)
 
@@ -506,7 +506,7 @@ class CriteriaClusterer:
 
         clustered_at = datetime.now(timezone.utc)
         rows = self.build_assignment_rows(filtered, labels, clustered_at)
-        clustering_io.write_parquet(rows, CLUSTER_PARQUET_SCHEMA, assignments_output_path)
+        clustering_io.write_parquet(rows, KMEANS_CLUSTER_PARQUET_SCHEMA, assignments_output_path)
 
         embedding_backend = filtered.column("embedding_backend")[0].as_py()
         embedding_model = filtered.column("embedding_model")[0].as_py()
@@ -580,7 +580,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--k-min",
         type=int,
-        default=CriteriaClusterer.DEFAULT_K_MIN,
+        default=KMeansClusterer.DEFAULT_K_MIN,
         help="Minimum k to search when auto-selecting (ignored if --n-clusters is set; default: 2)",
     )
     parser.add_argument(
@@ -595,19 +595,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--random-state",
         type=int,
-        default=CriteriaClusterer.DEFAULT_RANDOM_STATE,
+        default=KMeansClusterer.DEFAULT_RANDOM_STATE,
         help="Random seed for k-means initialization, for reproducibility (default: 42)",
     )
     parser.add_argument(
         "--n-init",
         type=int,
-        default=CriteriaClusterer.DEFAULT_N_INIT,
+        default=KMeansClusterer.DEFAULT_N_INIT,
         help="Number of k-means initializations to run (default: 10)",
     )
     parser.add_argument(
         "--max-iter",
         type=int,
-        default=CriteriaClusterer.DEFAULT_MAX_ITER,
+        default=KMeansClusterer.DEFAULT_MAX_ITER,
         help="Maximum k-means iterations per initialization (default: 300)",
     )
     parser.add_argument(
@@ -637,7 +637,7 @@ def main() -> None:
 
     args = build_arg_parser().parse_args()
 
-    clusterer = CriteriaClusterer(
+    clusterer = KMeansClusterer(
         n_clusters=args.n_clusters,
         k_min=args.k_min,
         k_max=args.k_max,

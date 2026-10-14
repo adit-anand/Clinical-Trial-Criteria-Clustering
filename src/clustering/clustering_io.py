@@ -1,6 +1,6 @@
 """Shared, algorithm-agnostic I/O for the clustering pipeline stages.
 
-Both `criteria_clustering.py` (k-means) and `hdbscan_clustering.py` (HDBSCAN)
+Both `kmeans_clustering.py` (k-means) and `hdbscan_clustering.py` (HDBSCAN)
 read the same embeddings Parquet input format and write cluster assignments
 plus a metrics JSON in a similar shape. This module holds the logic that is
 genuinely common to both — reading/filtering/validating the input embeddings
