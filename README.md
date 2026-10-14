@@ -12,6 +12,11 @@ Pipeline for building embeddings of clinical trial eligibility criteria:
 3. **`src/clustering/criteria_clustering.py`** — reads that Parquet file,
    clusters the embedding vectors via k-means, and writes cluster
    assignments plus clustering performance metrics.
+4. **`src/clustering/hdbscan_clustering.py`** — reads the same Parquet file
+   and clusters the embedding vectors via HDBSCAN (density-based clustering,
+   no fixed cluster count), writing cluster assignments plus performance
+   metrics in a parallel format. Read/validate/write logic shared between
+   the two clustering approaches lives in `src/clustering/clustering_io.py`.
 
 ## Setup
 
@@ -124,8 +129,8 @@ and the `k` with the highest silhouette score is kept. Pass `--n-clusters` to
 skip the search and force a specific `k` instead. Either way, it writes:
 
 ```
-data/clustering/<condition_slug>_trials_clusters.parquet
-data/clustering/<condition_slug>_trials_cluster_metrics.json
+data/clustering/kmeans/<condition_slug>_trials_clusters.parquet
+data/clustering/kmeans/<condition_slug>_trials_cluster_metrics.json
 ```
 
 The Parquet file has one row per successfully-embedded criterion, containing
@@ -157,8 +162,56 @@ files; there is no append/skip-if-exists/merge behavior.
 | `--n-init`                     | no       | Number of k-means initializations to run per `k` (default: `10`). |
 | `--max-iter`                   | no       | Maximum k-means iterations per initialization (default: `300`). |
 | `--input-path`                 | no       | Override the default input embeddings Parquet path (`data/embeddings/<condition_slug>_trials_embeddings.parquet`). |
-| `--assignments-output-path`    | no       | Override the default output cluster-assignments Parquet path (`data/clustering/<condition_slug>_trials_clusters.parquet`). |
-| `--metrics-output-path`        | no       | Override the default output metrics JSON path (`data/clustering/<condition_slug>_trials_cluster_metrics.json`). |
+| `--assignments-output-path`    | no       | Override the default output cluster-assignments Parquet path (`data/clustering/kmeans/<condition_slug>_trials_clusters.parquet`). |
+| `--metrics-output-path`        | no       | Override the default output metrics JSON path (`data/clustering/kmeans/<condition_slug>_trials_cluster_metrics.json`). |
+
+## 4. HDBSCAN clustering criteria
+
+```bash
+python -m src.clustering.hdbscan_clustering "breast cancer"
+```
+
+This reads the same embeddings Parquet file as the k-means step, drops rows
+whose embedding failed, and clusters the remaining embedding vectors via
+HDBSCAN (density-based clustering). Unlike k-means, there is no cluster count
+to choose — HDBSCAN discovers clusters of varying density directly from the
+data, and explicitly labels points that don't belong to any cluster as noise
+(`cluster_id == -1`). It writes:
+
+```
+data/clustering/hdbscan/<condition_slug>_trials_hdbscan_clusters.parquet
+data/clustering/hdbscan/<condition_slug>_trials_hdbscan_cluster_metrics.json
+```
+
+The Parquet file has one row per successfully-embedded criterion, containing
+`nct_id`, `study_first_posted_date`, `criterion_text`, `criterion_type`,
+`cluster_id` (`-1` for noise), `cluster_probability` (HDBSCAN's cluster
+membership strength, `0.0` for noise points), `embedding_backend`,
+`embedding_model`, and `clustered_at`. The JSON file reports run provenance
+(sample/cluster counts, HDBSCAN parameters, `noise_count`/`noise_fraction`)
+plus clustering performance metrics — silhouette score, the Davies-Bouldin
+index, and the Calinski-Harabasz index — computed only over non-noise points.
+As with the k-means step, those three metrics require between 2 and
+`n_non_noise - 1` distinct clusters among non-noise points to be computable;
+if a run falls outside that range (e.g. an all-noise result), they are
+reported as `null` with an explanatory note and `metrics_valid` is `false`.
+
+Re-running this step for the same condition overwrites both existing output
+files; there is no append/skip-if-exists/merge behavior.
+
+### Arguments
+
+| Argument                        | Required | Description                                                                 |
+| --------------------------------- | -------- | ---------------------------------------------------------------------------- |
+| `condition`                        | yes      | Condition to cluster, e.g. `"breast cancer"`. Must match the condition passed to `criteria_embedding.py` (used to derive default input/output paths). |
+| `--min-cluster-size`               | no       | Minimum size of a group of points to be considered a cluster (default: `5`). |
+| `--min-samples`                    | no       | Number of samples in a neighborhood for a point to be a core point (default: `min_cluster_size`). |
+| `--metric`                         | no       | Distance metric to use (default: `euclidean`). |
+| `--cluster-selection-epsilon`      | no       | Distance threshold below which clusters are merged (default: `0.0`). |
+| `--cluster-selection-method`       | no       | `eom` (excess of mass) or `leaf` (default: `eom`). |
+| `--input-path`                     | no       | Override the default input embeddings Parquet path (`data/embeddings/<condition_slug>_trials_embeddings.parquet`). |
+| `--assignments-output-path`        | no       | Override the default output cluster-assignments Parquet path (`data/clustering/hdbscan/<condition_slug>_trials_hdbscan_clusters.parquet`). |
+| `--metrics-output-path`            | no       | Override the default output metrics JSON path (`data/clustering/hdbscan/<condition_slug>_trials_hdbscan_cluster_metrics.json`). |
 
 ### Example: full pipeline for one condition
 
@@ -166,4 +219,5 @@ files; there is no append/skip-if-exists/merge behavior.
 python -m src.preprocessing.criteria_retrieval "breast cancer"
 python -m src.embeddings.criteria_embedding "breast cancer" --backend huggingface
 python -m src.clustering.criteria_clustering "breast cancer"
+python -m src.clustering.hdbscan_clustering "breast cancer"
 ```

@@ -11,12 +11,12 @@ range, and the `k` with the highest silhouette score is kept. Passing
 ``--n-clusters`` instead skips the search and clusters at exactly that `k`.
 Either way, the run writes two output artifacts:
 
-    data/clustering/<condition>_trials_clusters.parquet
+    data/clustering/kmeans/<condition>_trials_clusters.parquet
         One row per successfully-embedded criterion, carrying its assigned
         ``cluster_id`` plus enough source columns (``nct_id``,
         ``criterion_text``, etc.) to join back to the embeddings file.
 
-    data/clustering/<condition>_trials_cluster_metrics.json
+    data/clustering/kmeans/<condition>_trials_cluster_metrics.json
         Clustering performance metrics (inertia, silhouette score,
         Davies-Bouldin index, Calinski-Harabasz index) plus run provenance
         (sample/cluster counts, k-means parameters), so clustering quality
@@ -24,10 +24,13 @@ Either way, the run writes two output artifacts:
 
 Re-running this step on the same condition overwrites both existing output
 files wholesale — there is no append/skip-if-exists/merge behavior.
+
+Read/validate/write logic shared with the HDBSCAN clustering pipeline (see
+`hdbscan_clustering.py`) lives in `clustering_io.py`; this module holds only
+k-means-specific logic (fitting, `k` selection, k-means's own metrics guard).
 """
 
 import argparse
-import json
 import logging
 import math
 import sys
@@ -36,22 +39,20 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
-import pyarrow.compute as pc
-import pyarrow.parquet as pq
 from sklearn.cluster import KMeans
 from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score, silhouette_score
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-INPUT_DIR = REPO_ROOT / "data" / "embeddings"
-OUTPUT_DIR = REPO_ROOT / "data" / "clustering"
+OUTPUT_DIR = REPO_ROOT / "data" / "clustering" / "kmeans"
 
-# criteria_retrieval.py lives in a sibling directory with no shared package
-# namespace (neither src/clustering/ nor src/preprocessing/ has an
-# __init__.py, consistent with both modules being invoked as standalone
-# scripts). Add the src/ root to sys.path explicitly so this still works
-# when the script is run directly rather than via the installed package.
+# clustering_io.py and criteria_retrieval.py live in sibling directories with
+# no shared package namespace (none of src/clustering/, src/preprocessing/
+# has an __init__.py, consistent with these modules being invoked as
+# standalone scripts). Add the src/ root to sys.path explicitly so this still
+# works when the script is run directly rather than via the installed package.
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from clustering import clustering_io
 from preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
 
 logger = logging.getLogger(__name__)
@@ -68,19 +69,6 @@ CLUSTER_PARQUET_SCHEMA = pa.schema(
         ("clustered_at", pa.timestamp("us", tz="UTC")),
     ]
 )
-
-
-def _relative_to_repo_root(path: Path) -> str:
-    """Render `path` as a POSIX-style string relative to `REPO_ROOT` if possible.
-
-    Falls back to the absolute path string when `path` doesn't live under
-    `REPO_ROOT` (e.g. an explicit `--input-path` override pointing elsewhere),
-    so metrics JSON generation never fails on path formatting alone.
-    """
-    try:
-        return path.resolve().relative_to(REPO_ROOT).as_posix()
-    except ValueError:
-        return path.resolve().as_posix()
 
 
 class CriteriaClusterer:
@@ -138,95 +126,6 @@ class CriteriaClusterer:
         self.random_state = random_state
         self.n_init = n_init
         self.max_iter = max_iter
-
-    def read_embeddings_parquet(self, input_path: Path) -> pa.Table:
-        """Read the embeddings Parquet file produced by `criteria_embedding.py`.
-
-        Args:
-            input_path: Path to a Parquet file written by
-                `CriteriaEmbedder.write_embeddings_parquet`.
-
-        Returns:
-            The full Parquet table, including rows with failed embeddings.
-
-        Raises:
-            FileNotFoundError: If `input_path` does not exist.
-        """
-        if not input_path.exists():
-            raise FileNotFoundError(f"Input embeddings Parquet not found: {input_path}")
-        return pq.read_table(input_path)
-
-    def filter_successful_rows(self, table: pa.Table) -> pa.Table:
-        """Filter a table down to rows where `embedding_success` is True.
-
-        Args:
-            table: A table as returned by `read_embeddings_parquet`.
-
-        Returns:
-            The subset of `table` with `embedding_success == True`.
-
-        Raises:
-            ValueError: If the result has zero rows, covering both an empty
-                input table and an input where every row failed embedding —
-                there is nothing to cluster either way.
-        """
-        filtered = table.filter(pc.field("embedding_success"))
-        if filtered.num_rows == 0:
-            raise ValueError(
-                f"No successfully embedded rows found in input "
-                f"(0 of {table.num_rows} row(s) had embedding_success=True); "
-                "refusing to cluster an empty dataset"
-            )
-        return filtered
-
-    def validate_embedding_dimensions(self, table: pa.Table) -> int:
-        """Confirm every row's `embedding` vector has the same length.
-
-        Args:
-            table: A table of successfully-embedded rows (e.g. the output of
-                `filter_successful_rows`).
-
-        Returns:
-            The common embedding dimensionality.
-
-        Raises:
-            ValueError: If more than one distinct embedding length is found,
-                naming each distinct dimension and an example `nct_id` for
-                it, so a mixed-backend/mixed-model input fails with an
-                actionable message rather than crashing inside numpy/sklearn.
-        """
-        nct_ids = table.column("nct_id").to_pylist()
-        embeddings = table.column("embedding").to_pylist()
-
-        dim_examples: dict[int, str] = {}
-        for nct_id, embedding in zip(nct_ids, embeddings):
-            dim_examples.setdefault(len(embedding), nct_id)
-
-        if len(dim_examples) > 1:
-            details = ", ".join(
-                f"dim={dim} (e.g. nct_id={example!r})" for dim, example in sorted(dim_examples.items())
-            )
-            raise ValueError(
-                f"Embeddings have inconsistent dimensionality, cannot cluster together: {details}"
-            )
-        return next(iter(dim_examples))
-
-    def extract_embedding_matrix(self, table: pa.Table) -> np.ndarray:
-        """Stack a table's `embedding` column into a 2D float32 matrix.
-
-        Args:
-            table: A table of successfully-embedded rows with uniform
-                embedding dimensionality.
-
-        Returns:
-            An array of shape `(n_samples, embedding_dim)`.
-
-        Raises:
-            ValueError: Propagated from `validate_embedding_dimensions` if
-                dimensions are not uniform.
-        """
-        self.validate_embedding_dimensions(table)
-        return np.array(table.column("embedding").to_pylist(), dtype=np.float32)
 
     def validate_k(self, n_clusters: int, n_samples: int) -> None:
         """Confirm a given `n_clusters` is usable for this dataset.
@@ -438,41 +337,23 @@ class CriteriaClusterer:
         Returns:
             One output dict per row, matching `CLUSTER_PARQUET_SCHEMA`'s columns.
         """
-        nct_ids = table.column("nct_id").to_pylist()
-        dates = table.column("study_first_posted_date").to_pylist()
-        texts = table.column("criterion_text").to_pylist()
-        types = table.column("criterion_type").to_pylist()
-        backends = table.column("embedding_backend").to_pylist()
-        models = table.column("embedding_model").to_pylist()
+        columns = clustering_io.extract_traceability_columns(table)
 
         rows = []
         for i in range(table.num_rows):
             rows.append(
                 {
-                    "nct_id": nct_ids[i],
-                    "study_first_posted_date": dates[i],
-                    "criterion_text": texts[i],
-                    "criterion_type": types[i],
+                    "nct_id": columns["nct_id"][i],
+                    "study_first_posted_date": columns["study_first_posted_date"][i],
+                    "criterion_text": columns["criterion_text"][i],
+                    "criterion_type": columns["criterion_type"][i],
                     "cluster_id": int(labels[i]),
-                    "embedding_backend": backends[i],
-                    "embedding_model": models[i],
+                    "embedding_backend": columns["embedding_backend"][i],
+                    "embedding_model": columns["embedding_model"][i],
                     "clustered_at": clustered_at,
                 }
             )
         return rows
-
-    def write_assignments_parquet(self, rows: list[dict], output_path: Path) -> None:
-        """Write cluster assignment rows to a Parquet file, overwriting any existing file.
-
-        Args:
-            rows: Output row dicts as produced by `build_assignment_rows`.
-            output_path: Destination Parquet file path. Parent directories
-                are created if missing.
-        """
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        columns = {name: [row[name] for row in rows] for name in CLUSTER_PARQUET_SCHEMA.names}
-        table = pa.Table.from_pydict(columns, schema=CLUSTER_PARQUET_SCHEMA)
-        pq.write_table(table, output_path)
 
     def build_metrics_dict(
         self,
@@ -522,24 +403,23 @@ class CriteriaClusterer:
         Returns:
             A JSON-serializable dict matching the documented metrics schema.
         """
-        cluster_sizes: dict[str, int] = {}
-        for label in labels:
-            key = str(int(label))
-            cluster_sizes[key] = cluster_sizes.get(key, 0) + 1
-
+        base = clustering_io.build_base_metrics_dict(
+            condition=condition,
+            slug=slug,
+            input_path=input_path,
+            assignments_output_path=assignments_output_path,
+            n_samples=n_samples,
+            n_samples_excluded=n_samples_excluded,
+            embedding_dim=embedding_dim,
+            embedding_backend=embedding_backend,
+            embedding_model=embedding_model,
+            cluster_sizes=clustering_io.compute_cluster_sizes(labels),
+            clustered_at=clustered_at,
+        )
         return {
-            "condition": condition,
-            "condition_slug": slug,
-            "input_path": _relative_to_repo_root(input_path),
-            "assignments_output_path": _relative_to_repo_root(assignments_output_path),
-            "n_samples": n_samples,
-            "n_samples_excluded_failed_embeddings": n_samples_excluded,
-            "embedding_dim": embedding_dim,
-            "embedding_backend": embedding_backend,
-            "embedding_model": embedding_model,
+            **base,
             "n_clusters_requested": n_clusters_requested,
             "n_clusters_actual": metrics_result["n_clusters_actual"],
-            "cluster_sizes": dict(sorted(cluster_sizes.items(), key=lambda kv: int(kv[0]))),
             "kmeans_params": {
                 "random_state": self.random_state,
                 "n_init": self.n_init,
@@ -554,20 +434,7 @@ class CriteriaClusterer:
                 "k_max": k_max,
                 "k_search_results": k_search_results,
             },
-            "clustered_at": clustered_at.isoformat(),
         }
-
-    def write_metrics_json(self, metrics_dict: dict, output_path: Path) -> None:
-        """Write a metrics dict to a JSON file, overwriting any existing file.
-
-        Args:
-            metrics_dict: As produced by `build_metrics_dict`.
-            output_path: Destination JSON file path. Parent directories are
-                created if missing.
-        """
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(metrics_dict, f, indent=2)
 
     def run(
         self,
@@ -583,7 +450,7 @@ class CriteriaClusterer:
                 string passed to `criteria_embedding.py`. Used to derive
                 default input/output paths via `condition_to_slug`.
             input_path: Embeddings Parquet to read. If omitted, defaults to
-                ``INPUT_DIR / f"{slug}_trials_embeddings.parquet"``.
+                the embeddings directory's `{slug}_trials_embeddings.parquet`.
             assignments_output_path: Where to write cluster assignments. If
                 omitted, defaults to
                 ``OUTPUT_DIR / f"{slug}_trials_clusters.parquet"``.
@@ -602,21 +469,24 @@ class CriteriaClusterer:
                 invalid/empty for the available sample count.
         """
         slug = EligibilityCriteriaFetcher.condition_to_slug(condition)
+        default_input_path, default_assignments_path, default_metrics_path = clustering_io.resolve_default_paths(
+            condition, OUTPUT_DIR, "_trials_clusters.parquet", "_trials_cluster_metrics.json"
+        )
         if input_path is None:
-            input_path = INPUT_DIR / f"{slug}_trials_embeddings.parquet"
+            input_path = default_input_path
         if assignments_output_path is None:
-            assignments_output_path = OUTPUT_DIR / f"{slug}_trials_clusters.parquet"
+            assignments_output_path = default_assignments_path
         if metrics_output_path is None:
-            metrics_output_path = OUTPUT_DIR / f"{slug}_trials_cluster_metrics.json"
+            metrics_output_path = default_metrics_path
 
-        table = self.read_embeddings_parquet(input_path)
+        table = clustering_io.read_embeddings_parquet(input_path)
         total_rows = table.num_rows
-        filtered = self.filter_successful_rows(table)
+        filtered = clustering_io.filter_successful_rows(table)
         n_samples = filtered.num_rows
         n_excluded = total_rows - n_samples
 
-        embedding_dim = self.validate_embedding_dimensions(filtered)
-        embedding_matrix = self.extract_embedding_matrix(filtered)
+        embedding_dim = clustering_io.validate_embedding_dimensions(filtered)
+        embedding_matrix = clustering_io.extract_embedding_matrix(filtered)
 
         if self.n_clusters is not None:
             k_selection_mode = "fixed"
@@ -636,7 +506,7 @@ class CriteriaClusterer:
 
         clustered_at = datetime.now(timezone.utc)
         rows = self.build_assignment_rows(filtered, labels, clustered_at)
-        self.write_assignments_parquet(rows, assignments_output_path)
+        clustering_io.write_parquet(rows, CLUSTER_PARQUET_SCHEMA, assignments_output_path)
 
         embedding_backend = filtered.column("embedding_backend")[0].as_py()
         embedding_model = filtered.column("embedding_model")[0].as_py()
@@ -660,7 +530,7 @@ class CriteriaClusterer:
             k_max=k_max,
             k_search_results=k_search_results,
         )
-        self.write_metrics_json(metrics_dict, metrics_output_path)
+        clustering_io.write_json(metrics_dict, metrics_output_path)
 
         if k_selection_mode == "auto":
             selection_summary = f"auto-selected k={n_clusters_requested} (searched {k_min}..{k_max})"
