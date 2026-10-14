@@ -8,6 +8,7 @@ dependencies = [
     "pyarrow>=21.0.0",
     "python-dotenv>=1.2.4",
     "requests>=2.34.2",
+    "scikit-learn>=1.9.1",
     "sentence-transformers>=6.1.0",
 ]
 

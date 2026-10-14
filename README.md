@@ -9,6 +9,9 @@ Pipeline for building embeddings of clinical trial eligibility criteria:
 2. **`src/embeddings/criteria_embedding.py`** — reads that CSV, embeds each
    criterion's text with a configurable backend, and writes the result to a
    Parquet file.
+3. **`src/clustering/criteria_clustering.py`** — reads that Parquet file,
+   clusters the embedding vectors via k-means, and writes cluster
+   assignments plus clustering performance metrics.
 
 ## Setup
 
@@ -106,9 +109,61 @@ file; there is no append/skip-if-exists/merge behavior.
   `Qwen/Qwen3-Embedding-8B`), which can be slow/memory-heavy on first run as
   the model downloads.
 
+## 3. Clustering criteria
+
+```bash
+python -m src.clustering.criteria_clustering "breast cancer"
+```
+
+This reads the Parquet file produced by the step above, drops rows whose
+embedding failed, and clusters the remaining embedding vectors via k-means.
+By default, the number of clusters (`k`) is **selected automatically**:
+k-means is fit once per candidate `k` in a search range (`--k-min` to
+`--k-max`, default `2` to `min(100, floor(sqrt(n_samples / 2)), n_samples - 1)`),
+and the `k` with the highest silhouette score is kept. Pass `--n-clusters` to
+skip the search and force a specific `k` instead. Either way, it writes:
+
+```
+data/clustering/<condition_slug>_trials_clusters.parquet
+data/clustering/<condition_slug>_trials_cluster_metrics.json
+```
+
+The Parquet file has one row per successfully-embedded criterion, containing
+`nct_id`, `study_first_posted_date`, `criterion_text`, `criterion_type`,
+`cluster_id`, `embedding_backend`, `embedding_model`, and `clustered_at`. The
+JSON file reports run provenance (sample/cluster counts, k-means parameters)
+plus clustering performance metrics: inertia, silhouette score, the
+Davies-Bouldin index, and the Calinski-Harabasz index. The silhouette,
+Davies-Bouldin, and Calinski-Harabasz scores require between 2 and
+`n_samples - 1` distinct clusters to be computable; if a run falls outside
+that range (e.g. due to empty-cluster collapse), those three metrics are
+reported as `null` with an explanatory note and `metrics_valid` is `false`.
+A `k_selection` object records whether `k` was `"auto"`-selected or `"fixed"`,
+the search bounds used, and (in auto mode) the full per-`k` sweep results, so
+the choice of `k` is auditable rather than a black box.
+
+Re-running this step for the same condition overwrites both existing output
+files; there is no append/skip-if-exists/merge behavior.
+
+### Arguments
+
+| Argument                     | Required | Description                                                                 |
+| ----------------------------- | -------- | ---------------------------------------------------------------------------- |
+| `condition`                    | yes      | Condition to cluster, e.g. `"breast cancer"`. Must match the condition passed to `criteria_embedding.py` (used to derive default input/output paths). |
+| `--n-clusters`                 | no       | Fix the number of k-means clusters and skip automatic selection (default: auto-select via a silhouette-score sweep). |
+| `--k-min`                      | no       | Minimum `k` to search when auto-selecting; ignored if `--n-clusters` is set (default: `2`). |
+| `--k-max`                      | no       | Maximum `k` to search when auto-selecting; ignored if `--n-clusters` is set (default: `min(100, floor(sqrt(n_samples / 2)), n_samples - 1)`). |
+| `--random-state`               | no       | Random seed for k-means initialization, for reproducibility (default: `42`). |
+| `--n-init`                     | no       | Number of k-means initializations to run per `k` (default: `10`). |
+| `--max-iter`                   | no       | Maximum k-means iterations per initialization (default: `300`). |
+| `--input-path`                 | no       | Override the default input embeddings Parquet path (`data/embeddings/<condition_slug>_trials_embeddings.parquet`). |
+| `--assignments-output-path`    | no       | Override the default output cluster-assignments Parquet path (`data/clustering/<condition_slug>_trials_clusters.parquet`). |
+| `--metrics-output-path`        | no       | Override the default output metrics JSON path (`data/clustering/<condition_slug>_trials_cluster_metrics.json`). |
+
 ### Example: full pipeline for one condition
 
 ```bash
 python -m src.preprocessing.criteria_retrieval "breast cancer"
 python -m src.embeddings.criteria_embedding "breast cancer" --backend huggingface
+python -m src.clustering.criteria_clustering "breast cancer"
 ```
