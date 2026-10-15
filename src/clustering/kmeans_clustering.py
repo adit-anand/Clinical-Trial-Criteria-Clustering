@@ -158,11 +158,11 @@ class KMeansClusterer:
             n_samples: Number of embeddings available to cluster.
 
         Returns:
-            `min(25, floor(sqrt(n_samples / 2)))`, clipped to `n_samples - 1`
+            `min(100, floor(sqrt(n_samples / 2)))`, clipped to `n_samples - 1`
             (silhouette's hard ceiling on `k`).
         """
         heuristic = int(math.sqrt(n_samples / 2))
-        return min(25, heuristic, n_samples - 1)
+        return min(100, heuristic, n_samples - 1)
 
     def validate_k_range(self, n_samples: int, k_min: int, k_max: int) -> None:
         """Confirm a `[k_min, k_max]` search range is usable for this dataset.

@@ -177,7 +177,7 @@ This reads the Parquet file produced by the step above, drops rows whose
 embedding failed, and clusters the remaining embedding vectors via k-means.
 By default, the number of clusters (`k`) is **selected automatically**:
 k-means is fit once per candidate `k` in a search range (`--k-min` to
-`--k-max`, default `2` to `min(25, floor(sqrt(n_samples / 2)), n_samples - 1)`),
+`--k-max`, default `2` to `min(100, floor(sqrt(n_samples / 2)), n_samples - 1)`),
 and the `k` with the highest silhouette score is kept. Pass `--n-clusters` to
 skip the search and force a specific `k` instead. Either way, it writes:
 
@@ -210,7 +210,7 @@ files; there is no append/skip-if-exists/merge behavior.
 | `condition`                    | yes      | Condition to cluster, e.g. `"breast cancer"`. Must match the condition passed to `criteria_embedding.py` (used to derive default input/output paths). |
 | `--n-clusters`                 | no       | Fix the number of k-means clusters and skip automatic selection (default: auto-select via a silhouette-score sweep). |
 | `--k-min`                      | no       | Minimum `k` to search when auto-selecting; ignored if `--n-clusters` is set (default: `2`). |
-| `--k-max`                      | no       | Maximum `k` to search when auto-selecting; ignored if `--n-clusters` is set (default: `min(25, floor(sqrt(n_samples / 2)), n_samples - 1)`). |
+| `--k-max`                      | no       | Maximum `k` to search when auto-selecting; ignored if `--n-clusters` is set (default: `min(100, floor(sqrt(n_samples / 2)), n_samples - 1)`). |
 | `--random-state`               | no       | Random seed for k-means initialization, for reproducibility (default: `42`). |
 | `--n-init`                     | no       | Number of k-means initializations to run per `k` (default: `10`). |
 | `--max-iter`                   | no       | Maximum k-means iterations per initialization (default: `300`). |
