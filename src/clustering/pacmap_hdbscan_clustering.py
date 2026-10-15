@@ -515,13 +515,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--hdbscan-min-cluster-size",
         type=int,
         default=HDBSCANClusterer.DEFAULT_MIN_CLUSTER_SIZE,
-        help="Fixed HDBSCAN min_cluster_size, not swept (default: 5)",
+        help="Fixed HDBSCAN min_cluster_size, not swept (default: 200)",
     )
     parser.add_argument(
         "--hdbscan-min-samples",
         type=int,
         default=HDBSCANClusterer.DEFAULT_MIN_CLUSTER_SIZE,
-        help="Fixed HDBSCAN min_samples, not swept (default: 5)",
+        help="Fixed HDBSCAN min_samples, not swept (default: 200)",
     )
     parser.add_argument(
         "--hdbscan-metric",

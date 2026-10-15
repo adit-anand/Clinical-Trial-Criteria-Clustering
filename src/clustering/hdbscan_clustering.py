@@ -124,7 +124,7 @@ class HDBSCANClusterer:
         model = clusterer.fit_hdbscan(embedding_matrix)
     """
 
-    DEFAULT_MIN_CLUSTER_SIZE = 5
+    DEFAULT_MIN_CLUSTER_SIZE = 200
     DEFAULT_METRIC = "euclidean"
     DEFAULT_CLUSTER_SELECTION_EPSILON = 0.0
     DEFAULT_CLUSTER_SELECTION_METHOD = "eom"
@@ -824,13 +824,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--min-cluster-size",
         type=parse_int_list,
         default=[HDBSCANClusterer.DEFAULT_MIN_CLUSTER_SIZE],
-        help="Comma-separated list of min_cluster_size values to try (default: 5)",
+        help="Comma-separated list of min_cluster_size values to try (default: 200)",
     )
     parser.add_argument(
         "--min-samples",
         type=parse_int_list,
         default=[HDBSCANClusterer.DEFAULT_MIN_CLUSTER_SIZE],
-        help="Comma-separated list of min_samples values to try (default: 5)",
+        help="Comma-separated list of min_samples values to try (default: 200)",
     )
     parser.add_argument(
         "--cluster-selection-epsilon",
