@@ -37,6 +37,11 @@ Pipeline for building embeddings of clinical trial eligibility criteria:
 8. **`src/clustering/pacmap_hdbscan_clustering.py`** — the same idea as step
    7, reducing with PaCMAP instead of UMAP. The config/seed/repeat sweep
    mechanics both steps share live in `src/clustering/reduction_sweep.py`.
+9. **`src/clustering/clustering_scatterplot.py`** — reads whichever
+   clustering method's output already exists for a condition and writes an
+   interactive HTML scatterplot of its criteria in a 2-dimensional UMAP
+   space (colored by cluster), reusing that method's own optimal-run seed
+   for the projection.
 
 ## Project structure
 
@@ -71,7 +76,8 @@ src/
     ├── hdbscan_sweep.py                  # step 6 (alias for step 4, no logic)
     ├── reduction_sweep.py                # shared config/seed/repeat sweep engine (steps 7-8)
     ├── umap_hdbscan_clustering.py        # step 7
-    └── pacmap_hdbscan_clustering.py      # step 8
+    ├── pacmap_hdbscan_clustering.py      # step 8
+    └── clustering_scatterplot.py         # step 9
 ```
 
 Within `src/clustering/`, `clustering_io.py` holds everything genuinely
@@ -88,6 +94,11 @@ CLI and holds no logic of its own. `umap_hdbscan_clustering.py` and
 holds the reducer-agnostic config/seed/repeat sweep mechanics common to both
 (picking the most reproducible seed per configuration, then the
 best-scoring configuration overall) so neither module re-implements it.
+`clustering_scatterplot.py` reads whichever of the four algorithms' output
+already exists (via its own `VISUALIZATION_SPECS` registry, one entry per
+algorithm, following the same "no branching elsewhere" pattern
+`clustering_report.py`'s `ALGORITHM_SPECS` already established) and never
+re-runs or modifies any of them.
 
 ## Setup
 
@@ -495,6 +506,53 @@ JSON shape (as `winning_pacmap_config`/`pacmap_config_search` instead of
 | `--assignments-output-path`          | no       | Override the default output cluster-assignments Parquet path. |
 | `--metrics-output-path`              | no       | Override the default output metrics JSON path. |
 
+## 9. Scatterplot visualization
+
+```bash
+uv run python -m src.clustering.clustering_scatterplot "breast cancer" --method umap_hdbscan
+```
+
+This reads whichever clustering method's output already exists for a
+condition (`--method`, one of `kmeans`/`hdbscan`/`umap_hdbscan`/
+`pacmap_hdbscan`) — it never re-runs clustering — and writes an interactive
+HTML scatterplot of that condition's criteria in a 2-dimensional UMAP space,
+with points colored by cluster (a distinct color for HDBSCAN-based methods'
+noise points), a legend mapping color to cluster, and a hover tooltip
+showing each point's criterion text.
+
+The 2D projection always reuses that method's own "optimal run" seed rather
+than introducing new randomness: k-means's `kmeans_params.random_state`;
+`umap_hdbscan`/`pacmap_hdbscan`'s `winning_seed`. Plain `hdbscan_clustering.py`
+has no seed concept at all in this codebase, so that case falls back to a
+documented default (`42`) — logged as a warning and noted in the plot's
+title, never silently. For `umap_hdbscan` specifically, if that run's
+winning configuration was already 2-dimensional, its already-persisted
+reduced embeddings are reused directly instead of fitting a new UMAP
+projection; every other case (including `pacmap_hdbscan`, whose own
+persisted projection is PaCMAP, not UMAP) always computes a fresh
+2-dimensional UMAP projection from the condition's original embeddings. It
+writes one HTML file into that method's own output directory, named
+consistently with its existing output:
+
+```
+data/clustering/kmeans/<condition_slug>_trials_cluster_scatterplot.html
+data/clustering/hdbscan/<condition_slug>_trials_hdbscan_scatterplot.html
+data/clustering/umap_hdbscan/<condition_slug>_trials_umap_hdbscan_scatterplot.html
+data/clustering/pacmap_hdbscan/<condition_slug>_trials_pacmap_hdbscan_scatterplot.html
+```
+
+Re-running this step for the same condition/method overwrites the existing
+HTML file wholesale; there is no append/skip-if-exists/merge behavior.
+
+### Arguments
+
+| Argument         | Required | Description                                                                 |
+| ----------------- | -------- | ---------------------------------------------------------------------------- |
+| `condition`        | yes      | Condition to visualize, e.g. `"breast cancer"`. Must already be clustered by `--method`. |
+| `--method`          | yes      | Which clustering method's output to visualize: `kmeans`, `hdbscan`, `umap_hdbscan`, or `pacmap_hdbscan`. |
+| `--seed`            | no       | Override the 2D UMAP projection's seed (default: reuse that method's own optimal-run seed, or the fallback default for `hdbscan`). |
+| `--output-path`     | no       | Override the default output HTML path. |
+
 ### Example: full pipeline for one condition
 
 ```bash
@@ -505,4 +563,5 @@ uv run python -m src.clustering.hdbscan_clustering "breast cancer" --min-cluster
 uv run python -m src.clustering.clustering_report "breast cancer"
 uv run python -m src.clustering.umap_hdbscan_clustering "breast cancer" --umap-n-neighbors 10,15,30 --seeds 1,2,3,4,5
 uv run python -m src.clustering.pacmap_hdbscan_clustering "breast cancer" --pacmap-n-neighbors 10,15,30 --seeds 1,2,3,4,5
+uv run python -m src.clustering.clustering_scatterplot "breast cancer" --method umap_hdbscan
 ```
