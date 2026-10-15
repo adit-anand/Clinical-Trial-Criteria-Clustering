@@ -1,18 +1,17 @@
 """Generate a consolidated clustering performance report for a condition.
 
 Reads the existing per-algorithm clustering metrics JSON artifacts already
-written by `kmeans_clustering.py` and `hdbscan_clustering.py` for a given
-condition (``data/clustering/kmeans/<condition>_trials_cluster_metrics.json``
-and ``data/clustering/hdbscan/<condition>_trials_hdbscan_cluster_metrics.json``)
-and renders one consolidated, human-readable Markdown report comparing their
-clustering performance side by side. This module never re-runs clustering —
-it only reads artifacts that already exist on disk.
+written by `kmeans_clustering.py`, `hdbscan_clustering.py`,
+`umap_hdbscan_clustering.py`, and `pacmap_hdbscan_clustering.py` for a given
+condition and renders one consolidated, human-readable Markdown report
+comparing their clustering performance side by side. This module never
+re-runs clustering — it only reads artifacts that already exist on disk.
 
 Each algorithm's presence in the report is driven entirely by one
 `AlgorithmSpec` registry entry (see `ALGORITHM_SPECS` below); adding support
-for a future third clustering algorithm means adding one entry to that list
-plus one small extractor function — no other function in this module branches
-on which algorithm it's looking at.
+for a future additional clustering algorithm means adding one entry to that
+list plus one small extractor function — no other function in this module
+branches on which algorithm it's looking at.
 
 A missing or unparseable metrics file for one algorithm never aborts the
 whole report: it's reflected as a clearly labeled per-algorithm status
@@ -47,7 +46,7 @@ if not __package__:
 
 from src.paths import REPO_ROOT
 from src.preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
-from src.clustering import hdbscan_clustering, kmeans_clustering
+from src.clustering import hdbscan_clustering, kmeans_clustering, pacmap_hdbscan_clustering, umap_hdbscan_clustering
 
 DEFAULT_REPORT_OUTPUT_DIR = REPO_ROOT / "data" / "clustering" / "reports"
 
@@ -174,6 +173,66 @@ def hdbscan_extra_fields(data: dict) -> list[tuple[str, str]]:
     ]
 
 
+def umap_hdbscan_extra_fields(data: dict) -> list[tuple[str, str]]:
+    """Extract UMAP+HDBSCAN-only fields (no equivalent in other algorithms).
+
+    Args:
+        data: A parsed UMAP+HDBSCAN metrics dict (as produced by
+            `umap_hdbscan_clustering.build_metrics_dict`).
+
+    Returns:
+        Label/formatted-value pairs for cluster/noise statistics plus the
+        winning UMAP configuration, seed, and that seed's reproducibility
+        (noise_fraction standard deviation across its repeats). Uses
+        `.get(...)` throughout so an unexpected/partial schema degrades to
+        "N/A" fields rather than raising.
+    """
+    noise_count = data.get("noise_count")
+    n_samples = data.get("n_samples")
+    noise_display = _format_percent(noise_count, n_samples) if noise_count is not None and n_samples is not None else "N/A"
+
+    winning_config = data.get("winning_umap_config") or {}
+    reproducibility_std = data.get("winning_seed_noise_fraction_std")
+
+    return [
+        ("Clusters found", str(data.get("n_clusters_actual", "N/A"))),
+        ("Noise points", noise_display),
+        ("Winning UMAP config", str(winning_config) if winning_config else "N/A"),
+        ("Winning seed", str(data.get("winning_seed", "N/A"))),
+        ("Reproducibility (noise fraction std)", f"{reproducibility_std:.4f}" if reproducibility_std is not None else "N/A"),
+    ]
+
+
+def pacmap_hdbscan_extra_fields(data: dict) -> list[tuple[str, str]]:
+    """Extract PaCMAP+HDBSCAN-only fields (no equivalent in other algorithms).
+
+    Args:
+        data: A parsed PaCMAP+HDBSCAN metrics dict (as produced by
+            `pacmap_hdbscan_clustering.build_metrics_dict`).
+
+    Returns:
+        Label/formatted-value pairs for cluster/noise statistics plus the
+        winning PaCMAP configuration, seed, and that seed's reproducibility
+        (noise_fraction standard deviation across its repeats). Uses
+        `.get(...)` throughout so an unexpected/partial schema degrades to
+        "N/A" fields rather than raising.
+    """
+    noise_count = data.get("noise_count")
+    n_samples = data.get("n_samples")
+    noise_display = _format_percent(noise_count, n_samples) if noise_count is not None and n_samples is not None else "N/A"
+
+    winning_config = data.get("winning_pacmap_config") or {}
+    reproducibility_std = data.get("winning_seed_noise_fraction_std")
+
+    return [
+        ("Clusters found", str(data.get("n_clusters_actual", "N/A"))),
+        ("Noise points", noise_display),
+        ("Winning PaCMAP config", str(winning_config) if winning_config else "N/A"),
+        ("Winning seed", str(data.get("winning_seed", "N/A"))),
+        ("Reproducibility (noise fraction std)", f"{reproducibility_std:.4f}" if reproducibility_std is not None else "N/A"),
+    ]
+
+
 ALGORITHM_SPECS: list[AlgorithmSpec] = [
     AlgorithmSpec(
         key="kmeans",
@@ -188,6 +247,20 @@ ALGORITHM_SPECS: list[AlgorithmSpec] = [
         output_dir=hdbscan_clustering.OUTPUT_DIR,
         metrics_suffix="_trials_hdbscan_cluster_metrics.json",
         extra_fields_fn=hdbscan_extra_fields,
+    ),
+    AlgorithmSpec(
+        key="umap_hdbscan",
+        display_name="UMAP + HDBSCAN",
+        output_dir=umap_hdbscan_clustering.OUTPUT_DIR,
+        metrics_suffix="_trials_umap_hdbscan_cluster_metrics.json",
+        extra_fields_fn=umap_hdbscan_extra_fields,
+    ),
+    AlgorithmSpec(
+        key="pacmap_hdbscan",
+        display_name="PaCMAP + HDBSCAN",
+        output_dir=pacmap_hdbscan_clustering.OUTPUT_DIR,
+        metrics_suffix="_trials_pacmap_hdbscan_cluster_metrics.json",
+        extra_fields_fn=pacmap_hdbscan_extra_fields,
     ),
 ]
 
