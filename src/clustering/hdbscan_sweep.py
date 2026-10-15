@@ -30,6 +30,7 @@ import argparse
 import itertools
 import logging
 import math
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,10 +39,18 @@ from typing import Literal
 import numpy as np
 from hdbscan import validity
 
-from src.preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
+# Allow running this file directly (e.g. `uv run src/clustering/hdbscan_sweep.py`)
+# as well as via `-m` (e.g. `uv run python -m src.clustering.hdbscan_sweep`).
+# Direct execution leaves __package__ unset and never puts the repo root on
+# sys.path, so the src.* imports below would otherwise fail with
+# "ModuleNotFoundError: No module named 'src'"; -m already sets both up
+# correctly, so this is a no-op in that case.
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from . import clustering_io
-from .hdbscan_clustering import HDBSCAN_CLUSTER_PARQUET_SCHEMA, OUTPUT_DIR, HDBSCANClusterer
+from src.preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
+from src.clustering import clustering_io
+from src.clustering.hdbscan_clustering import HDBSCAN_CLUSTER_PARQUET_SCHEMA, OUTPUT_DIR, HDBSCANClusterer
 
 logger = logging.getLogger(__name__)
 

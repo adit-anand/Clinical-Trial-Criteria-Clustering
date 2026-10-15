@@ -30,6 +30,7 @@ HDBSCAN-specific logic (fitting, noise-aware metrics, probability output).
 
 import argparse
 import logging
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -38,10 +39,18 @@ import pyarrow as pa
 from sklearn.cluster import HDBSCAN
 from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score, silhouette_score
 
+# Allow running this file directly (e.g. `uv run src/clustering/hdbscan_clustering.py`)
+# as well as via `-m` (e.g. `uv run python -m src.clustering.hdbscan_clustering`).
+# Direct execution leaves __package__ unset and never puts the repo root on
+# sys.path, so the src.* imports below would otherwise fail with
+# "ModuleNotFoundError: No module named 'src'"; -m already sets both up
+# correctly, so this is a no-op in that case.
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from src.paths import REPO_ROOT
 from src.preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
-
-from . import clustering_io
+from src.clustering import clustering_io
 
 OUTPUT_DIR = REPO_ROOT / "data" / "clustering" / "hdbscan"
 

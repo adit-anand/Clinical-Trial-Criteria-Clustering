@@ -32,14 +32,16 @@ Pipeline for building embeddings of clinical trial eligibility criteria:
 ## Project structure
 
 `src/preprocessing/`, `src/embeddings/`, and `src/clustering/` are real
-Python packages (each has an `__init__.py`), so every pipeline module runs
-as `uv run python -m src.<package>.<module>` and imports its siblings as ordinary
-package imports — same-package modules via relative imports (e.g. `from
-. import clustering_io`), cross-package ones via the fully-qualified path
-(e.g. `from src.preprocessing.criteria_retrieval import
-EligibilityCriteriaFetcher`). The one constant every module needs — the
-repo root — is centralized in `src/paths.py` rather than re-derived in each
-file.
+Python packages (each has an `__init__.py`), so every pipeline module
+imports its siblings as ordinary absolute package imports (e.g. `from
+src.preprocessing.criteria_retrieval import EligibilityCriteriaFetcher`,
+`from src.clustering import clustering_io`). The one constant every module
+needs — the repo root — is centralized in `src/paths.py` rather than
+re-derived in each file. Every entry-point script can be run either as a
+module (`uv run python -m src.<package>.<module> "..."`, used throughout
+this README) or directly (`uv run src/<package>/<module>.py "..."`) — a
+small bootstrap at the top of each one puts the repo root on `sys.path`
+when it detects direct execution, so both styles behave identically.
 
 ```
 src/

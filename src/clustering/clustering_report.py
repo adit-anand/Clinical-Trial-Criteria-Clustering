@@ -30,15 +30,24 @@ are never overwritten or appended to.
 import argparse
 import json
 import logging
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Literal
 
+# Allow running this file directly (e.g. `uv run src/clustering/clustering_report.py`)
+# as well as via `-m` (e.g. `uv run python -m src.clustering.clustering_report`).
+# Direct execution leaves __package__ unset and never puts the repo root on
+# sys.path, so the src.* imports below would otherwise fail with
+# "ModuleNotFoundError: No module named 'src'"; -m already sets both up
+# correctly, so this is a no-op in that case.
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from src.paths import REPO_ROOT
 from src.preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
-
-from . import hdbscan_clustering, kmeans_clustering
+from src.clustering import hdbscan_clustering, kmeans_clustering
 
 DEFAULT_REPORT_OUTPUT_DIR = REPO_ROOT / "data" / "clustering" / "reports"
 
