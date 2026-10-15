@@ -449,7 +449,7 @@ before any fitting is attempted.
 | `--seeds`                            | no       | Comma-separated list of seeds to sweep for reproducibility (default: `42`). |
 | `--repeats-per-seed`                 | no       | Number of repeated fits per (configuration, seed) pair (default: `10`). |
 | `--hdbscan-min-cluster-size`         | no       | Fixed HDBSCAN `min_cluster_size`, not swept (default: `5`). |
-| `--hdbscan-min-samples`              | no       | Fixed HDBSCAN `min_samples`, not swept (default: `min_cluster_size`). |
+| `--hdbscan-min-samples`              | no       | Fixed HDBSCAN `min_samples`, not swept (default: `5`). |
 | `--hdbscan-metric`                   | no       | Fixed HDBSCAN distance metric, not swept (default: `euclidean`). |
 | `--hdbscan-cluster-selection-epsilon`| no       | Fixed HDBSCAN `cluster_selection_epsilon`, not swept (default: `0.0`). |
 | `--hdbscan-cluster-selection-method` | no       | Fixed HDBSCAN `cluster_selection_method`, not swept: `eom` or `leaf` (default: `eom`). |
@@ -496,7 +496,7 @@ JSON shape (as `winning_pacmap_config`/`pacmap_config_search` instead of
 | `--seeds`                            | no       | Comma-separated list of seeds to sweep for reproducibility (default: `42`). |
 | `--repeats-per-seed`                 | no       | Number of repeated fits per (configuration, seed) pair (default: `10`). |
 | `--hdbscan-min-cluster-size`         | no       | Fixed HDBSCAN `min_cluster_size`, not swept (default: `5`). |
-| `--hdbscan-min-samples`              | no       | Fixed HDBSCAN `min_samples`, not swept (default: `min_cluster_size`). |
+| `--hdbscan-min-samples`              | no       | Fixed HDBSCAN `min_samples`, not swept (default: `5`). |
 | `--hdbscan-metric`                   | no       | Fixed HDBSCAN distance metric, not swept (default: `euclidean`). |
 | `--hdbscan-cluster-selection-epsilon`| no       | Fixed HDBSCAN `cluster_selection_epsilon`, not swept (default: `0.0`). |
 | `--hdbscan-cluster-selection-method` | no       | Fixed HDBSCAN `cluster_selection_method`, not swept: `eom` or `leaf` (default: `eom`). |

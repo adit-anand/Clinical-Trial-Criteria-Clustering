@@ -291,7 +291,7 @@ def run(
     seeds: list[int] = DEFAULT_SEEDS,
     repeats_per_seed: int = DEFAULT_REPEATS_PER_SEED,
     hdbscan_min_cluster_size: int = HDBSCANClusterer.DEFAULT_MIN_CLUSTER_SIZE,
-    hdbscan_min_samples: int | None = None,
+    hdbscan_min_samples: int = HDBSCANClusterer.DEFAULT_MIN_CLUSTER_SIZE,
     hdbscan_metric: str = HDBSCANClusterer.DEFAULT_METRIC,
     hdbscan_cluster_selection_epsilon: float = HDBSCANClusterer.DEFAULT_CLUSTER_SELECTION_EPSILON,
     hdbscan_cluster_selection_method: str = HDBSCANClusterer.DEFAULT_CLUSTER_SELECTION_METHOD,
@@ -312,7 +312,9 @@ def run(
         seeds: UMAP `random_state` values to sweep for reproducibility.
         repeats_per_seed: Number of repeated fits per (config, seed) pair.
         hdbscan_min_cluster_size: Fixed (non-swept) HDBSCAN hyperparameter.
-        hdbscan_min_samples: Fixed (non-swept) HDBSCAN hyperparameter.
+        hdbscan_min_samples: Fixed (non-swept) HDBSCAN hyperparameter; always
+            an explicit value (never `None`), so the effective `min_samples`
+            HDBSCAN fits with is never left to sklearn's own implicit fallback.
         hdbscan_metric: Fixed (non-swept) HDBSCAN hyperparameter.
         hdbscan_cluster_selection_epsilon: Fixed (non-swept) HDBSCAN hyperparameter.
         hdbscan_cluster_selection_method: Fixed (non-swept) HDBSCAN hyperparameter.
@@ -504,8 +506,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--hdbscan-min-samples",
         type=int,
-        default=None,
-        help="Fixed HDBSCAN min_samples, not swept (default: min_cluster_size)",
+        default=HDBSCANClusterer.DEFAULT_MIN_CLUSTER_SIZE,
+        help="Fixed HDBSCAN min_samples, not swept (default: 5)",
     )
     parser.add_argument(
         "--hdbscan-metric",
