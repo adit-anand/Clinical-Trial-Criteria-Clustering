@@ -68,10 +68,11 @@ class RepeatResult:
 
     Attributes:
         repeat_index: 0-based index within this seed's `repeats_per_seed` runs.
-        status: `"ok"` if both fits succeeded and HDBSCAN's clustering metrics
-            were computable; `"degenerate"` if both fits succeeded but the
-            metrics were not (e.g. all-noise or single-cluster result);
-            `"errored"` if the reducer or HDBSCAN itself raised.
+        status: `"ok"` if both fits succeeded and `HDBSCANClusterer.compute_metrics`
+            reported `metrics_valid=True`; `"degenerate"` if both fits
+            succeeded but it didn't (see that method's eligibility
+            constraints — cluster count, dominant-cluster share, noise
+            fraction); `"errored"` if the reducer or HDBSCAN itself raised.
         detail: Human-readable explanation, set for `"degenerate"`/`"errored"`.
         metrics_result: `HDBSCANClusterer.compute_metrics(...)`'s return
             value, set for `"ok"`/`"degenerate"` (not `"errored"`).

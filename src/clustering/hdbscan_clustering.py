@@ -36,7 +36,10 @@ cluster assignments and metrics written:
 A combination that's invalid for the dataset (e.g. `min_samples` exceeding
 the sample count) is skipped with a logged reason rather than aborting the
 rest of the sweep. A combination that fits but produces a degenerate result
-(e.g. all-noise) is logged but never eligible to be the "best." If no
+— per `HDBSCANClusterer.compute_metrics`'s eligibility constraints (cluster
+count outside `MIN_N_CLUSTERS`/`MAX_N_CLUSTERS`, a dominant cluster
+exceeding `MAX_CLUSTER_SHARE`, or noise exceeding `MAX_NOISE_FRACTION`) —
+is logged but never eligible to be the "best." If no
 combination qualifies — including when only the single default combination
 was tried and it's degenerate — nothing is written. The total number of
 combinations (the product of all four swept lists' lengths) is capped at
@@ -126,6 +129,19 @@ class HDBSCANClusterer:
     DEFAULT_CLUSTER_SELECTION_EPSILON = 0.0
     DEFAULT_CLUSTER_SELECTION_METHOD = "eom"
     DEFAULT_ALPHA = 1.0
+
+    # A result's non-noise cluster count must fall in this range to be
+    # considered valid/eligible to win a sweep — too few clusters is as
+    # undesirable a result as too many, for this pipeline's purposes.
+    MIN_N_CLUSTERS = 10
+    MAX_N_CLUSTERS = 100
+
+    # No single cluster may hold more than this share of all data points
+    # (a lopsided result where one cluster swallows most of the dataset is
+    # treated as degenerate, not a meaningful clustering), and the overall
+    # noise fraction may not exceed this same limit either.
+    MAX_CLUSTER_SHARE = 0.20
+    MAX_NOISE_FRACTION = 0.20
 
     def __init__(
         self,
@@ -220,21 +236,41 @@ class HDBSCANClusterer:
         index are computed only over non-noise points (`label >= 0`), guarded
         the same way the k-means pipeline guards its own metrics (requires
         2 <= n_clusters_actual <= n_non_noise - 1 among non-noise points);
-        when the guard fails (e.g. an all-noise or single-cluster result),
+        when that guard fails (e.g. an all-noise or single-cluster result),
         the three metrics are reported as `None` with an explanatory note
         rather than letting sklearn raise. `noise_count`/`noise_fraction` are
         always reported, regardless of whether the metrics could be computed.
+
+        Independently of whether the metrics were computable, a result is
+        only considered valid/eligible to win a sweep if it also satisfies
+        three additional, business-level constraints — each violated
+        independently of the others, and independently of whether the
+        metrics above were computable:
+
+        - `n_clusters_actual` falls within `[MIN_N_CLUSTERS, MAX_N_CLUSTERS]`
+          — too few clusters is treated as degenerate just as too many are.
+        - No single cluster holds more than `MAX_CLUSTER_SHARE` of all
+          points — a lopsided result where one cluster swallows most of the
+          dataset isn't a meaningful clustering.
+        - `noise_fraction` does not exceed `MAX_NOISE_FRACTION`.
+
+        `metrics` are still reported (not `None`) whenever they're
+        computable, even if one of the above constraints fails, so a
+        rejected result remains inspectable; only `metrics_valid` reflects
+        the rejection, with its own explanatory note per violated constraint.
 
         Args:
             embedding_matrix: The matrix HDBSCAN was fit on.
             labels: `model.labels_` (may include `-1` for noise).
 
         Returns:
-            A dict with keys `metrics` (the 3 metric values, `None` for any
-            skipped), `notes` (list of human-readable caveats),
-            `n_clusters_actual` (count of distinct non-negative labels),
-            `noise_count`, `noise_fraction`, and `metrics_valid` (True iff
-            none of the guarded metrics were skipped).
+            A dict with keys `metrics` (the 3 metric values, `None` only if
+            they couldn't be computed at all), `notes` (list of human-readable
+            caveats), `n_clusters_actual` (count of distinct non-negative
+            labels), `noise_count`, `noise_fraction`, and `metrics_valid`
+            (True iff the metrics were computable *and* `n_clusters_actual`,
+            the largest cluster's share of all points, and `noise_fraction`
+            all satisfy the constraints described above).
         """
         n_samples = embedding_matrix.shape[0]
         noise_mask = labels == -1
@@ -247,8 +283,14 @@ class HDBSCANClusterer:
         n_clusters_actual = len(set(non_noise_labels.tolist()))
         notes: list[str] = []
 
-        can_score = 2 <= n_clusters_actual <= n_non_noise - 1
-        if can_score:
+        if n_non_noise > 0:
+            _, cluster_counts = np.unique(non_noise_labels, return_counts=True)
+            max_cluster_share = float(cluster_counts.max()) / n_samples
+        else:
+            max_cluster_share = 0.0
+
+        can_compute = 2 <= n_clusters_actual <= n_non_noise - 1
+        if can_compute:
             metrics = {
                 "silhouette_score": float(silhouette_score(non_noise_matrix, non_noise_labels)),
                 "davies_bouldin_index": float(davies_bouldin_score(non_noise_matrix, non_noise_labels)),
@@ -267,13 +309,41 @@ class HDBSCANClusterer:
                 f"(noise_count={noise_count} of {n_samples})"
             )
 
+        in_desired_cluster_count_range = self.MIN_N_CLUSTERS <= n_clusters_actual <= self.MAX_N_CLUSTERS
+        if not in_desired_cluster_count_range:
+            notes.append(
+                f"n_clusters_actual={n_clusters_actual} is outside the desired range "
+                f"[{self.MIN_N_CLUSTERS}, {self.MAX_N_CLUSTERS}]; treating this result as invalid/degenerate"
+            )
+
+        within_max_cluster_share = max_cluster_share <= self.MAX_CLUSTER_SHARE
+        if not within_max_cluster_share:
+            notes.append(
+                f"the largest cluster holds {max_cluster_share:.1%} of all points, exceeding "
+                f"MAX_CLUSTER_SHARE={self.MAX_CLUSTER_SHARE:.0%}; treating this result as invalid/degenerate"
+            )
+
+        within_max_noise_fraction = noise_fraction <= self.MAX_NOISE_FRACTION
+        if not within_max_noise_fraction:
+            notes.append(
+                f"noise_fraction={noise_fraction:.1%} exceeds MAX_NOISE_FRACTION="
+                f"{self.MAX_NOISE_FRACTION:.0%}; treating this result as invalid/degenerate"
+            )
+
+        metrics_valid = (
+            can_compute
+            and in_desired_cluster_count_range
+            and within_max_cluster_share
+            and within_max_noise_fraction
+        )
+
         return {
             "metrics": metrics,
             "notes": notes,
             "n_clusters_actual": n_clusters_actual,
             "noise_count": noise_count,
             "noise_fraction": noise_fraction,
-            "metrics_valid": can_score,
+            "metrics_valid": metrics_valid,
         }
 
     def build_assignment_rows(
@@ -389,8 +459,9 @@ class SweepCandidate:
             `cluster_selection_epsilon`/`alpha` values this candidate used.
         status: `"invalid"` if `HDBSCANClusterer.validate_hyperparameters`
             rejected the combination for this dataset (never fit);
-            `"degenerate"` if fitting succeeded but produced no usable
-            quality metrics (e.g. all-noise); `"ok"` otherwise.
+            `"degenerate"` if fitting succeeded but `metrics_valid` came back
+            `False` (see `HDBSCANClusterer.compute_metrics`'s eligibility
+            constraints); `"ok"` otherwise.
         detail: Human-readable explanation, set for `"invalid"`/`"degenerate"`.
         metrics_result: `HDBSCANClusterer.compute_metrics(...)`'s return
             value, set whenever fitting was attempted (`"degenerate"`/`"ok"`).

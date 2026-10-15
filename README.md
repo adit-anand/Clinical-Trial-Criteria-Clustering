@@ -290,7 +290,16 @@ DBCV score that decided the winner). As with the k-means step, the first
 three metrics require between 2 and `n_non_noise - 1` distinct clusters
 among non-noise points to be computable; if a run falls outside that range
 (e.g. an all-noise result), they are reported as `null` with an explanatory
-note and `metrics_valid` is `false`.
+note and `metrics_valid` is `false`. Independently of computability, a
+combination is also only considered valid if it satisfies three further,
+business-level constraints: its resulting cluster count falls between
+`HDBSCANClusterer.MIN_N_CLUSTERS` (`10`) and `MAX_N_CLUSTERS` (`100`); no
+single cluster holds more than `MAX_CLUSTER_SHARE` (`20%`) of all points;
+and `noise_fraction` does not exceed `MAX_NOISE_FRACTION` (`20%`). A
+combination that fails any of these still has its metrics computed and
+reported where possible (so it remains inspectable), but is treated as
+invalid/degenerate and is never eligible to win, with its own explanatory
+note per violated constraint.
 
 A combination invalid for the dataset (e.g. `--min-samples` exceeding the
 sample count) is logged as skipped rather than aborting the rest of the
@@ -427,9 +436,10 @@ tried, not just the winner.
 A configuration invalid for the dataset (e.g. `--umap-n-neighbors` exceeding
 the sample count) is skipped rather than aborting the rest of the sweep; a
 configuration whose winning seed's representative repeat produces a
-degenerate result (e.g. all noise) is recorded but never eligible to win.
-If no configuration produces a usable relative validity index, nothing is
-written. Re-running this step for the same condition overwrites all three
+degenerate result — per `HDBSCANClusterer.compute_metrics`'s eligibility
+constraints (cluster count, dominant-cluster share, noise fraction — see
+step 4) — is recorded but never eligible to win. If no configuration
+produces a usable relative validity index, nothing is written. Re-running this step for the same condition overwrites all three
 existing output files wholesale.
 
 The total planned fit count (`configurations x seeds x repeats_per_seed`) is
