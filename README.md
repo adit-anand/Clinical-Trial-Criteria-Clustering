@@ -28,6 +28,14 @@ Pipeline for building embeddings of clinical trial eligibility criteria:
    HDBSCAN's hyperparameters for a condition's existing embeddings, and
    writes the best-performing combination's cluster assignments and metrics
    as that condition's HDBSCAN output.
+7. **`src/clustering/umap_hdbscan_clustering.py`** — reduces a condition's
+   embeddings with UMAP (sweeping UMAP's own hyperparameters and a
+   user-supplied seed list for reproducibility) before clustering the
+   reduced vectors with HDBSCAN, writing the reduced embeddings plus cluster
+   assignments and metrics.
+8. **`src/clustering/pacmap_hdbscan_clustering.py`** — the same idea as step
+   7, reducing with PaCMAP instead of UMAP. The config/seed/repeat sweep
+   mechanics both steps share live in `src/clustering/reduction_sweep.py`.
 
 ## Project structure
 
@@ -59,17 +67,25 @@ src/
     ├── kmeans_clustering.py              # step 3
     ├── hdbscan_clustering.py             # step 4
     ├── clustering_report.py              # step 5
-    └── hdbscan_sweep.py                  # step 6
+    ├── hdbscan_sweep.py                  # step 6
+    ├── reduction_sweep.py                # shared config/seed/repeat sweep engine (steps 7-8)
+    ├── umap_hdbscan_clustering.py        # step 7
+    └── pacmap_hdbscan_clustering.py      # step 8
 ```
 
 Within `src/clustering/`, `clustering_io.py` holds everything genuinely
-common to both clustering algorithms (reading/validating embeddings,
-resolving default I/O paths, writing output); `kmeans_clustering.py` and
-`hdbscan_clustering.py` each hold only their own algorithm's fitting and
-metrics logic, so adding a third clustering algorithm means adding one new
-sibling module, not touching the shared I/O layer or the other algorithms.
+common to every clustering algorithm (reading/validating embeddings,
+resolving default I/O paths, writing output); each algorithm module
+(`kmeans_clustering.py`, `hdbscan_clustering.py`, `umap_hdbscan_clustering.py`,
+`pacmap_hdbscan_clustering.py`) holds only its own fitting and metrics logic,
+so adding another clustering algorithm means adding one new sibling module,
+not touching the shared I/O layer or the other algorithms.
 `clustering_report.py` and `hdbscan_sweep.py` build on top of that same
-layer without modifying it.
+layer without modifying it. `umap_hdbscan_clustering.py` and
+`pacmap_hdbscan_clustering.py` additionally share `reduction_sweep.py`, which
+holds the reducer-agnostic config/seed/repeat sweep mechanics common to both
+(picking the most reproducible seed per configuration, then the
+best-scoring configuration overall) so neither module re-implements it.
 
 ## Setup
 
@@ -273,9 +289,10 @@ files; there is no append/skip-if-exists/merge behavior.
 uv run python -m src.clustering.clustering_report "breast cancer"
 ```
 
-This reads whichever of the k-means/HDBSCAN metrics JSON files already exist
-for the condition — it never re-runs clustering — and writes a single
-consolidated Markdown report comparing their performance:
+This reads whichever of the k-means/HDBSCAN/UMAP+HDBSCAN/PaCMAP+HDBSCAN
+metrics JSON files already exist for the condition — it never re-runs
+clustering — and writes a single consolidated Markdown report comparing
+their performance:
 
 ```
 data/clustering/reports/<condition_slug>_clustering_report_<timestamp>.md
@@ -356,6 +373,139 @@ attempted.
 | `--assignments-output-path`        | no       | Override the default output cluster-assignments Parquet path (`data/clustering/hdbscan/<condition_slug>_trials_hdbscan_clusters.parquet`). |
 | `--metrics-output-path`            | no       | Override the default output metrics JSON path (`data/clustering/hdbscan/<condition_slug>_trials_hdbscan_cluster_metrics.json`). |
 
+## 7. UMAP + HDBSCAN clustering
+
+```bash
+uv run python -m src.clustering.umap_hdbscan_clustering "breast cancer" --umap-n-neighbors 10,15,30 --seeds 1,2,3,4,5
+```
+
+This reads the same embeddings Parquet file as the other clustering steps,
+drops rows whose embedding failed, and reduces the remaining embedding
+vectors' dimensionality with UMAP before clustering the reduced vectors with
+HDBSCAN. Three things are swept, nested in this order:
+
+1. **UMAP configuration** — the Cartesian product of `--umap-n-components`,
+   `--umap-n-neighbors`, and `--umap-min-dist` value lists (`--umap-metric`
+   is held fixed across the whole sweep, not swept).
+2. **Seed** — every value in `--seeds`, UMAP's `random_state` for that
+   configuration.
+3. **Repeat** — `--repeats-per-seed` (default `10`) independent fits of the
+   same (configuration, seed) pair, used to measure how *reproducible* that
+   seed is.
+
+For each configuration, the seed whose repeats are most mutually
+consistent (lowest standard deviation of noise fraction across its repeats)
+is chosen — not the seed with the best score — and one of its repeats (the
+one closest to that seed's own mean noise fraction) becomes that
+configuration's representative result. Across configurations, the one
+whose representative result has the highest relative validity index (DBCV),
+tie-broken by the lowest noise fraction, wins overall — the same
+winner-selection semantics `hdbscan_sweep.py` already uses. HDBSCAN's own
+hyperparameters (`--hdbscan-min-cluster-size`, etc.) are held fixed across
+this whole sweep rather than swept; use `hdbscan_sweep.py` separately
+against this step's own reduced-embeddings output if you also want to sweep
+those. It writes:
+
+```
+data/clustering/umap_hdbscan/<condition_slug>_trials_umap_reduced_embeddings.parquet
+data/clustering/umap_hdbscan/<condition_slug>_trials_umap_hdbscan_clusters.parquet
+data/clustering/umap_hdbscan/<condition_slug>_trials_umap_hdbscan_cluster_metrics.json
+```
+
+The reduced-embeddings Parquet file has one row per successfully-embedded
+criterion, containing `nct_id`, `study_first_posted_date`, `criterion_text`,
+`criterion_type`, `reduced_embedding`, `embedding_backend`,
+`embedding_model`, and `reduced_at` — independently joinable back to the
+source criteria via `nct_id` without needing the cluster assignments. The
+cluster-assignments Parquet file has the same schema `hdbscan_clustering.py`
+itself writes. The metrics JSON has the same envelope and clustering-quality
+fields as an ordinary HDBSCAN run, plus `winning_umap_config`,
+`winning_seed`, `winning_seed_noise_fraction_std`, and a full
+`umap_config_search` audit trail recording every configuration/seed/repeat
+tried, not just the winner.
+
+A configuration invalid for the dataset (e.g. `--umap-n-neighbors` exceeding
+the sample count) is skipped rather than aborting the rest of the sweep; a
+configuration whose winning seed's representative repeat produces a
+degenerate result (e.g. all noise) is recorded but never eligible to win.
+If no configuration produces a usable relative validity index, nothing is
+written. Re-running this step for the same condition overwrites all three
+existing output files wholesale.
+
+The total planned fit count (`configurations x seeds x repeats_per_seed`) is
+capped at 300, the configuration grid at 12 combinations, the seed list at
+10, and `--repeats-per-seed` at 10; exceeding any of these raises an error
+before any fitting is attempted.
+
+### Arguments
+
+| Argument                           | Required | Description                                                                 |
+| ----------------------------------- | -------- | ---------------------------------------------------------------------------- |
+| `condition`                          | yes      | Condition to cluster, e.g. `"breast cancer"`. Must match the condition passed to `criteria_embedding.py` (used to derive default input/output paths). |
+| `--umap-n-components`                | no       | Comma-separated list of UMAP `n_components` values to sweep (default: `2`). |
+| `--umap-n-neighbors`                 | no       | Comma-separated list of UMAP `n_neighbors` values to sweep (default: `15`). |
+| `--umap-min-dist`                    | no       | Comma-separated list of UMAP `min_dist` values to sweep (default: `0.1`). |
+| `--umap-metric`                      | no       | UMAP distance metric, held fixed across the sweep (default: `euclidean`). |
+| `--seeds`                            | no       | Comma-separated list of seeds to sweep for reproducibility (default: `42`). |
+| `--repeats-per-seed`                 | no       | Number of repeated fits per (configuration, seed) pair (default: `10`). |
+| `--hdbscan-min-cluster-size`         | no       | Fixed HDBSCAN `min_cluster_size`, not swept (default: `5`). |
+| `--hdbscan-min-samples`              | no       | Fixed HDBSCAN `min_samples`, not swept (default: `min_cluster_size`). |
+| `--hdbscan-metric`                   | no       | Fixed HDBSCAN distance metric, not swept (default: `euclidean`). |
+| `--hdbscan-cluster-selection-epsilon`| no       | Fixed HDBSCAN `cluster_selection_epsilon`, not swept (default: `0.0`). |
+| `--hdbscan-cluster-selection-method` | no       | Fixed HDBSCAN `cluster_selection_method`, not swept: `eom` or `leaf` (default: `eom`). |
+| `--hdbscan-alpha`                    | no       | Fixed HDBSCAN `alpha`, not swept (default: `1.0`). |
+| `--input-path`                       | no       | Override the default input embeddings Parquet path (`data/embeddings/<condition_slug>_trials_embeddings.parquet`). |
+| `--reduced-embeddings-output-path`   | no       | Override the default output reduced-embeddings Parquet path. |
+| `--assignments-output-path`          | no       | Override the default output cluster-assignments Parquet path. |
+| `--metrics-output-path`              | no       | Override the default output metrics JSON path. |
+
+## 8. PaCMAP + HDBSCAN clustering
+
+```bash
+uv run python -m src.clustering.pacmap_hdbscan_clustering "breast cancer" --pacmap-n-neighbors 10,15,30 --seeds 1,2,3,4,5
+```
+
+The same idea as step 7, reducing with [PaCMAP](https://github.com/YingfanWang/PaCMAP)
+instead of UMAP. PaCMAP has no `min_dist` equivalent — its
+neighborhood/distance behavior is instead shaped by `--pacmap-mn-ratio` and
+`--pacmap-fp-ratio`, which weight mid-near vs. further point pairs during
+optimization. Everything else — the configuration/seed/repeat sweep,
+winner-selection semantics, fixed (non-swept) HDBSCAN hyperparameters, sweep
+caps, and overwrite-on-rerun behavior — is identical to step 7. It writes:
+
+```
+data/clustering/pacmap_hdbscan/<condition_slug>_trials_pacmap_reduced_embeddings.parquet
+data/clustering/pacmap_hdbscan/<condition_slug>_trials_pacmap_hdbscan_clusters.parquet
+data/clustering/pacmap_hdbscan/<condition_slug>_trials_pacmap_hdbscan_cluster_metrics.json
+```
+
+with the reduced-embeddings schema, cluster-assignments schema, and metrics
+JSON shape (as `winning_pacmap_config`/`pacmap_config_search` instead of
+`winning_umap_config`/`umap_config_search`) otherwise identical to step 7's.
+
+### Arguments
+
+| Argument                           | Required | Description                                                                 |
+| ----------------------------------- | -------- | ---------------------------------------------------------------------------- |
+| `condition`                          | yes      | Condition to cluster, e.g. `"breast cancer"`. Must match the condition passed to `criteria_embedding.py` (used to derive default input/output paths). |
+| `--pacmap-n-components`              | no       | Comma-separated list of PaCMAP `n_components` values to sweep (default: `2`). |
+| `--pacmap-n-neighbors`               | no       | Comma-separated list of PaCMAP `n_neighbors` values to sweep (default: `10`). |
+| `--pacmap-mn-ratio`                  | no       | Comma-separated list of PaCMAP `MN_ratio` values to sweep (default: `0.5`). |
+| `--pacmap-fp-ratio`                  | no       | Comma-separated list of PaCMAP `FP_ratio` values to sweep (default: `2.0`). |
+| `--pacmap-distance`                  | no       | PaCMAP distance metric, held fixed across the sweep (default: `euclidean`). |
+| `--seeds`                            | no       | Comma-separated list of seeds to sweep for reproducibility (default: `42`). |
+| `--repeats-per-seed`                 | no       | Number of repeated fits per (configuration, seed) pair (default: `10`). |
+| `--hdbscan-min-cluster-size`         | no       | Fixed HDBSCAN `min_cluster_size`, not swept (default: `5`). |
+| `--hdbscan-min-samples`              | no       | Fixed HDBSCAN `min_samples`, not swept (default: `min_cluster_size`). |
+| `--hdbscan-metric`                   | no       | Fixed HDBSCAN distance metric, not swept (default: `euclidean`). |
+| `--hdbscan-cluster-selection-epsilon`| no       | Fixed HDBSCAN `cluster_selection_epsilon`, not swept (default: `0.0`). |
+| `--hdbscan-cluster-selection-method` | no       | Fixed HDBSCAN `cluster_selection_method`, not swept: `eom` or `leaf` (default: `eom`). |
+| `--hdbscan-alpha`                    | no       | Fixed HDBSCAN `alpha`, not swept (default: `1.0`). |
+| `--input-path`                       | no       | Override the default input embeddings Parquet path (`data/embeddings/<condition_slug>_trials_embeddings.parquet`). |
+| `--reduced-embeddings-output-path`   | no       | Override the default output reduced-embeddings Parquet path. |
+| `--assignments-output-path`          | no       | Override the default output cluster-assignments Parquet path. |
+| `--metrics-output-path`              | no       | Override the default output metrics JSON path. |
+
 ### Example: full pipeline for one condition
 
 ```bash
@@ -365,4 +515,6 @@ uv run python -m src.clustering.kmeans_clustering "breast cancer"
 uv run python -m src.clustering.hdbscan_clustering "breast cancer"
 uv run python -m src.clustering.clustering_report "breast cancer"
 uv run python -m src.clustering.hdbscan_sweep "breast cancer" --min-cluster-size 5,10,15
+uv run python -m src.clustering.umap_hdbscan_clustering "breast cancer" --umap-n-neighbors 10,15,30 --seeds 1,2,3,4,5
+uv run python -m src.clustering.pacmap_hdbscan_clustering "breast cancer" --pacmap-n-neighbors 10,15,30 --seeds 1,2,3,4,5
 ```
