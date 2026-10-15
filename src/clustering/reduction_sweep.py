@@ -16,7 +16,7 @@ once:
         among the per-config winning seeds, pick the config whose
         representative repeat has the highest relative validity index
         (DBCV), tie-broken by lowest noise_fraction — identical
-        winner-selection semantics to `hdbscan_sweep.select_best`.
+        winner-selection semantics to `hdbscan_clustering.select_best`.
 
 Reproducibility is measured as the standard deviation of `noise_fraction`
 (population stdev, via `statistics.pstdev`, since a seed's repeats are
@@ -51,7 +51,7 @@ from src.clustering.hdbscan_clustering import HDBSCANClusterer
 
 logger = logging.getLogger(__name__)
 
-# Unlike `hdbscan_sweep.py`'s flat Cartesian product, this sweep's total unit
+# Unlike `hdbscan_clustering.py`'s own sweep's flat Cartesian product, this sweep's total unit
 # of work is `n_configs * n_seeds * repeats_per_seed` (each unit being a
 # reducer fit plus an HDBSCAN fit, more expensive than a lone HDBSCAN fit),
 # so each dimension gets its own, tighter cap, plus a cap on the product
@@ -279,7 +279,7 @@ def evaluate_repeat(
     try:
         # hdbscan.validity.validity_index requires float64 input (its Cython
         # core is compiled against double_t); reduced matrices may be
-        # float32, so cast just for this call, exactly as hdbscan_sweep.py does.
+        # float32, so cast just for this call, exactly as hdbscan_clustering.py does.
         relative_validity = float(
             validity.validity_index(
                 reduced_matrix.astype(np.float64), labels, metric=hdbscan_clusterer.metric
@@ -448,7 +448,7 @@ def select_best_config(candidates: list[ReducerConfigCandidate]) -> ReducerConfi
         The `"ok"` candidate whose representative repeat has the highest
         `relative_validity` (ties broken by the lowest `noise_fraction`), or
         `None` if no candidate has a computed relative validity index —
-        identical semantics to `hdbscan_sweep.select_best`.
+        identical semantics to `hdbscan_clustering.select_best`.
     """
     eligible = [
         c for c in candidates if c.status == "ok" and representative_repeat(c).relative_validity is not None

@@ -17,17 +17,18 @@ Pipeline for building embeddings of clinical trial eligibility criteria:
    assignments plus clustering performance metrics.
 4. **`src/clustering/hdbscan_clustering.py`** — reads the same Parquet file
    and clusters the embedding vectors via HDBSCAN (density-based clustering,
-   no fixed cluster count), writing cluster assignments plus performance
-   metrics in a parallel format. Read/validate/write logic shared between
-   the two clustering approaches lives in `src/clustering/clustering_io.py`.
+   no fixed cluster count), sweeping the Cartesian product of its
+   hyperparameter value lists (a single value per flag is a sweep of size
+   one) and writing the best-performing combination's cluster assignments
+   plus performance metrics. Read/validate/write logic shared between the
+   clustering approaches lives in `src/clustering/clustering_io.py`.
 5. **`src/clustering/clustering_report.py`** — reads the metrics JSON already
    written by whichever of the clustering steps above have been run for a
    condition, and writes one consolidated Markdown report comparing their
    performance side by side.
-6. **`src/clustering/hdbscan_sweep.py`** — tries multiple combinations of
-   HDBSCAN's hyperparameters for a condition's existing embeddings, and
-   writes the best-performing combination's cluster assignments and metrics
-   as that condition's HDBSCAN output.
+6. **`src/clustering/hdbscan_sweep.py`** — a backward-compatible alias for
+   step 4's CLI; holds no logic of its own (step 4 always sweeps now, so
+   there's no separate sweep step to have its own module).
 7. **`src/clustering/umap_hdbscan_clustering.py`** — reduces a condition's
    embeddings with UMAP (sweeping UMAP's own hyperparameters and a
    user-supplied seed list for reproducibility) before clustering the
@@ -67,7 +68,7 @@ src/
     ├── kmeans_clustering.py              # step 3
     ├── hdbscan_clustering.py             # step 4
     ├── clustering_report.py              # step 5
-    ├── hdbscan_sweep.py                  # step 6
+    ├── hdbscan_sweep.py                  # step 6 (alias for step 4, no logic)
     ├── reduction_sweep.py                # shared config/seed/repeat sweep engine (steps 7-8)
     ├── umap_hdbscan_clustering.py        # step 7
     └── pacmap_hdbscan_clustering.py      # step 8
@@ -80,8 +81,9 @@ resolving default I/O paths, writing output); each algorithm module
 `pacmap_hdbscan_clustering.py`) holds only its own fitting and metrics logic,
 so adding another clustering algorithm means adding one new sibling module,
 not touching the shared I/O layer or the other algorithms.
-`clustering_report.py` and `hdbscan_sweep.py` build on top of that same
-layer without modifying it. `umap_hdbscan_clustering.py` and
+`clustering_report.py` builds on top of that same layer without modifying
+it; `hdbscan_sweep.py` is a thin alias re-exporting `hdbscan_clustering.py`'s
+CLI and holds no logic of its own. `umap_hdbscan_clustering.py` and
 `pacmap_hdbscan_clustering.py` additionally share `reduction_sweep.py`, which
 holds the reducer-agnostic config/seed/repeat sweep mechanics common to both
 (picking the most reproducible seed per configuration, then the
@@ -237,15 +239,27 @@ files; there is no append/skip-if-exists/merge behavior.
 ## 4. HDBSCAN clustering criteria
 
 ```bash
-uv run python -m src.clustering.hdbscan_clustering "breast cancer"
+uv run python -m src.clustering.hdbscan_clustering "breast cancer" --min-cluster-size 5,10,15 --alpha 0.8,1.0,1.2
 ```
 
 This reads the same embeddings Parquet file as the k-means step, drops rows
-whose embedding failed, and clusters the remaining embedding vectors via
-HDBSCAN (density-based clustering). Unlike k-means, there is no cluster count
-to choose — HDBSCAN discovers clusters of varying density directly from the
-data, and explicitly labels points that don't belong to any cluster as noise
-(`cluster_id == -1`). It writes:
+whose embedding failed, and fits HDBSCAN (density-based clustering) once per
+combination in the Cartesian product of the supplied
+`--min-cluster-size`/`--min-samples`/`--cluster-selection-epsilon`/`--alpha`
+value lists (`--metric`/`--cluster-selection-method` are held fixed across
+the whole sweep, not swept). Passing a single value for each — the
+default — is simply a sweep of size one: every invocation goes through the
+same combination-evaluation and winner-selection logic, whether there's one
+candidate or many. Unlike k-means, there is no cluster count to choose for
+any individual fit — HDBSCAN discovers clusters of varying density directly
+from the data, and explicitly labels points that don't belong to any
+cluster as noise (`cluster_id == -1`).
+
+Each combination's clustering performance metrics are logged as the sweep
+runs; no separate sweep-results file is written. Once every combination has
+been tried, the single best one — by relative validity index (DBCV, higher
+is better), with noise fraction (lower is better) as a tiebreaker — has its
+cluster assignments and metrics written:
 
 ```
 data/clustering/hdbscan/<condition_slug>_trials_hdbscan_clusters.parquet
@@ -257,13 +271,24 @@ The Parquet file has one row per successfully-embedded criterion, containing
 `cluster_id` (`-1` for noise), `cluster_probability` (HDBSCAN's cluster
 membership strength, `0.0` for noise points), `embedding_backend`,
 `embedding_model`, and `clustered_at`. The JSON file reports run provenance
-(sample/cluster counts, HDBSCAN parameters, `noise_count`/`noise_fraction`)
-plus clustering performance metrics — silhouette score, the Davies-Bouldin
-index, and the Calinski-Harabasz index — computed only over non-noise points.
-As with the k-means step, those three metrics require between 2 and
-`n_non_noise - 1` distinct clusters among non-noise points to be computable;
-if a run falls outside that range (e.g. an all-noise result), they are
-reported as `null` with an explanatory note and `metrics_valid` is `false`.
+(sample/cluster counts, the winning combination's HDBSCAN parameters,
+`noise_count`/`noise_fraction`) plus clustering performance metrics —
+silhouette score, the Davies-Bouldin index, the Calinski-Harabasz index
+(computed only over non-noise points), and `relative_validity_index` (the
+DBCV score that decided the winner). As with the k-means step, the first
+three metrics require between 2 and `n_non_noise - 1` distinct clusters
+among non-noise points to be computable; if a run falls outside that range
+(e.g. an all-noise result), they are reported as `null` with an explanatory
+note and `metrics_valid` is `false`.
+
+A combination invalid for the dataset (e.g. `--min-samples` exceeding the
+sample count) is logged as skipped rather than aborting the rest of the
+sweep; a combination that fits but produces a degenerate result (e.g. all
+noise) is logged but never eligible to win. If no combination produces a
+usable relative validity index — including when only the single default
+combination was tried and it's degenerate — nothing is written. The total
+number of combinations (the product of all four swept lists' lengths) is
+capped at 50; exceeding it raises an error before any fitting is attempted.
 
 Re-running this step for the same condition overwrites both existing output
 files; there is no append/skip-if-exists/merge behavior.
@@ -273,12 +298,12 @@ files; there is no append/skip-if-exists/merge behavior.
 | Argument                        | Required | Description                                                                 |
 | --------------------------------- | -------- | ---------------------------------------------------------------------------- |
 | `condition`                        | yes      | Condition to cluster, e.g. `"breast cancer"`. Must match the condition passed to `criteria_embedding.py` (used to derive default input/output paths). |
-| `--min-cluster-size`               | no       | Minimum size of a group of points to be considered a cluster (default: `5`). |
-| `--min-samples`                    | no       | Number of samples in a neighborhood for a point to be a core point (default: `min_cluster_size`). |
-| `--metric`                         | no       | Distance metric to use (default: `euclidean`). |
-| `--cluster-selection-epsilon`      | no       | Distance threshold below which clusters are merged (default: `0.0`). |
-| `--cluster-selection-method`       | no       | `eom` (excess of mass) or `leaf` (default: `eom`). |
-| `--alpha`                          | no       | Distance scaling parameter used in robust single linkage (default: `1.0`). |
+| `--min-cluster-size`               | no       | Comma-separated list of `min_cluster_size` values to try (default: `5`). |
+| `--min-samples`                    | no       | Comma-separated list of `min_samples` values to try (default: `5`). |
+| `--cluster-selection-epsilon`      | no       | Comma-separated list of `cluster_selection_epsilon` values to try (default: `0.0`). |
+| `--alpha`                          | no       | Comma-separated list of `alpha` values to try (default: `1.0`). |
+| `--metric`                         | no       | Distance metric to use, held fixed across the sweep (default: `euclidean`). |
+| `--cluster-selection-method`       | no       | `eom` (excess of mass) or `leaf`, held fixed across the sweep (default: `eom`). |
 | `--input-path`                     | no       | Override the default input embeddings Parquet path (`data/embeddings/<condition_slug>_trials_embeddings.parquet`). |
 | `--assignments-output-path`        | no       | Override the default output cluster-assignments Parquet path (`data/clustering/hdbscan/<condition_slug>_trials_hdbscan_clusters.parquet`). |
 | `--metrics-output-path`            | no       | Override the default output metrics JSON path (`data/clustering/hdbscan/<condition_slug>_trials_hdbscan_cluster_metrics.json`). |
@@ -322,56 +347,20 @@ the same condition are never overwritten or appended to.
 | `--output-dir`   | no       | Override the default report output directory (`data/clustering/reports`). |
 | `--print`        | no       | Also print the generated report to stdout, in addition to writing the file. |
 
-## 6. HDBSCAN hyperparameter sweep
+## 6. HDBSCAN hyperparameter sweep (alias)
 
 ```bash
 uv run python -m src.clustering.hdbscan_sweep "breast cancer" --min-cluster-size 5,10,15 --alpha 0.8,1.0,1.2
 ```
 
-This reads the same embeddings Parquet file as the ordinary HDBSCAN step and
-fits HDBSCAN once per combination in the Cartesian product of the supplied
-`--min-cluster-size`/`--min-samples`/`--cluster-selection-epsilon`/`--alpha`
-value lists (`--metric`/`--cluster-selection-method` are held fixed across
-the whole sweep, not swept). Each combination's clustering performance
-metrics are logged as the sweep runs; no separate sweep-results file is
-written. Once every combination has been tried, the single best one — by
-relative validity index (DBCV, higher is better), with noise fraction (lower
-is better) as a tiebreaker — has its cluster assignments and metrics written
-to the condition's normal HDBSCAN output location, exactly as if
-`hdbscan_clustering.py` had been run directly with those parameters:
-
-```
-data/clustering/hdbscan/<condition_slug>_trials_hdbscan_clusters.parquet
-data/clustering/hdbscan/<condition_slug>_trials_hdbscan_cluster_metrics.json
-```
-
-The written metrics JSON has the same schema as an ordinary HDBSCAN run,
-plus one extra field, `relative_validity_index`, recording the DBCV score
-that decided the winner. A combination invalid for the dataset (e.g.
-`--min-samples` exceeding the sample count) is logged as skipped rather than
-aborting the rest of the sweep; a combination that fits but produces a
-degenerate result (e.g. all noise) is logged but never eligible to win. If
-no combination produces a usable relative validity index, nothing is
-written. Re-running the sweep for the same condition overwrites the prior
-HDBSCAN output, exactly as re-running `hdbscan_clustering.py` directly would.
-The total number of combinations (the product of all four swept lists'
-lengths) is capped at 50; exceeding it raises an error before any fitting is
-attempted.
-
-### Arguments
-
-| Argument                        | Required | Description                                                                 |
-| --------------------------------- | -------- | ---------------------------------------------------------------------------- |
-| `condition`                        | yes      | Condition to sweep, e.g. `"breast cancer"`. Must match the condition passed to `criteria_embedding.py` (used to derive default input/output paths). |
-| `--min-cluster-size`               | no       | Comma-separated list of `min_cluster_size` values to try (default: `5`). |
-| `--min-samples`                    | no       | Comma-separated list of `min_samples` values to try (default: `5`). |
-| `--cluster-selection-epsilon`      | no       | Comma-separated list of `cluster_selection_epsilon` values to try (default: `0.0`). |
-| `--alpha`                          | no       | Comma-separated list of `alpha` values to try (default: `1.0`). |
-| `--metric`                         | no       | Distance metric to use, held fixed across the sweep (default: `euclidean`). |
-| `--cluster-selection-method`       | no       | `eom` or `leaf`, held fixed across the sweep (default: `eom`). |
-| `--input-path`                     | no       | Override the default input embeddings Parquet path (`data/embeddings/<condition_slug>_trials_embeddings.parquet`). |
-| `--assignments-output-path`        | no       | Override the default output cluster-assignments Parquet path (`data/clustering/hdbscan/<condition_slug>_trials_hdbscan_clusters.parquet`). |
-| `--metrics-output-path`            | no       | Override the default output metrics JSON path (`data/clustering/hdbscan/<condition_slug>_trials_hdbscan_cluster_metrics.json`). |
+`hdbscan_clustering.py` (step 4) now always sweeps — a single value per flag
+is simply a sweep of size one — so there is no longer a distinct sweep step.
+This module is kept only so existing invocations of
+`uv run python -m src.clustering.hdbscan_sweep ...` keep working: it holds
+no logic of its own and just re-exports step 4's CLI and functions under
+this module's name. The command above is exactly equivalent to running
+`uv run python -m src.clustering.hdbscan_clustering "breast cancer" --min-cluster-size 5,10,15 --alpha 0.8,1.0,1.2`
+directly — see step 4 for the full behavior, output schema, and arguments.
 
 ## 7. UMAP + HDBSCAN clustering
 
@@ -400,11 +389,11 @@ one closest to that seed's own mean noise fraction) becomes that
 configuration's representative result. Across configurations, the one
 whose representative result has the highest relative validity index (DBCV),
 tie-broken by the lowest noise fraction, wins overall — the same
-winner-selection semantics `hdbscan_sweep.py` already uses. HDBSCAN's own
-hyperparameters (`--hdbscan-min-cluster-size`, etc.) are held fixed across
-this whole sweep rather than swept; use `hdbscan_sweep.py` separately
-against this step's own reduced-embeddings output if you also want to sweep
-those. It writes:
+winner-selection semantics `hdbscan_clustering.py` already uses. HDBSCAN's
+own hyperparameters (`--hdbscan-min-cluster-size`, etc.) are held fixed
+across this whole sweep rather than swept; run `hdbscan_clustering.py`
+separately against this step's own reduced-embeddings output (via
+`--input-path`) if you also want to sweep those. It writes:
 
 ```
 data/clustering/umap_hdbscan/<condition_slug>_trials_umap_reduced_embeddings.parquet
@@ -512,9 +501,8 @@ JSON shape (as `winning_pacmap_config`/`pacmap_config_search` instead of
 uv run python -m src.preprocessing.criteria_retrieval "breast cancer"
 uv run python -m src.embeddings.criteria_embedding "breast cancer" --backend huggingface
 uv run python -m src.clustering.kmeans_clustering "breast cancer"
-uv run python -m src.clustering.hdbscan_clustering "breast cancer"
+uv run python -m src.clustering.hdbscan_clustering "breast cancer" --min-cluster-size 5,10,15
 uv run python -m src.clustering.clustering_report "breast cancer"
-uv run python -m src.clustering.hdbscan_sweep "breast cancer" --min-cluster-size 5,10,15
 uv run python -m src.clustering.umap_hdbscan_clustering "breast cancer" --umap-n-neighbors 10,15,30 --seeds 1,2,3,4,5
 uv run python -m src.clustering.pacmap_hdbscan_clustering "breast cancer" --pacmap-n-neighbors 10,15,30 --seeds 1,2,3,4,5
 ```

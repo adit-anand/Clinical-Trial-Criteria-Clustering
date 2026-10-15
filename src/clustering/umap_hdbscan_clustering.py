@@ -8,8 +8,8 @@ seed in a user-supplied seed list is fit ``repeats_per_seed`` times (default
 10) so the most *reproducible* seed — the one whose repeats agree most with
 each other, not the one that scores best — can be selected; HDBSCAN's own
 hyperparameters are held fixed across the whole sweep rather than swept
-(``hdbscan_sweep.py`` already covers sweeping those alone, including against
-this step's own reduced-embeddings output). The config/seed/repeat sweep
+(``hdbscan_clustering.py`` already covers sweeping those alone, including
+against this step's own reduced-embeddings output). The config/seed/repeat sweep
 mechanics — reducer-agnostic — live in ``reduction_sweep.py``; this module
 only supplies UMAP's own fit/validate functions and this step's I/O.
 
@@ -58,8 +58,12 @@ from src.paths import REPO_ROOT
 from src.preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
 from src.clustering import clustering_io
 from src.clustering import reduction_sweep
-from src.clustering.hdbscan_clustering import HDBSCAN_CLUSTER_PARQUET_SCHEMA, HDBSCANClusterer
-from src.clustering.hdbscan_sweep import parse_float_list, parse_int_list
+from src.clustering.hdbscan_clustering import (
+    HDBSCAN_CLUSTER_PARQUET_SCHEMA,
+    HDBSCANClusterer,
+    parse_float_list,
+    parse_int_list,
+)
 
 OUTPUT_DIR = REPO_ROOT / "data" / "clustering" / "umap_hdbscan"
 
