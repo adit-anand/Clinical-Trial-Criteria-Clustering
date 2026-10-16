@@ -58,10 +58,10 @@ logger = logging.getLogger(__name__)
 # reducer fit plus an HDBSCAN fit, more expensive than a lone HDBSCAN fit),
 # so each dimension gets its own, tighter cap, plus a cap on the product
 # itself.
-MAX_CONFIG_COMBINATIONS = 12
+MAX_CONFIG_COMBINATIONS = 100
 MAX_SEEDS = 10
 MAX_REPEATS_PER_SEED = 10
-MAX_TOTAL_FITS = 300
+MAX_TOTAL_FITS = 2000
 
 
 @dataclass(frozen=True)
