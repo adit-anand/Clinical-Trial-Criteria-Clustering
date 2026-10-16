@@ -87,7 +87,7 @@ logger = logging.getLogger(__name__)
 # lengths) is capped here; exceeding it raises an error before any fitting
 # is attempted. In fixed-`k` mode (no k_min/k_max sweep), this caps the
 # `--random-state` list alone.
-MAX_SWEEP_COMBINATIONS = 50
+MAX_SWEEP_COMBINATIONS = 100
 
 KMEANS_CLUSTER_PARQUET_SCHEMA = pa.schema(
     [
@@ -121,12 +121,26 @@ class KMeansClusterer:
     DEFAULT_RANDOM_STATE = 42
     DEFAULT_N_INIT = 10
     DEFAULT_MAX_ITER = 300
+    DEFAULT_METRIC = "euclidean"
+
+    # sklearn's KMeans has no pluggable distance metric at all — Lloyd's
+    # algorithm's centroid-averaging step is only mathematically well-defined
+    # under squared Euclidean distance, unlike HDBSCAN/PaCMAP's own `metric`
+    # parameters. "cosine" is still offered because it has a well-known,
+    # exact equivalence: L2-normalizing every embedding vector to unit length
+    # before fitting ordinary Euclidean k-means is "spherical k-means" —
+    # squared Euclidean distance between unit vectors is a strictly
+    # monotonic function of their cosine distance, so the two give identical
+    # cluster assignments. No other metric (e.g. manhattan) has an analogous
+    # equivalence for a mean-based centroid update, so none is offered.
+    VALID_METRICS = ("euclidean", "cosine")
 
     def __init__(
         self,
         random_state: int = DEFAULT_RANDOM_STATE,
         n_init: int = DEFAULT_N_INIT,
         max_iter: int = DEFAULT_MAX_ITER,
+        metric: str = DEFAULT_METRIC,
     ):
         """Store k-means configuration for this clusterer.
 
@@ -137,10 +151,16 @@ class KMeansClusterer:
             n_init: Number of k-means initializations to run per `k`,
                 keeping the best result by inertia.
             max_iter: Maximum number of iterations per initialization.
+            metric: `"euclidean"` (sklearn's own default) or `"cosine"`. Held
+                only for recording in `build_metrics_dict`'s `kmeans_params`
+                — the actual cosine behavior is implemented by normalizing
+                the embedding matrix *before* it ever reaches this class
+                (see `run_sweep`), not by anything in this class itself.
         """
         self.random_state = random_state
         self.n_init = n_init
         self.max_iter = max_iter
+        self.metric = metric
 
     def validate_k(self, n_clusters: int, n_samples: int) -> None:
         """Confirm a given `n_clusters` is usable for this dataset.
@@ -447,6 +467,7 @@ class KMeansClusterer:
                 "random_state": self.random_state,
                 "n_init": self.n_init,
                 "max_iter": self.max_iter,
+                "metric": self.metric,
             },
             "metrics": metrics_result["metrics"],
             "metrics_valid": metrics_result["metrics_valid"],
@@ -533,7 +554,7 @@ def generate_k_range_combinations(
 
 
 def evaluate_k_range_combination(
-    combo: dict, n_init: int, max_iter: int, embedding_matrix: np.ndarray, n_samples: int
+    combo: dict, n_init: int, max_iter: int, metric: str, embedding_matrix: np.ndarray, n_samples: int
 ) -> KMeansSweepCandidate:
     """Auto-select `k` within one `(k_min, k_max, random_state)` combination.
 
@@ -541,14 +562,18 @@ def evaluate_k_range_combination(
         combo: One combination from `generate_k_range_combinations`.
         n_init: Held fixed across the sweep.
         max_iter: Held fixed across the sweep.
-        embedding_matrix: Array of shape `(n_samples, embedding_dim)`.
+        metric: Held fixed across the sweep; recorded only (see
+            `KMeansClusterer.__init__`) — `embedding_matrix` is already
+            normalized by `run_sweep` beforehand if `metric == "cosine"`.
+        embedding_matrix: Array of shape `(n_samples, embedding_dim)`,
+            already normalized if `metric == "cosine"`.
         n_samples: `embedding_matrix.shape[0]`.
 
     Returns:
         A `KMeansSweepCandidate` reflecting whether the range was invalid or
         produced a usable result.
     """
-    clusterer = KMeansClusterer(random_state=combo["random_state"], n_init=n_init, max_iter=max_iter)
+    clusterer = KMeansClusterer(random_state=combo["random_state"], n_init=n_init, max_iter=max_iter, metric=metric)
     try:
         clusterer.validate_k_range(n_samples, combo["k_min"], combo["k_max"])
     except ValueError as exc:
@@ -568,7 +593,7 @@ def evaluate_k_range_combination(
 
 
 def evaluate_fixed_k_combination(
-    n_clusters: int, random_state: int, n_init: int, max_iter: int, embedding_matrix: np.ndarray, n_samples: int
+    n_clusters: int, random_state: int, n_init: int, max_iter: int, metric: str, embedding_matrix: np.ndarray, n_samples: int
 ) -> KMeansSweepCandidate:
     """Fit a single fixed `k` for one `random_state` combination.
 
@@ -577,14 +602,17 @@ def evaluate_fixed_k_combination(
         random_state: This combination's `random_state`.
         n_init: Held fixed across the sweep.
         max_iter: Held fixed across the sweep.
-        embedding_matrix: Array of shape `(n_samples, embedding_dim)`.
+        metric: Held fixed across the sweep; recorded only — `embedding_matrix`
+            is already normalized by `run_sweep` beforehand if `metric == "cosine"`.
+        embedding_matrix: Array of shape `(n_samples, embedding_dim)`,
+            already normalized if `metric == "cosine"`.
         n_samples: `embedding_matrix.shape[0]`.
 
     Returns:
         A `KMeansSweepCandidate` reflecting whether `n_clusters` was invalid
         or produced a usable result.
     """
-    clusterer = KMeansClusterer(random_state=random_state, n_init=n_init, max_iter=max_iter)
+    clusterer = KMeansClusterer(random_state=random_state, n_init=n_init, max_iter=max_iter, metric=metric)
     try:
         clusterer.validate_k(n_clusters, n_samples)
     except ValueError as exc:
@@ -676,6 +704,7 @@ def run_sweep(
     random_state_values: list[int] | None = None,
     n_init: int = KMeansClusterer.DEFAULT_N_INIT,
     max_iter: int = KMeansClusterer.DEFAULT_MAX_ITER,
+    metric: str = KMeansClusterer.DEFAULT_METRIC,
     input_path: Path | None = None,
     assignments_output_path: Path | None = None,
     metrics_output_path: Path | None = None,
@@ -703,6 +732,16 @@ def run_sweep(
             modes). Defaults to `[KMeansClusterer.DEFAULT_RANDOM_STATE]` if `None`.
         n_init: Held fixed across the sweep.
         max_iter: Held fixed across the sweep.
+        metric: `"euclidean"` (sklearn's own default) or `"cosine"`, held
+            fixed across the sweep. sklearn's `KMeans` has no pluggable
+            metric at all — Lloyd's algorithm's centroid-averaging step is
+            only mathematically defined under squared Euclidean distance.
+            `"cosine"` is implemented by L2-normalizing every embedding
+            vector to unit length *before* any fitting ("spherical
+            k-means") — squared Euclidean distance between unit vectors is
+            a strictly monotonic function of their cosine distance, so this
+            gives identical cluster assignments to a true cosine-distance
+            k-means, not an approximation.
         input_path: Embeddings Parquet to read. If omitted, defaults to
             the embeddings directory's `{slug}_trials_embeddings.parquet`.
         assignments_output_path: Where to write the winning combination's
@@ -720,7 +759,8 @@ def run_sweep(
     Raises:
         FileNotFoundError: If the resolved input Parquet does not exist.
         ValueError: If there are no successfully-embedded rows to cluster,
-            if embedding dimensionality is inconsistent, or if the requested
+            if embedding dimensionality is inconsistent, if `metric` isn't
+            one of `KMeansClusterer.VALID_METRICS`, or if the requested
             sweep has more than `MAX_SWEEP_COMBINATIONS` combinations.
     """
     if k_min_values is None:
@@ -729,6 +769,8 @@ def run_sweep(
         k_max_values = [None]
     if random_state_values is None:
         random_state_values = [KMeansClusterer.DEFAULT_RANDOM_STATE]
+    if metric not in KMeansClusterer.VALID_METRICS:
+        raise ValueError(f"Unknown metric {metric!r}; expected one of {KMeansClusterer.VALID_METRICS}")
 
     slug = EligibilityCriteriaFetcher.condition_to_slug(condition)
     default_input_path, default_assignments_path, default_metrics_path = clustering_io.resolve_default_paths(
@@ -750,6 +792,15 @@ def run_sweep(
     embedding_dim = clustering_io.validate_embedding_dimensions(filtered)
     embedding_matrix = clustering_io.extract_embedding_matrix(filtered)
 
+    if metric == "cosine":
+        norms = np.linalg.norm(embedding_matrix, axis=1, keepdims=True)
+        if np.any(norms == 0):
+            raise ValueError(
+                "Cannot normalize for metric='cosine': at least one embedding vector has zero norm"
+            )
+        embedding_matrix = embedding_matrix / norms
+        logger.info("run_sweep: normalized embedding vectors to unit length for metric='cosine'")
+
     resolved_k_min_values: list[int] | None = None
     resolved_k_max_values: list[int] | None = None
 
@@ -765,7 +816,7 @@ def run_sweep(
             len(random_state_values), n_clusters, condition, n_samples,
         )
         candidates = [
-            evaluate_fixed_k_combination(n_clusters, random_state, n_init, max_iter, embedding_matrix, n_samples)
+            evaluate_fixed_k_combination(n_clusters, random_state, n_init, max_iter, metric, embedding_matrix, n_samples)
             for random_state in random_state_values
         ]
     else:
@@ -781,7 +832,7 @@ def run_sweep(
             len(combos), condition, n_samples,
         )
         candidates = [
-            evaluate_k_range_combination(combo, n_init, max_iter, embedding_matrix, n_samples) for combo in combos
+            evaluate_k_range_combination(combo, n_init, max_iter, metric, embedding_matrix, n_samples) for combo in combos
         ]
 
     for index, candidate in enumerate(candidates, start=1):
@@ -796,7 +847,7 @@ def run_sweep(
         return None
 
     clustered_at = datetime.now(timezone.utc)
-    winning_clusterer = KMeansClusterer(random_state=best.random_state, n_init=n_init, max_iter=max_iter)
+    winning_clusterer = KMeansClusterer(random_state=best.random_state, n_init=n_init, max_iter=max_iter, metric=metric)
     labels = best.kmeans.labels_
 
     rows = winning_clusterer.build_assignment_rows(filtered, labels, clustered_at)
@@ -912,6 +963,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Maximum k-means iterations per initialization, held fixed across the sweep (default: 300)",
     )
     parser.add_argument(
+        "--metric",
+        type=str,
+        choices=KMeansClusterer.VALID_METRICS,
+        default=KMeansClusterer.DEFAULT_METRIC,
+        help=(
+            "Distance metric, held fixed across the sweep (default: euclidean). 'cosine' "
+            "L2-normalizes embedding vectors to unit length before fitting ordinary k-means "
+            "('spherical k-means') -- sklearn's KMeans has no pluggable metric of its own, "
+            "so no other metric is offered"
+        ),
+    )
+    parser.add_argument(
         "--input-path",
         type=Path,
         default=None,
@@ -946,6 +1009,7 @@ def main() -> None:
         random_state_values=args.random_state,
         n_init=args.n_init,
         max_iter=args.max_iter,
+        metric=args.metric,
         input_path=args.input_path,
         assignments_output_path=args.assignments_output_path,
         metrics_output_path=args.metrics_output_path,

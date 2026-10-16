@@ -242,11 +242,23 @@ whole sweep is auditable rather than a black box. A combination whose
 `[k_min, k_max]` range is invalid for the dataset (e.g. `k_max < k_min`) is
 skipped with a logged reason rather than aborting the rest of the sweep; if
 no combination produces a usable silhouette score, nothing is written. The
-total number of combinations is capped at 50; exceeding it raises an error
+total number of combinations is capped at 100; exceeding it raises an error
 before any fitting is attempted.
 
 Re-running this step for the same condition overwrites both existing output
 files; there is no append/skip-if-exists/merge behavior.
+
+`--metric` controls the distance metric, held fixed across the sweep.
+sklearn's `KMeans` has no pluggable metric of its own — Lloyd's algorithm's
+centroid-averaging step is only mathematically well-defined under squared
+Euclidean distance (`--metric euclidean`, the default). `--metric cosine` is
+still offered because it has an exact equivalence: embedding vectors are
+L2-normalized to unit length *before* fitting ordinary k-means ("spherical
+k-means") — squared Euclidean distance between unit vectors is a strictly
+monotonic function of their cosine distance, so this gives identical cluster
+assignments to a true cosine-distance k-means, not an approximation. No
+other metric (e.g. manhattan) has an analogous equivalence, so none is
+offered. `kmeans_params.metric` in the metrics JSON records which was used.
 
 ### Arguments
 
@@ -259,6 +271,7 @@ files; there is no append/skip-if-exists/merge behavior.
 | `--random-state`               | no       | Comma-separated list of random seeds to sweep for k-means initialization (default: `42`). |
 | `--n-init`                     | no       | Number of k-means initializations to run per `k`, held fixed across the sweep (default: `10`). |
 | `--max-iter`                   | no       | Maximum k-means iterations per initialization, held fixed across the sweep (default: `300`). |
+| `--metric`                     | no       | Distance metric, held fixed across the sweep: `euclidean` or `cosine` (see above; default: `euclidean`). |
 | `--input-path`                 | no       | Override the default input embeddings Parquet path (`data/embeddings/<condition_slug>_trials_embeddings.parquet`). |
 | `--assignments-output-path`    | no       | Override the default output cluster-assignments Parquet path (`data/clustering/kmeans/<condition_slug>_trials_clusters.parquet`). |
 | `--metrics-output-path`        | no       | Override the default output metrics JSON path (`data/clustering/kmeans/<condition_slug>_trials_cluster_metrics.json`). |
@@ -324,7 +337,7 @@ noise) is logged but never eligible to win. If no combination produces a
 usable relative validity index — including when only the single default
 combination was tried and it's degenerate — nothing is written. The total
 number of combinations (the product of all four swept lists' lengths) is
-capped at 50; exceeding it raises an error before any fitting is attempted.
+capped at 100; exceeding it raises an error before any fitting is attempted.
 
 Re-running this step for the same condition overwrites both existing output
 files; there is no append/skip-if-exists/merge behavior.
@@ -463,7 +476,7 @@ produces a usable relative validity index, nothing is written. Re-running this s
 existing output files wholesale.
 
 The total planned fit count (`configurations x seeds x repeats_per_seed`) is
-capped at 10000, the configuration grid at 500 combinations, the seed list
+capped at 10000, the configuration grid at 1000 combinations, the seed list
 at 10, and `--repeats-per-seed` at 10; exceeding any of these raises an
 error before any fitting is attempted.
 
@@ -510,7 +523,7 @@ that `n_neighbors` logged as `degenerate` and (if nothing else qualifies)
 the whole run write nothing. If you hit this, narrow `--pacmap-n-neighbors`
 to a lower range and sweep `--hdbscan-min-cluster-size` alongside it
 instead, as the example above does — mind the combinatorial caps described
-below (`MAX_CONFIG_COMBINATIONS=500`, `MAX_TOTAL_FITS=10000`) when widening
+below (`MAX_CONFIG_COMBINATIONS=1000`, `MAX_TOTAL_FITS=10000`) when widening
 either dimension; the example above uses 12 configurations (3 `n_neighbors`
 x 4 `min_cluster_size`) with a small `--seeds` list to keep the total fit
 count modest even though it's well under either cap.

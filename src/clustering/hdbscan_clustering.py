@@ -93,7 +93,7 @@ logger = logging.getLogger(__name__)
 # The total number of combinations (the product of all four swept lists'
 # lengths) is capped here; exceeding it raises an error before any fitting
 # is attempted.
-MAX_SWEEP_COMBINATIONS = 50
+MAX_SWEEP_COMBINATIONS = 100
 
 HDBSCAN_CLUSTER_PARQUET_SCHEMA = pa.schema(
     [
