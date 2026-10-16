@@ -1,14 +1,23 @@
-"""Cluster per-condition eligibility criteria embeddings via k-means.
+"""Cluster per-condition eligibility criteria embeddings via k-means, sweeping hyperparameters.
 
 Reads an embeddings Parquet file produced by
 `src/embeddings/criteria_embedding.py`
 (``data/embeddings/<condition>_trials_embeddings.parquet``), drops rows whose
 embedding failed (``embedding_success`` is False — there is no vector to
-cluster for those), and fits a `sklearn.cluster.KMeans` model over the
-remaining embedding vectors. By default, the number of clusters (`k`) is
-selected automatically: k-means is fit once per candidate `k` in a search
-range, and the `k` with the highest silhouette score is kept. Passing
-``--n-clusters`` instead skips the search and clusters at exactly that `k`.
+cluster for those), and fits `sklearn.cluster.KMeans` once per combination in
+the Cartesian product of the supplied `--k-min`/`--k-max`/`--random-state`
+value lists (`--n-init`/`--max-iter` are held fixed across the whole sweep,
+not swept). Passing a single value for each (the default) is simply a sweep
+of size one — every invocation goes through the same combination-evaluation
+and winner-selection path, whether there's one candidate or fifty.
+
+For each `(k_min, k_max, random_state)` combination, `k` is itself
+auto-selected by sweeping `[k_min, k_max]` with that `random_state` and
+keeping the `k` with the highest silhouette score (exactly as this module's
+"auto" mode always has); the single overall winner across every combination
+is then the one whose chosen `k` has the highest silhouette score of all.
+Passing ``--n-clusters`` instead fixes `k` and skips all `k`-selection
+entirely — only `--random-state` is swept in that case, over the fixed `k`.
 Either way, the run writes two output artifacts:
 
     data/clustering/kmeans/<condition>_trials_clusters.parquet
@@ -19,23 +28,37 @@ Either way, the run writes two output artifacts:
     data/clustering/kmeans/<condition>_trials_cluster_metrics.json
         Clustering performance metrics (inertia, silhouette score,
         Davies-Bouldin index, Calinski-Harabasz index) plus run provenance
-        (sample/cluster counts, k-means parameters), so clustering quality
-        can be reviewed without re-running the clustering step.
+        (sample/cluster counts, k-means parameters, the winning combination,
+        and the full sweep audit trail), so clustering quality can be
+        reviewed without re-running the clustering step.
+
+A combination whose `[k_min, k_max]` range is invalid for the dataset (e.g.
+`k_max < k_min`) is skipped with a logged reason rather than aborting the
+rest of the sweep. If no combination produces a usable silhouette score —
+including when only the single default combination was tried — nothing is
+written. The total number of combinations is capped at
+`MAX_SWEEP_COMBINATIONS`; exceeding it raises an error before any fitting is
+attempted.
 
 Re-running this step on the same condition overwrites both existing output
 files wholesale — there is no append/skip-if-exists/merge behavior.
 
 Read/validate/write logic shared with the HDBSCAN clustering pipeline (see
 `hdbscan_clustering.py`) lives in `clustering_io.py`; this module holds only
-k-means-specific logic (fitting, `k` selection, k-means's own metrics guard).
+k-means-specific logic (fitting, `k` selection, k-means's own metrics guard,
+and the hyperparameter sweep itself). `parse_int_list` (comma-separated CLI
+value parsing) is reused from `hdbscan_clustering.py` rather than redefined.
 """
 
 import argparse
+import itertools
 import logging
 import math
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pyarrow as pa
@@ -54,10 +77,17 @@ if not __package__:
 from src.paths import REPO_ROOT
 from src.preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
 from src.clustering import clustering_io
+from src.clustering.hdbscan_clustering import parse_int_list
 
 OUTPUT_DIR = REPO_ROOT / "data" / "clustering" / "kmeans"
 
 logger = logging.getLogger(__name__)
+
+# The total number of combinations (the product of the swept lists'
+# lengths) is capped here; exceeding it raises an error before any fitting
+# is attempted. In fixed-`k` mode (no k_min/k_max sweep), this caps the
+# `--random-state` list alone.
+MAX_SWEEP_COMBINATIONS = 50
 
 KMEANS_CLUSTER_PARQUET_SCHEMA = pa.schema(
     [
@@ -74,19 +104,17 @@ KMEANS_CLUSTER_PARQUET_SCHEMA = pa.schema(
 
 
 class KMeansClusterer:
-    """Orchestrates the read -> filter -> cluster -> score -> write pipeline for one condition.
+    """Fits and scores a single k-means hyperparameter combination.
 
-    Unlike `CriteriaEmbedder`/`EligibilityCriteriaFetcher`, this class holds
-    no long-lived expensive resource (no model/session) — k-means
-    configuration is cheap to store, and a fresh `KMeans` estimator is
-    constructed and fit per `run()` call since it is stateful per dataset.
+    Holds only the k-means configuration that's fixed across a sweep
+    (`random_state`/`n_init`/`max_iter`); `k`/`k_min`/`k_max` are passed
+    explicitly to each method per combination, not stored on the instance —
+    `run_sweep` (module-level, below) constructs one instance per
+    `random_state` it tries.
 
     Typical usage:
-        clusterer = KMeansClusterer()  # auto-selects k via silhouette score
-        assignments_path, metrics_path = clusterer.run("breast cancer")
-
-        clusterer = KMeansClusterer(n_clusters=20)  # fixed k, skips the search
-        assignments_path, metrics_path = clusterer.run("breast cancer")
+        clusterer = KMeansClusterer()
+        best_k, model, sweep_results = clusterer.select_optimal_k(embedding_matrix, 2, 50)
     """
 
     DEFAULT_K_MIN = 2
@@ -96,9 +124,6 @@ class KMeansClusterer:
 
     def __init__(
         self,
-        n_clusters: int | None = None,
-        k_min: int = DEFAULT_K_MIN,
-        k_max: int | None = None,
         random_state: int = DEFAULT_RANDOM_STATE,
         n_init: int = DEFAULT_N_INIT,
         max_iter: int = DEFAULT_MAX_ITER,
@@ -106,25 +131,13 @@ class KMeansClusterer:
         """Store k-means configuration for this clusterer.
 
         Args:
-            n_clusters: Fix the number of k-means clusters (`k`) and skip
-                automatic selection. If `None` (the default), `k` is
-                auto-selected by sweeping `[k_min, k_max]` and keeping the
-                `k` with the highest silhouette score.
-            k_min: Minimum `k` to search when auto-selecting. Ignored if
-                `n_clusters` is set.
-            k_max: Maximum `k` to search when auto-selecting. If `None`, a
-                default is computed per-dataset by `resolve_k_max`. Ignored
-                if `n_clusters` is set.
             random_state: Seed for k-means's centroid initialization, fixed
-                by default so repeated runs (and repeated sweeps) are
+                per instance so repeated runs (and repeated sweeps) are
                 reproducible.
             n_init: Number of k-means initializations to run per `k`,
                 keeping the best result by inertia.
             max_iter: Maximum number of iterations per initialization.
         """
-        self.n_clusters = n_clusters
-        self.k_min = k_min
-        self.k_max = k_max
         self.random_state = random_state
         self.n_init = n_init
         self.max_iter = max_iter
@@ -373,14 +386,18 @@ class KMeansClusterer:
         labels: np.ndarray,
         clustered_at: datetime,
         k_selection_mode: str,
-        k_min: int | None,
-        k_max: int | None,
-        k_search_results: list[dict] | None,
+        winning_k_min: int | None,
+        winning_k_max: int | None,
+        winning_k_search_results: list[dict] | None,
+        k_min_values: list[int] | None,
+        k_max_values: list[int] | None,
+        random_state_values: list[int],
+        all_candidates: list["KMeansSweepCandidate"],
     ) -> dict:
         """Assemble the full metrics JSON payload for one clustering run.
 
         Args:
-            condition: Condition string passed to `run`.
+            condition: Condition string passed to `run_sweep`.
             slug: `condition`'s filesystem-safe slug.
             input_path: The embeddings Parquet path that was read.
             assignments_output_path: Where cluster assignments were written.
@@ -388,19 +405,23 @@ class KMeansClusterer:
             n_samples_excluded: Number of input rows dropped for having
                 failed embeddings.
             embedding_dim: Common embedding dimensionality.
-            embedding_backend: Backend recorded on the clustered rows (or
-                `None` if there were none, which can't happen given
-                `n_samples > 0` is guaranteed before this is called).
+            embedding_backend: Backend recorded on the clustered rows.
             embedding_model: Model recorded on the clustered rows.
-            n_clusters_requested: The `k` k-means was fit with (fixed or
-                auto-selected).
-            metrics_result: The dict returned by `compute_metrics`.
-            labels: `kmeans.labels_`, used to compute per-cluster sizes.
+            n_clusters_requested: The winning combination's `k`.
+            metrics_result: The winning combination's `compute_metrics` result.
+            labels: The winning combination's `kmeans.labels_`.
             clustered_at: Wall-clock time this clustering run completed.
             k_selection_mode: `"fixed"` or `"auto"`.
-            k_min: Search floor used, or `None` in fixed mode.
-            k_max: Search ceiling used, or `None` in fixed mode.
-            k_search_results: Per-`k` sweep results, or `None` in fixed mode.
+            winning_k_min: The winning combination's search floor, or `None` in fixed mode.
+            winning_k_max: The winning combination's search ceiling, or `None` in fixed mode.
+            winning_k_search_results: The winning combination's own per-`k`
+                sweep results, or `None` in fixed mode.
+            k_min_values: The full swept `k_min` list, or `None` in fixed mode.
+            k_max_values: The full swept `k_max` list (already resolved from
+                any `None`/auto entries), or `None` in fixed mode.
+            random_state_values: The full swept `random_state` list.
+            all_candidates: Every `(k_min, k_max, random_state)` or
+                `(random_state)` combination tried, for the audit trail.
 
         Returns:
             A JSON-serializable dict matching the documented metrics schema.
@@ -432,128 +453,404 @@ class KMeansClusterer:
             "notes": metrics_result["notes"],
             "k_selection": {
                 "mode": k_selection_mode,
-                "k_min": k_min,
-                "k_max": k_max,
-                "k_search_results": k_search_results,
+                "k_min": winning_k_min,
+                "k_max": winning_k_max,
+                "k_search_results": winning_k_search_results,
+            },
+            "combination_search": {
+                "k_min_values": k_min_values,
+                "k_max_values": k_max_values,
+                "random_state_values": random_state_values,
+                "candidates": serialize_candidates(all_candidates),
             },
         }
 
-    def run(
-        self,
-        condition: str,
-        input_path: Path | None = None,
-        assignments_output_path: Path | None = None,
-        metrics_output_path: Path | None = None,
-    ) -> tuple[Path, Path]:
-        """Run the full read-filter-cluster-score-write pipeline for one condition.
 
-        Args:
-            condition: Condition string, e.g. "breast cancer" — the same
-                string passed to `criteria_embedding.py`. Used to derive
-                default input/output paths via `condition_to_slug`.
-            input_path: Embeddings Parquet to read. If omitted, defaults to
-                the embeddings directory's `{slug}_trials_embeddings.parquet`.
-            assignments_output_path: Where to write cluster assignments. If
-                omitted, defaults to
-                ``OUTPUT_DIR / f"{slug}_trials_clusters.parquet"``.
-            metrics_output_path: Where to write metrics. If omitted, defaults
-                to ``OUTPUT_DIR / f"{slug}_trials_cluster_metrics.json"``.
+@dataclass(frozen=True)
+class KMeansSweepCandidate:
+    """The outcome of evaluating one `(k_min, k_max, random_state)` or `(random_state)` combination.
 
-        Returns:
-            A tuple `(assignments_output_path, metrics_output_path)`.
+    In fixed-`k` mode, `k_min`/`k_max` are `None` and `best_k` is always the
+    fixed `k`; in auto mode, `best_k` is whichever `k` in `[k_min, k_max]`
+    scored highest for that combination's `random_state`.
 
-        Raises:
-            FileNotFoundError: If the resolved input Parquet does not exist.
-            ValueError: If there are no successfully-embedded rows to
-                cluster, if embedding dimensionality is inconsistent, if a
-                fixed `n_clusters` is invalid for the available sample count,
-                or if the auto-selection search range `[k_min, k_max]` is
-                invalid/empty for the available sample count.
-        """
-        slug = EligibilityCriteriaFetcher.condition_to_slug(condition)
-        default_input_path, default_assignments_path, default_metrics_path = clustering_io.resolve_default_paths(
-            condition, OUTPUT_DIR, "_trials_clusters.parquet", "_trials_cluster_metrics.json"
+    Attributes:
+        k_min: Search floor for this combination, or `None` in fixed mode.
+        k_max: Search ceiling for this combination, or `None` in fixed mode.
+        random_state: The `random_state` tried for this combination.
+        status: `"invalid"` if the `[k_min, k_max]` range (auto mode) or
+            fixed `n_clusters` was rejected for this dataset before any fit
+            was attempted; `"ok"` otherwise.
+        detail: Human-readable explanation, set for `"invalid"`.
+        best_k: The `k` used for this combination's fit, set iff `"ok"`.
+        kmeans: The fitted `KMeans` estimator for `best_k`, set iff `"ok"`
+            (kept so the eventual winner never needs to be refit).
+        metrics_result: `KMeansClusterer.compute_metrics(...)`'s return
+            value for `best_k`, set iff `"ok"`.
+        k_search_results: Per-`k` sweep results within this combination's
+            range (auto mode only), else `None`.
+    """
+
+    k_min: int | None
+    k_max: int | None
+    random_state: int
+    status: Literal["ok", "invalid"]
+    detail: str | None = None
+    best_k: int | None = None
+    kmeans: KMeans | None = None
+    metrics_result: dict | None = None
+    k_search_results: list[dict] | None = None
+
+
+def generate_k_range_combinations(
+    k_min_values: list[int], k_max_values: list[int], random_state_values: list[int]
+) -> list[dict]:
+    """Build the Cartesian product of the three swept auto-mode hyperparameters.
+
+    Args:
+        k_min_values: Candidate `k_min` values.
+        k_max_values: Candidate `k_max` values (already resolved — no `None`
+            entries; see `run_sweep`'s auto-mode branch).
+        random_state_values: Candidate `random_state` values.
+
+    Returns:
+        One dict per combination, each with keys `k_min`, `k_max`, `random_state`.
+
+    Raises:
+        ValueError: If the product size exceeds `MAX_SWEEP_COMBINATIONS`,
+            naming the actual count and the limit.
+    """
+    combos = [
+        {"k_min": k_min, "k_max": k_max, "random_state": random_state}
+        for k_min, k_max, random_state in itertools.product(k_min_values, k_max_values, random_state_values)
+    ]
+    if len(combos) > MAX_SWEEP_COMBINATIONS:
+        raise ValueError(
+            f"Requested sweep has {len(combos)} combination(s), exceeding the limit of "
+            f"{MAX_SWEEP_COMBINATIONS}; narrow one or more of --k-min/--k-max/--random-state"
         )
-        if input_path is None:
-            input_path = default_input_path
-        if assignments_output_path is None:
-            assignments_output_path = default_assignments_path
-        if metrics_output_path is None:
-            metrics_output_path = default_metrics_path
+    return combos
 
-        table = clustering_io.read_embeddings_parquet(input_path)
-        total_rows = table.num_rows
-        filtered = clustering_io.filter_successful_rows(table)
-        n_samples = filtered.num_rows
-        n_excluded = total_rows - n_samples
 
-        embedding_dim = clustering_io.validate_embedding_dimensions(filtered)
-        embedding_matrix = clustering_io.extract_embedding_matrix(filtered)
+def evaluate_k_range_combination(
+    combo: dict, n_init: int, max_iter: int, embedding_matrix: np.ndarray, n_samples: int
+) -> KMeansSweepCandidate:
+    """Auto-select `k` within one `(k_min, k_max, random_state)` combination.
 
-        if self.n_clusters is not None:
-            k_selection_mode = "fixed"
-            k_min = k_max = k_search_results = None
-            self.validate_k(self.n_clusters, n_samples)
-            kmeans = self.fit_kmeans(embedding_matrix, self.n_clusters)
-            n_clusters_requested = self.n_clusters
-        else:
-            k_selection_mode = "auto"
-            k_min = self.k_min
-            k_max = self.k_max if self.k_max is not None else self.resolve_k_max(n_samples)
-            self.validate_k_range(n_samples, k_min, k_max)
-            n_clusters_requested, kmeans, k_search_results = self.select_optimal_k(embedding_matrix, k_min, k_max)
+    Args:
+        combo: One combination from `generate_k_range_combinations`.
+        n_init: Held fixed across the sweep.
+        max_iter: Held fixed across the sweep.
+        embedding_matrix: Array of shape `(n_samples, embedding_dim)`.
+        n_samples: `embedding_matrix.shape[0]`.
 
-        labels = kmeans.labels_
-        metrics_result = self.compute_metrics(embedding_matrix, labels, kmeans, n_clusters_requested)
-
-        clustered_at = datetime.now(timezone.utc)
-        rows = self.build_assignment_rows(filtered, labels, clustered_at)
-        clustering_io.write_parquet(rows, KMEANS_CLUSTER_PARQUET_SCHEMA, assignments_output_path)
-
-        embedding_backend = filtered.column("embedding_backend")[0].as_py()
-        embedding_model = filtered.column("embedding_model")[0].as_py()
-
-        metrics_dict = self.build_metrics_dict(
-            condition=condition,
-            slug=slug,
-            input_path=input_path,
-            assignments_output_path=assignments_output_path,
-            n_samples=n_samples,
-            n_samples_excluded=n_excluded,
-            embedding_dim=embedding_dim,
-            embedding_backend=embedding_backend,
-            embedding_model=embedding_model,
-            n_clusters_requested=n_clusters_requested,
-            metrics_result=metrics_result,
-            labels=labels,
-            clustered_at=clustered_at,
-            k_selection_mode=k_selection_mode,
-            k_min=k_min,
-            k_max=k_max,
-            k_search_results=k_search_results,
+    Returns:
+        A `KMeansSweepCandidate` reflecting whether the range was invalid or
+        produced a usable result.
+    """
+    clusterer = KMeansClusterer(random_state=combo["random_state"], n_init=n_init, max_iter=max_iter)
+    try:
+        clusterer.validate_k_range(n_samples, combo["k_min"], combo["k_max"])
+    except ValueError as exc:
+        return KMeansSweepCandidate(
+            k_min=combo["k_min"], k_max=combo["k_max"], random_state=combo["random_state"],
+            status="invalid", detail=str(exc),
         )
-        clustering_io.write_json(metrics_dict, metrics_output_path)
 
-        if k_selection_mode == "auto":
-            selection_summary = f"auto-selected k={n_clusters_requested} (searched {k_min}..{k_max})"
-        else:
-            selection_summary = f"fixed k={n_clusters_requested}"
+    best_k, kmeans, k_search_results = clusterer.select_optimal_k(embedding_matrix, combo["k_min"], combo["k_max"])
+    labels = kmeans.labels_
+    metrics_result = clusterer.compute_metrics(embedding_matrix, labels, kmeans, best_k)
 
+    return KMeansSweepCandidate(
+        k_min=combo["k_min"], k_max=combo["k_max"], random_state=combo["random_state"],
+        status="ok", best_k=best_k, kmeans=kmeans, metrics_result=metrics_result, k_search_results=k_search_results,
+    )
+
+
+def evaluate_fixed_k_combination(
+    n_clusters: int, random_state: int, n_init: int, max_iter: int, embedding_matrix: np.ndarray, n_samples: int
+) -> KMeansSweepCandidate:
+    """Fit a single fixed `k` for one `random_state` combination.
+
+    Args:
+        n_clusters: The fixed `k`, held the same across every combination.
+        random_state: This combination's `random_state`.
+        n_init: Held fixed across the sweep.
+        max_iter: Held fixed across the sweep.
+        embedding_matrix: Array of shape `(n_samples, embedding_dim)`.
+        n_samples: `embedding_matrix.shape[0]`.
+
+    Returns:
+        A `KMeansSweepCandidate` reflecting whether `n_clusters` was invalid
+        or produced a usable result.
+    """
+    clusterer = KMeansClusterer(random_state=random_state, n_init=n_init, max_iter=max_iter)
+    try:
+        clusterer.validate_k(n_clusters, n_samples)
+    except ValueError as exc:
+        return KMeansSweepCandidate(k_min=None, k_max=None, random_state=random_state, status="invalid", detail=str(exc))
+
+    kmeans = clusterer.fit_kmeans(embedding_matrix, n_clusters)
+    labels = kmeans.labels_
+    metrics_result = clusterer.compute_metrics(embedding_matrix, labels, kmeans, n_clusters)
+
+    return KMeansSweepCandidate(
+        k_min=None, k_max=None, random_state=random_state,
+        status="ok", best_k=n_clusters, kmeans=kmeans, metrics_result=metrics_result,
+    )
+
+
+def select_best(candidates: list[KMeansSweepCandidate]) -> KMeansSweepCandidate | None:
+    """Pick the best candidate by highest silhouette score.
+
+    Args:
+        candidates: As produced by `evaluate_k_range_combination`/
+            `evaluate_fixed_k_combination`, one per combination.
+
+    Returns:
+        The `"ok"` candidate with the highest silhouette score, or `None` if
+        no candidate has a computable one (e.g. every combination was
+        invalid, or every fit's metrics were degenerate).
+    """
+    eligible = [
+        c for c in candidates
+        if c.status == "ok" and c.metrics_result is not None and c.metrics_result["metrics"]["silhouette_score"] is not None
+    ]
+    if not eligible:
+        return None
+    return max(eligible, key=lambda c: c.metrics_result["metrics"]["silhouette_score"])
+
+
+def log_candidate(index: int, total: int, candidate: KMeansSweepCandidate) -> None:
+    """Log one INFO line summarizing a single evaluated combination."""
+    if candidate.status == "invalid":
         logger.info(
-            "run: clustered %d row(s) into %d cluster(s), %s, for %r -> %s, %s "
-            "(embedding_dim=%d, inertia=%.4f, silhouette=%s, excluded=%d failed-embedding row(s))",
-            n_samples,
-            metrics_result["n_clusters_actual"],
-            selection_summary,
-            condition,
-            assignments_output_path,
-            metrics_output_path,
-            embedding_dim,
-            metrics_result["metrics"]["inertia"],
-            metrics_result["metrics"]["silhouette_score"],
-            n_excluded,
+            "evaluate: [%d/%d] k_min=%s k_max=%s random_state=%d -> invalid (%s)",
+            index, total, candidate.k_min, candidate.k_max, candidate.random_state, candidate.detail,
         )
-        return assignments_output_path, metrics_output_path
+        return
+    logger.info(
+        "evaluate: [%d/%d] k_min=%s k_max=%s random_state=%d -> ok, k=%d, inertia=%.4f, silhouette=%s",
+        index, total, candidate.k_min, candidate.k_max, candidate.random_state, candidate.best_k,
+        candidate.metrics_result["metrics"]["inertia"], candidate.metrics_result["metrics"]["silhouette_score"],
+    )
+
+
+def serialize_candidates(candidates: list[KMeansSweepCandidate]) -> list[dict]:
+    """Render the sweep's audit trail as JSON-serializable dicts.
+
+    Each candidate's record is kept compact (status, chosen `k`, silhouette
+    score only — not the full per-`k` inner sweep, which is kept in full
+    only for the overall winner under `k_selection.k_search_results`).
+
+    Args:
+        candidates: As produced by `run_sweep`'s sweep loop.
+
+    Returns:
+        One dict per candidate, suitable for embedding in a metrics JSON's
+        `combination_search` field.
+    """
+    serialized = []
+    for candidate in candidates:
+        serialized.append(
+            {
+                "k_min": candidate.k_min,
+                "k_max": candidate.k_max,
+                "random_state": candidate.random_state,
+                "status": candidate.status,
+                "detail": candidate.detail,
+                "best_k": candidate.best_k,
+                "silhouette_score": (
+                    candidate.metrics_result["metrics"]["silhouette_score"] if candidate.metrics_result else None
+                ),
+            }
+        )
+    return serialized
+
+
+def run_sweep(
+    condition: str,
+    n_clusters: int | None = None,
+    k_min_values: list[int] | None = None,
+    k_max_values: list[int | None] | None = None,
+    random_state_values: list[int] | None = None,
+    n_init: int = KMeansClusterer.DEFAULT_N_INIT,
+    max_iter: int = KMeansClusterer.DEFAULT_MAX_ITER,
+    input_path: Path | None = None,
+    assignments_output_path: Path | None = None,
+    metrics_output_path: Path | None = None,
+) -> tuple[Path, Path] | None:
+    """Sweep k-means hyperparameters for a condition and write the best result.
+
+    This is the module's only orchestration entry point — a single value per
+    list (the CLI defaults) is simply a sweep of size one; the winner-
+    selection and output-writing logic is identical regardless of how many
+    combinations were tried.
+
+    Args:
+        condition: Condition string, e.g. "breast cancer" — the same string
+            passed to `criteria_embedding.py`.
+        n_clusters: If given, fixes `k` and sweeps only `random_state_values`
+            over that fixed `k` — `k_min_values`/`k_max_values` are ignored.
+            If `None` (the default), `k` is auto-selected per combination by
+            sweeping `[k_min, k_max]` with that combination's `random_state`.
+        k_min_values: Candidate `k_min` values to sweep (auto mode only).
+            Defaults to `[KMeansClusterer.DEFAULT_K_MIN]` if `None`.
+        k_max_values: Candidate `k_max` values to sweep (auto mode only); a
+            `None` entry resolves per-dataset via `resolve_k_max`. Defaults
+            to `[None]` if `None`.
+        random_state_values: Candidate `random_state` values to sweep (both
+            modes). Defaults to `[KMeansClusterer.DEFAULT_RANDOM_STATE]` if `None`.
+        n_init: Held fixed across the sweep.
+        max_iter: Held fixed across the sweep.
+        input_path: Embeddings Parquet to read. If omitted, defaults to
+            the embeddings directory's `{slug}_trials_embeddings.parquet`.
+        assignments_output_path: Where to write the winning combination's
+            cluster assignments. If omitted, defaults to
+            ``OUTPUT_DIR / f"{slug}_trials_clusters.parquet"``.
+        metrics_output_path: Where to write the winning combination's
+            metrics. If omitted, defaults to
+            ``OUTPUT_DIR / f"{slug}_trials_cluster_metrics.json"``.
+
+    Returns:
+        `(assignments_output_path, metrics_output_path)` for the winning
+        combination, or `None` if no combination produced a usable result
+        (in which case nothing is written).
+
+    Raises:
+        FileNotFoundError: If the resolved input Parquet does not exist.
+        ValueError: If there are no successfully-embedded rows to cluster,
+            if embedding dimensionality is inconsistent, or if the requested
+            sweep has more than `MAX_SWEEP_COMBINATIONS` combinations.
+    """
+    if k_min_values is None:
+        k_min_values = [KMeansClusterer.DEFAULT_K_MIN]
+    if k_max_values is None:
+        k_max_values = [None]
+    if random_state_values is None:
+        random_state_values = [KMeansClusterer.DEFAULT_RANDOM_STATE]
+
+    slug = EligibilityCriteriaFetcher.condition_to_slug(condition)
+    default_input_path, default_assignments_path, default_metrics_path = clustering_io.resolve_default_paths(
+        condition, OUTPUT_DIR, "_trials_clusters.parquet", "_trials_cluster_metrics.json"
+    )
+    if input_path is None:
+        input_path = default_input_path
+    if assignments_output_path is None:
+        assignments_output_path = default_assignments_path
+    if metrics_output_path is None:
+        metrics_output_path = default_metrics_path
+
+    table = clustering_io.read_embeddings_parquet(input_path)
+    total_rows = table.num_rows
+    filtered = clustering_io.filter_successful_rows(table)
+    n_samples = filtered.num_rows
+    n_excluded = total_rows - n_samples
+
+    embedding_dim = clustering_io.validate_embedding_dimensions(filtered)
+    embedding_matrix = clustering_io.extract_embedding_matrix(filtered)
+
+    resolved_k_min_values: list[int] | None = None
+    resolved_k_max_values: list[int] | None = None
+
+    if n_clusters is not None:
+        k_selection_mode = "fixed"
+        if len(random_state_values) > MAX_SWEEP_COMBINATIONS:
+            raise ValueError(
+                f"Requested sweep has {len(random_state_values)} random_state value(s), exceeding "
+                f"the limit of {MAX_SWEEP_COMBINATIONS}; narrow --random-state"
+            )
+        logger.info(
+            "run_sweep: evaluating %d random_state value(s) for fixed n_clusters=%d, %r (n_samples=%d)",
+            len(random_state_values), n_clusters, condition, n_samples,
+        )
+        candidates = [
+            evaluate_fixed_k_combination(n_clusters, random_state, n_init, max_iter, embedding_matrix, n_samples)
+            for random_state in random_state_values
+        ]
+    else:
+        k_selection_mode = "auto"
+        resolved_k_min_values = sorted(set(k_min_values))
+        default_clusterer = KMeansClusterer()
+        resolved_k_max_values = sorted(
+            {k_max if k_max is not None else default_clusterer.resolve_k_max(n_samples) for k_max in k_max_values}
+        )
+        combos = generate_k_range_combinations(resolved_k_min_values, resolved_k_max_values, random_state_values)
+        logger.info(
+            "run_sweep: evaluating %d (k_min, k_max, random_state) combination(s) for %r (n_samples=%d)",
+            len(combos), condition, n_samples,
+        )
+        candidates = [
+            evaluate_k_range_combination(combo, n_init, max_iter, embedding_matrix, n_samples) for combo in combos
+        ]
+
+    for index, candidate in enumerate(candidates, start=1):
+        log_candidate(index, len(candidates), candidate)
+
+    best = select_best(candidates)
+    if best is None:
+        logger.warning(
+            "run_sweep: no combination produced a usable silhouette score for %r; writing nothing",
+            condition,
+        )
+        return None
+
+    clustered_at = datetime.now(timezone.utc)
+    winning_clusterer = KMeansClusterer(random_state=best.random_state, n_init=n_init, max_iter=max_iter)
+    labels = best.kmeans.labels_
+
+    rows = winning_clusterer.build_assignment_rows(filtered, labels, clustered_at)
+    clustering_io.write_parquet(rows, KMEANS_CLUSTER_PARQUET_SCHEMA, assignments_output_path)
+
+    embedding_backend = filtered.column("embedding_backend")[0].as_py()
+    embedding_model = filtered.column("embedding_model")[0].as_py()
+
+    metrics_dict = winning_clusterer.build_metrics_dict(
+        condition=condition,
+        slug=slug,
+        input_path=input_path,
+        assignments_output_path=assignments_output_path,
+        n_samples=n_samples,
+        n_samples_excluded=n_excluded,
+        embedding_dim=embedding_dim,
+        embedding_backend=embedding_backend,
+        embedding_model=embedding_model,
+        n_clusters_requested=best.best_k,
+        metrics_result=best.metrics_result,
+        labels=labels,
+        clustered_at=clustered_at,
+        k_selection_mode=k_selection_mode,
+        winning_k_min=best.k_min,
+        winning_k_max=best.k_max,
+        winning_k_search_results=best.k_search_results,
+        k_min_values=resolved_k_min_values,
+        k_max_values=resolved_k_max_values,
+        random_state_values=random_state_values,
+        all_candidates=candidates,
+    )
+    clustering_io.write_json(metrics_dict, metrics_output_path)
+
+    if k_selection_mode == "auto":
+        selection_summary = f"auto-selected k={best.best_k} (k_min={best.k_min}, k_max={best.k_max})"
+    else:
+        selection_summary = f"fixed k={best.best_k}"
+
+    logger.info(
+        "run_sweep: clustered %d row(s) into %d cluster(s), %s, random_state=%d, for %r -> %s, %s "
+        "(embedding_dim=%d, inertia=%.4f, silhouette=%s, excluded=%d failed-embedding row(s))",
+        n_samples,
+        best.metrics_result["n_clusters_actual"],
+        selection_summary,
+        best.random_state,
+        condition,
+        assignments_output_path,
+        metrics_output_path,
+        embedding_dim,
+        best.metrics_result["metrics"]["inertia"],
+        best.metrics_result["metrics"]["silhouette_score"],
+        n_excluded,
+    )
+    return assignments_output_path, metrics_output_path
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -561,10 +858,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     Returns:
         An ``argparse.ArgumentParser`` accepting a positional ``condition``
-        argument plus k-means and path-override options.
+        argument plus comma-separated value lists for the swept
+        hyperparameters, fixed-value flags for the un-swept ones, and
+        path-override options.
     """
     parser = argparse.ArgumentParser(
-        description="Cluster a condition's criterion embeddings via k-means."
+        description="Cluster a condition's criterion embeddings via k-means, sweeping hyperparameters."
     )
     parser.add_argument(
         "condition",
@@ -575,42 +874,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "Fix the number of k-means clusters and skip automatic selection "
-            "(default: auto-select via a silhouette-score sweep over --k-min..--k-max)"
+            "Fix the number of k-means clusters and skip automatic selection (--k-min/--k-max are "
+            "ignored if set; default: auto-select via a silhouette-score sweep over --k-min..--k-max)"
         ),
     )
     parser.add_argument(
         "--k-min",
-        type=int,
-        default=KMeansClusterer.DEFAULT_K_MIN,
-        help="Minimum k to search when auto-selecting (ignored if --n-clusters is set; default: 2)",
+        type=parse_int_list,
+        default=[KMeansClusterer.DEFAULT_K_MIN],
+        help="Comma-separated list of k_min values to sweep when auto-selecting (default: 2)",
     )
     parser.add_argument(
         "--k-max",
-        type=int,
+        type=parse_int_list,
         default=None,
         help=(
-            "Maximum k to search when auto-selecting (ignored if --n-clusters is set); "
-            "defaults to min(100, floor(sqrt(n_samples / 2)), n_samples - 1)"
+            "Comma-separated list of k_max values to sweep when auto-selecting; "
+            "defaults to a single auto-computed value, min(100, floor(sqrt(n_samples / 2)), n_samples - 1)"
         ),
     )
     parser.add_argument(
         "--random-state",
-        type=int,
-        default=KMeansClusterer.DEFAULT_RANDOM_STATE,
-        help="Random seed for k-means initialization, for reproducibility (default: 42)",
+        type=parse_int_list,
+        default=[KMeansClusterer.DEFAULT_RANDOM_STATE],
+        help="Comma-separated list of random seeds to sweep for k-means initialization (default: 42)",
     )
     parser.add_argument(
         "--n-init",
         type=int,
         default=KMeansClusterer.DEFAULT_N_INIT,
-        help="Number of k-means initializations to run (default: 10)",
+        help="Number of k-means initializations to run, held fixed across the sweep (default: 10)",
     )
     parser.add_argument(
         "--max-iter",
         type=int,
         default=KMeansClusterer.DEFAULT_MAX_ITER,
-        help="Maximum k-means iterations per initialization (default: 300)",
+        help="Maximum k-means iterations per initialization, held fixed across the sweep (default: 300)",
     )
     parser.add_argument(
         "--input-path",
@@ -634,21 +933,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    """CLI entry point: cluster and write cluster assignments/metrics for one condition."""
+    """CLI entry point: sweep, cluster, and write cluster assignments/metrics for one condition."""
     logging.basicConfig(level=logging.INFO)
 
     args = build_arg_parser().parse_args()
 
-    clusterer = KMeansClusterer(
+    run_sweep(
+        args.condition,
         n_clusters=args.n_clusters,
-        k_min=args.k_min,
-        k_max=args.k_max,
-        random_state=args.random_state,
+        k_min_values=args.k_min,
+        k_max_values=args.k_max,
+        random_state_values=args.random_state,
         n_init=args.n_init,
         max_iter=args.max_iter,
-    )
-    clusterer.run(
-        args.condition,
         input_path=args.input_path,
         assignments_output_path=args.assignments_output_path,
         metrics_output_path=args.metrics_output_path,
