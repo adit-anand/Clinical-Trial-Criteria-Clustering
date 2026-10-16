@@ -232,7 +232,14 @@ def resolve_seed(spec: VisualizationSpec, metrics: dict) -> tuple[int, bool]:
     return DEFAULT_FALLBACK_SEED, False
 
 
-def resolve_points(spec: VisualizationSpec, slug: str, metrics: dict, n_rows: int, seed: int) -> np.ndarray:
+def resolve_points(
+    spec: VisualizationSpec,
+    slug: str,
+    metrics: dict,
+    n_rows: int,
+    seed: int,
+    embeddings_path: Path | None = None,
+) -> np.ndarray:
     """Resolve the 2D points to plot, reusing a persisted UMAP projection when one exists.
 
     Args:
@@ -243,6 +250,14 @@ def resolve_points(spec: VisualizationSpec, slug: str, metrics: dict, n_rows: in
             count), used to sanity-check row alignment against a freshly
             re-read embeddings file.
         seed: The seed resolved by `resolve_seed` (or a CLI override).
+        embeddings_path: Explicit embeddings Parquet path to read when a
+            fresh projection is needed (every method except `umap_hdbscan`
+            with an already-2D winning config), overriding the default
+            `data/embeddings/{slug}_trials_embeddings.parquet` lookup — use
+            this if the condition's embeddings were originally written to a
+            non-default path (e.g. via that clustering step's own
+            `--input-path` override at embedding/clustering time). Ignored
+            when a persisted projection is reused instead.
 
     Returns:
         An `(n_rows, 2)` array of 2D coordinates, row-aligned with the
@@ -264,7 +279,8 @@ def resolve_points(spec: VisualizationSpec, slug: str, metrics: dict, n_rows: in
         return np.array(table.column("reduced_embedding").to_pylist(), dtype=np.float64)
 
     logger.info("resolve_points: computing a fresh 2D UMAP projection for %s (seed=%d)", spec.key, seed)
-    embeddings_path = clustering_io.EMBEDDINGS_INPUT_DIR / f"{slug}_trials_embeddings.parquet"
+    if embeddings_path is None:
+        embeddings_path = clustering_io.EMBEDDINGS_INPUT_DIR / f"{slug}_trials_embeddings.parquet"
     table = clustering_io.read_embeddings_parquet(embeddings_path)
     filtered = clustering_io.filter_successful_rows(table)
     if filtered.num_rows != n_rows:
@@ -334,6 +350,7 @@ def run(
     method: str,
     seed_override: int | None = None,
     input_path: Path | None = None,
+    embeddings_path: Path | None = None,
     output_path: Path | None = None,
 ) -> Path:
     """Render and write a 2D UMAP scatterplot for one condition/method pair.
@@ -352,6 +369,12 @@ def run(
             f"{slug}{spec.assignments_suffix}"` lookup — the file whose rows
             become the plotted points. If omitted, the default
             per-method/-condition path is used, as before.
+        embeddings_path: Explicit embeddings Parquet path to read when a
+            fresh 2D projection is needed (see `resolve_points`), overriding
+            the default `data/embeddings/{slug}_trials_embeddings.parquet`
+            lookup — needed if that condition's embeddings were originally
+            written to a non-default path. Ignored for `umap_hdbscan` runs
+            that reuse a persisted 2D projection instead of fitting a fresh one.
         output_path: Where to write the HTML. If omitted, defaults to
             ``spec.output_dir / f"{slug}{spec.scatterplot_suffix}"``.
 
@@ -361,7 +384,8 @@ def run(
     Raises:
         ValueError: If `method` isn't a recognized key in `VISUALIZATION_SPECS`.
         FileNotFoundError: If the condition hasn't been clustered by `method`
-            yet, or if `input_path` is given but doesn't exist.
+            yet, if `input_path` is given but doesn't exist, or if a fresh
+            projection is needed and the resolved embeddings path doesn't exist.
     """
     if method not in VISUALIZATION_SPECS:
         raise ValueError(f"Unknown method {method!r}; expected one of {sorted(VISUALIZATION_SPECS)}")
@@ -377,7 +401,7 @@ def run(
     else:
         seed, seed_explicit = resolve_seed(spec, metrics)
 
-    points_2d = resolve_points(spec, slug, metrics, assignments_table.num_rows, seed)
+    points_2d = resolve_points(spec, slug, metrics, assignments_table.num_rows, seed, embeddings_path=embeddings_path)
     frame = build_plot_frame(assignments_table, points_2d)
     fig = render_scatterplot(frame, condition, method, seed, seed_explicit)
 
@@ -428,6 +452,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "rows become the plotted points), instead of looking it up from --method/condition",
     )
     parser.add_argument(
+        "--embeddings-path",
+        type=Path,
+        default=None,
+        help="Override the default embeddings Parquet path read when a fresh 2D projection is "
+        "needed (every method except umap_hdbscan reusing an already-2D persisted projection); "
+        "use this if that condition's embeddings were originally written to a non-default path",
+    )
+    parser.add_argument(
         "--output-path",
         type=Path,
         default=None,
@@ -440,7 +472,14 @@ def main() -> None:
     """CLI entry point: render and write a scatterplot for one condition/method pair."""
     logging.basicConfig(level=logging.INFO)
     args = build_arg_parser().parse_args()
-    run(args.condition, args.method, seed_override=args.seed, input_path=args.input_path, output_path=args.output_path)
+    run(
+        args.condition,
+        args.method,
+        seed_override=args.seed,
+        input_path=args.input_path,
+        embeddings_path=args.embeddings_path,
+        output_path=args.output_path,
+    )
 
 
 if __name__ == "__main__":

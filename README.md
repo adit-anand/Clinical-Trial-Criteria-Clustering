@@ -556,7 +556,11 @@ with points colored by cluster (a distinct color for HDBSCAN-based methods'
 noise points), a legend mapping color to cluster, and a hover tooltip
 showing each point's criterion text. Pass `--input-path` to visualize an
 arbitrary cluster-assignments Parquet file directly instead of looking one
-up from `--method`/`condition`.
+up from `--method`/`condition`, and `--embeddings-path` if that condition's
+embeddings live at a non-default path (e.g. because they were originally
+written there via that clustering step's own `--input-path` override) —
+needed whenever a fresh 2D projection has to be fit rather than reusing a
+persisted one.
 
 The 2D projection always reuses that method's own "optimal run" seed rather
 than introducing new randomness: k-means's `kmeans_params.random_state`;
@@ -590,6 +594,7 @@ HTML file wholesale; there is no append/skip-if-exists/merge behavior.
 | `--method`          | yes      | Which clustering method's output to visualize: `kmeans`, `hdbscan`, `umap_hdbscan`, or `pacmap_hdbscan`. |
 | `--seed`            | no       | Override the 2D UMAP projection's seed (default: reuse that method's own optimal-run seed, or the fallback default for `hdbscan`). |
 | `--input-path`      | no       | Override the default cluster-assignments Parquet path to visualize (the file whose rows become the plotted points), instead of looking it up from `--method`/`condition`. |
+| `--embeddings-path` | no       | Override the default embeddings Parquet path read when a fresh 2D projection is needed (every method except `umap_hdbscan` reusing an already-2D persisted projection) — use this if that condition's embeddings were originally written to a non-default path. |
 | `--output-path`     | no       | Override the default output HTML path. |
 
 ### Example: full pipeline for one condition
