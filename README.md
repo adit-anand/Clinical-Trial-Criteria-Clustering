@@ -476,7 +476,7 @@ produces a usable relative validity index, nothing is written. Re-running this s
 existing output files wholesale.
 
 The total planned fit count (`configurations x seeds x repeats_per_seed`) is
-capped at 10000, the configuration grid at 1000 combinations, the seed list
+capped at 25000, the configuration grid at 1000 combinations, the seed list
 at 10, and `--repeats-per-seed` at 10; exceeding any of these raises an
 error before any fitting is attempted.
 
@@ -523,7 +523,7 @@ that `n_neighbors` logged as `degenerate` and (if nothing else qualifies)
 the whole run write nothing. If you hit this, narrow `--pacmap-n-neighbors`
 to a lower range and sweep `--hdbscan-min-cluster-size` alongside it
 instead, as the example above does — mind the combinatorial caps described
-below (`MAX_CONFIG_COMBINATIONS=1000`, `MAX_TOTAL_FITS=10000`) when widening
+below (`MAX_CONFIG_COMBINATIONS=1000`, `MAX_TOTAL_FITS=25000`) when widening
 either dimension; the example above uses 12 configurations (3 `n_neighbors`
 x 4 `min_cluster_size`) with a small `--seeds` list to keep the total fit
 count modest even though it's well under either cap.

@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 MAX_CONFIG_COMBINATIONS = 1000
 MAX_SEEDS = 10
 MAX_REPEATS_PER_SEED = 10
-MAX_TOTAL_FITS = 10000
+MAX_TOTAL_FITS = 25000
 
 
 @dataclass(frozen=True)
