@@ -409,11 +409,15 @@ one closest to that seed's own mean noise fraction) becomes that
 configuration's representative result. Across configurations, the one
 whose representative result has the highest relative validity index (DBCV),
 tie-broken by the lowest noise fraction, wins overall — the same
-winner-selection semantics `hdbscan_clustering.py` already uses. HDBSCAN's
-own hyperparameters (`--hdbscan-min-cluster-size`, etc.) are held fixed
-across this whole sweep rather than swept; run `hdbscan_clustering.py`
-separately against this step's own reduced-embeddings output (via
-`--input-path`) if you also want to sweep those. It writes:
+winner-selection semantics `hdbscan_clustering.py` already uses.
+`--hdbscan-min-cluster-size` is itself swept too — folded into the same
+config grid as the UMAP hyperparameters above, so a "config" here means a
+UMAP hyperparameter combination *and* a `min_cluster_size` value together
+(mind the combinatorial caps below when widening this too). HDBSCAN's other
+hyperparameters are still held fixed across the whole sweep; run
+`hdbscan_clustering.py` separately against this step's own
+reduced-embeddings output (via `--input-path`) if you also want to sweep
+those. It writes:
 
 ```
 data/clustering/umap_hdbscan/<condition_slug>_trials_umap_reduced_embeddings.parquet
@@ -458,7 +462,7 @@ before any fitting is attempted.
 | `--umap-metric`                      | no       | UMAP distance metric, held fixed across the sweep (default: `euclidean`). |
 | `--seeds`                            | no       | Comma-separated list of seeds to sweep for reproducibility (default: `42`). |
 | `--repeats-per-seed`                 | no       | Number of repeated fits per (configuration, seed) pair (default: `10`). |
-| `--hdbscan-min-cluster-size`         | no       | Fixed HDBSCAN `min_cluster_size`, not swept (default: `200`). |
+| `--hdbscan-min-cluster-size`         | no       | Comma-separated list of HDBSCAN `min_cluster_size` values to sweep, folded into the same config grid as the UMAP hyperparameters above (default: `200`). |
 | `--hdbscan-min-samples`              | no       | Fixed HDBSCAN `min_samples`, not swept (default: `200`). |
 | `--hdbscan-metric`                   | no       | Fixed HDBSCAN distance metric, not swept (default: `euclidean`). |
 | `--hdbscan-cluster-selection-epsilon`| no       | Fixed HDBSCAN `cluster_selection_epsilon`, not swept (default: `0.0`). |
@@ -472,24 +476,38 @@ before any fitting is attempted.
 ## 8. PaCMAP + HDBSCAN clustering
 
 ```bash
-uv run python -m src.clustering.pacmap_hdbscan_clustering "breast cancer" --pacmap-n-neighbors 15,20,25,30 --seeds 1,2,3,4,5
+uv run python -m src.clustering.pacmap_hdbscan_clustering "breast cancer" --pacmap-n-neighbors 15,20,25 --hdbscan-min-cluster-size 100,150,200,250 --seeds 1,2
 ```
 
 The same idea as step 7, reducing with [PaCMAP](https://github.com/YingfanWang/PaCMAP)
 instead of UMAP. PaCMAP has no `min_dist` equivalent — its
 neighborhood/distance behavior is instead shaped by `--pacmap-mn-ratio` and
 `--pacmap-fp-ratio`, which weight mid-near vs. further point pairs during
-optimization and can be swept the same way `--pacmap-n-neighbors` is (mind
-the combinatorial caps described below — e.g. don't sweep a wide
-`n_neighbors` range at the same time as wide `mn_ratio`/`fp_ratio` ranges):
+optimization and can be swept the same way `--pacmap-n-neighbors` is.
+
+A large `--pacmap-n-neighbors` (e.g. 30+) tends to over-smooth PaCMAP's
+projection into one dominant blob — HDBSCAN then reports one giant cluster
+plus a couple of stragglers, which the `MIN_N_CLUSTERS`/`MAX_CLUSTER_SHARE`/
+`MAX_NOISE_FRACTION` guards (see step 4) correctly reject as degenerate
+rather than letting it "win" the sweep, so you'll see every combination at
+that `n_neighbors` logged as `degenerate` and (if nothing else qualifies)
+the whole run write nothing. If you hit this, narrow `--pacmap-n-neighbors`
+to a lower range and sweep `--hdbscan-min-cluster-size` alongside it
+instead, as the example above does — mind the combinatorial caps described
+below (`MAX_CONFIG_COMBINATIONS=12`, `MAX_TOTAL_FITS=300`) when widening
+either dimension; the example above is already at the 12-combination
+ceiling (3 `n_neighbors` x 4 `min_cluster_size`), hence the smaller `--seeds`
+list.
+
+To also explore `mn_ratio`/`fp_ratio` instead:
 
 ```bash
 uv run python -m src.clustering.pacmap_hdbscan_clustering "breast cancer" --pacmap-n-neighbors 20 --pacmap-mn-ratio 0.3,0.5,0.7 --pacmap-fp-ratio 1.0,2.0,3.0 --seeds 1,2,3
 ```
 
 Everything else — the configuration/seed/repeat sweep,
-winner-selection semantics, fixed (non-swept) HDBSCAN hyperparameters, sweep
-caps, and overwrite-on-rerun behavior — is identical to step 7. It writes:
+winner-selection semantics, sweep caps, and overwrite-on-rerun behavior —
+is identical to step 7. It writes:
 
 ```
 data/clustering/pacmap_hdbscan/<condition_slug>_trials_pacmap_reduced_embeddings.parquet
@@ -507,13 +525,13 @@ JSON shape (as `winning_pacmap_config`/`pacmap_config_search` instead of
 | ----------------------------------- | -------- | ---------------------------------------------------------------------------- |
 | `condition`                          | yes      | Condition to cluster, e.g. `"breast cancer"`. Must match the condition passed to `criteria_embedding.py` (used to derive default input/output paths). |
 | `--pacmap-n-components`              | no       | Comma-separated list of PaCMAP `n_components` values to sweep (default: `2`). |
-| `--pacmap-n-neighbors`               | no       | Comma-separated list of PaCMAP `n_neighbors` values to sweep (default: `10`). |
+| `--pacmap-n-neighbors`               | no       | Comma-separated list of PaCMAP `n_neighbors` values to sweep (default: `10`); very large values (30+) risk collapsing into one dominant cluster — pair with a `--hdbscan-min-cluster-size` sweep instead of relying on them alone. |
 | `--pacmap-mn-ratio`                  | no       | Comma-separated list of PaCMAP `MN_ratio` values to sweep (default: `0.5`). |
 | `--pacmap-fp-ratio`                  | no       | Comma-separated list of PaCMAP `FP_ratio` values to sweep (default: `2.0`). |
 | `--pacmap-distance`                  | no       | PaCMAP distance metric, held fixed across the sweep (default: `euclidean`). |
 | `--seeds`                            | no       | Comma-separated list of seeds to sweep for reproducibility (default: `42`). |
 | `--repeats-per-seed`                 | no       | Number of repeated fits per (configuration, seed) pair (default: `10`). |
-| `--hdbscan-min-cluster-size`         | no       | Fixed HDBSCAN `min_cluster_size`, not swept (default: `200`). |
+| `--hdbscan-min-cluster-size`         | no       | Comma-separated list of HDBSCAN `min_cluster_size` values to sweep, folded into the same config grid as the PaCMAP hyperparameters above (default: `200`). |
 | `--hdbscan-min-samples`              | no       | Fixed HDBSCAN `min_samples`, not swept (default: `200`). |
 | `--hdbscan-metric`                   | no       | Fixed HDBSCAN distance metric, not swept (default: `euclidean`). |
 | `--hdbscan-cluster-selection-epsilon`| no       | Fixed HDBSCAN `cluster_selection_epsilon`, not swept (default: `0.0`). |
@@ -580,6 +598,6 @@ uv run python -m src.clustering.kmeans_clustering "breast cancer"
 uv run python -m src.clustering.hdbscan_clustering "breast cancer" --min-cluster-size 5,10,15
 uv run python -m src.clustering.clustering_report "breast cancer"
 uv run python -m src.clustering.umap_hdbscan_clustering "breast cancer" --umap-n-neighbors 10,15,30 --seeds 1,2,3,4,5
-uv run python -m src.clustering.pacmap_hdbscan_clustering "breast cancer" --pacmap-n-neighbors 15,20,25,30 --seeds 1,2,3,4,5
+uv run python -m src.clustering.pacmap_hdbscan_clustering "breast cancer" --pacmap-n-neighbors 15,20,25 --hdbscan-min-cluster-size 100,150,200,250 --seeds 1,2
 uv run python -m src.clustering.clustering_scatterplot "breast cancer" --method umap_hdbscan
 ```

@@ -6,7 +6,9 @@ clustering the reduced vectors with HDBSCAN. Both share an identical sweep
 shape that has nothing to do with which reducer is used, so it lives here
 once:
 
-    for each reducer hyperparameter combination ("config"):
+    for each config (a combination of reducer hyperparameters, plus
+    optionally HDBSCAN's own `min_cluster_size` if the caller chooses to
+    sweep it too — see `evaluate_config`'s `build_hdbscan_clusterer`):
         for each user-supplied seed:
             fit the reducer + HDBSCAN `repeats_per_seed` times (default 10)
             pick the seed's most *reproducible* repeat set: the seed with the
@@ -239,21 +241,26 @@ def evaluate_repeat(
 
     Args:
         fit_reduced: A reducer-specific callable
-            `(embedding_matrix, seed, **hyperparams) -> reduced_matrix`.
-        hyperparams: This config's reducer hyperparameter values.
+            `(embedding_matrix, seed, **reducer_hyperparams) -> reduced_matrix`.
+            Called with every key of `hyperparams` *except* `min_cluster_size`
+            (that key, if present, belongs to HDBSCAN, not the reducer — see
+            `evaluate_config`'s `build_hdbscan_clusterer`).
+        hyperparams: This config's hyperparameter values — the reducer's own
+            plus, optionally, `min_cluster_size` for HDBSCAN.
         seed: The reducer's `random_state` for this repeat.
         repeat_index: 0-based index within this seed's repeats.
-        hdbscan_clusterer: A single `HDBSCANClusterer` instance configured
-            with this run's fixed (non-swept) HDBSCAN hyperparameters; reused
-            across every repeat since it holds no per-fit state.
+        hdbscan_clusterer: A single `HDBSCANClusterer` instance already
+            built for this config (see `evaluate_config`); reused across
+            every repeat since it holds no per-fit state.
         embedding_matrix: The original, non-reduced embedding matrix.
 
     Returns:
         A `RepeatResult` reflecting whether fitting errored, produced a
         degenerate clustering, or a usable result.
     """
+    reducer_hyperparams = {key: value for key, value in hyperparams.items() if key != "min_cluster_size"}
     try:
-        reduced_matrix = fit_reduced(embedding_matrix, seed=seed, **hyperparams)
+        reduced_matrix = fit_reduced(embedding_matrix, seed=seed, **reducer_hyperparams)
     except Exception as exc:  # noqa: BLE001 - a reducer-internal failure shouldn't abort the whole sweep
         return RepeatResult(repeat_index=repeat_index, status="errored", detail=f"Reduction failed: {exc}")
 
@@ -314,10 +321,12 @@ def evaluate_seed(
 
     Args:
         fit_reduced: As passed to `evaluate_repeat`.
-        hyperparams: This config's reducer hyperparameter values.
+        hyperparams: This config's hyperparameter values (reducer's own plus,
+            optionally, `min_cluster_size`).
         seed: The reducer's `random_state` for every repeat in this group.
         repeats_per_seed: Number of repeats to run.
-        hdbscan_clusterer: As passed to `evaluate_repeat`.
+        hdbscan_clusterer: As passed to `evaluate_repeat` — already built for
+            this config by `evaluate_config`.
         embedding_matrix: The original, non-reduced embedding matrix.
 
     Returns:
@@ -381,21 +390,28 @@ def evaluate_config(
     seeds: list[int],
     repeats_per_seed: int,
     validate_fn: Callable[[dict, int], None],
-    hdbscan_clusterer: HDBSCANClusterer,
+    build_hdbscan_clusterer: Callable[[dict], HDBSCANClusterer],
     embedding_matrix: np.ndarray,
     n_samples: int,
 ) -> ReducerConfigCandidate:
-    """Validate, then sweep every seed for one reducer hyperparameter combination.
+    """Validate, then sweep every seed for one hyperparameter combination.
 
     Args:
         fit_reduced: As passed to `evaluate_repeat`.
-        hyperparams: This config's reducer hyperparameter values.
+        hyperparams: This config's hyperparameter values — the reducer's own
+            plus, optionally, `min_cluster_size` for HDBSCAN (if the caller
+            is sweeping it; see `build_hdbscan_clusterer`).
         seeds: The full user-supplied seed list.
         repeats_per_seed: Number of repeats to run per seed.
         validate_fn: A reducer-specific `(hyperparams, n_samples) -> None`
             precondition check; raises `ValueError` if this config is
             unusable for the dataset (e.g. `n_neighbors >= n_samples`).
-        hdbscan_clusterer: As passed to `evaluate_repeat`.
+        build_hdbscan_clusterer: `(hyperparams) -> HDBSCANClusterer` —
+            constructs this config's `HDBSCANClusterer` (e.g. reading
+            `hyperparams["min_cluster_size"]` if that's being swept, with
+            every other HDBSCAN hyperparameter held fixed by the closure).
+            Built once per config, then reused across every seed/repeat for
+            that config, since the clusterer holds no per-fit state.
         embedding_matrix: The original, non-reduced embedding matrix.
         n_samples: `embedding_matrix.shape[0]`.
 
@@ -405,6 +421,12 @@ def evaluate_config(
     """
     try:
         validate_fn(hyperparams, n_samples)
+    except ValueError as exc:
+        return ReducerConfigCandidate(hyperparams=hyperparams, status="invalid", detail=str(exc))
+
+    hdbscan_clusterer = build_hdbscan_clusterer(hyperparams)
+    try:
+        hdbscan_clusterer.validate_hyperparameters(n_samples)
     except ValueError as exc:
         return ReducerConfigCandidate(hyperparams=hyperparams, status="invalid", detail=str(exc))
 
@@ -544,23 +566,26 @@ def run_reduction_sweep(
     hyperparameter_values: dict[str, list],
     seeds: list[int],
     repeats_per_seed: int,
-    hdbscan_clusterer: HDBSCANClusterer,
+    build_hdbscan_clusterer: Callable[[dict], HDBSCANClusterer],
     embedding_matrix: np.ndarray,
     n_samples: int,
 ) -> tuple[ReducerConfigCandidate | None, list[ReducerConfigCandidate]]:
     """Run the full config x seed x repeat sweep and pick the overall winner.
 
     Args:
-        fit_reduced: Reducer-specific `(embedding_matrix, seed, **hyperparams)
-            -> reduced_matrix` callable.
+        fit_reduced: Reducer-specific `(embedding_matrix, seed,
+            **reducer_hyperparams) -> reduced_matrix` callable.
         validate_fn: Reducer-specific `(hyperparams, n_samples) -> None`
             precondition check, raising `ValueError` for an unusable config.
-        hyperparameter_values: The swept reducer hyperparameters, as passed
-            to `generate_config_combinations`.
+        hyperparameter_values: The swept hyperparameters, as passed to
+            `generate_config_combinations` — the reducer's own, plus
+            optionally `"min_cluster_size"` if the caller wants HDBSCAN's
+            `min_cluster_size` swept alongside them (see
+            `build_hdbscan_clusterer`).
         seeds: The user-supplied seed list.
         repeats_per_seed: Number of repeats per (config, seed) pair.
-        hdbscan_clusterer: A single `HDBSCANClusterer` configured with this
-            run's fixed HDBSCAN hyperparameters.
+        build_hdbscan_clusterer: `(hyperparams) -> HDBSCANClusterer`,
+            called once per config (see `evaluate_config`).
         embedding_matrix: The original, non-reduced embedding matrix.
         n_samples: `embedding_matrix.shape[0]`.
 
@@ -583,7 +608,8 @@ def run_reduction_sweep(
     candidates = []
     for index, hyperparams in enumerate(combos, start=1):
         candidate = evaluate_config(
-            fit_reduced, hyperparams, seeds, repeats_per_seed, validate_fn, hdbscan_clusterer, embedding_matrix, n_samples
+            fit_reduced, hyperparams, seeds, repeats_per_seed, validate_fn, build_hdbscan_clusterer,
+            embedding_matrix, n_samples,
         )
         log_config_candidate(index, len(combos), candidate)
         candidates.append(candidate)

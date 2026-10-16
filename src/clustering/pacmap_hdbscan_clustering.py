@@ -65,6 +65,7 @@ DEFAULT_FP_RATIO = [2.0]
 DEFAULT_DISTANCE = "euclidean"
 DEFAULT_SEEDS = [42]
 DEFAULT_REPEATS_PER_SEED = 10
+DEFAULT_HDBSCAN_MIN_CLUSTER_SIZE_VALUES = [HDBSCANClusterer.DEFAULT_MIN_CLUSTER_SIZE]
 
 PACMAP_REDUCED_EMBEDDING_PARQUET_SCHEMA = pa.schema(
     [
@@ -225,7 +226,9 @@ def build_metrics_dict(
         embedding_dim: Original (non-reduced) embedding dimensionality.
         embedding_backend: Backend recorded on the clustered rows.
         embedding_model: Model recorded on the clustered rows.
-        hdbscan_clusterer: The fixed-hyperparameter `HDBSCANClusterer` used across the sweep.
+        hdbscan_clusterer: The winning combination's `HDBSCANClusterer`
+            (built from `best.hyperparams["min_cluster_size"]` plus this
+            run's other, fixed HDBSCAN hyperparameters).
         best: The winning `ReducerConfigCandidate`.
         all_candidates: Every candidate tried, for the audit trail.
         seeds: The full seed list that was swept.
@@ -268,7 +271,7 @@ def build_metrics_dict(
         "metrics_valid": representative.metrics_result["metrics_valid"],
         "relative_validity_index": representative.relative_validity,
         "notes": representative.metrics_result["notes"] + best.notes,
-        "winning_pacmap_config": best.hyperparams,
+        "winning_pacmap_config": {k: v for k, v in best.hyperparams.items() if k != "min_cluster_size"},
         "winning_seed": best.winning_seed.seed,
         "winning_seed_noise_fraction_std": best.winning_seed.noise_fraction_std,
         "pacmap_config_search": {
@@ -276,6 +279,7 @@ def build_metrics_dict(
             "n_neighbors_values": sorted({c.hyperparams["n_neighbors"] for c in all_candidates}),
             "mn_ratio_values": sorted({c.hyperparams["mn_ratio"] for c in all_candidates}),
             "fp_ratio_values": sorted({c.hyperparams["fp_ratio"] for c in all_candidates}),
+            "min_cluster_size_values": sorted({c.hyperparams["min_cluster_size"] for c in all_candidates}),
             "distance": pacmap_distance,
             "seeds": seeds,
             "repeats_per_seed": repeats_per_seed,
@@ -293,7 +297,7 @@ def run(
     pacmap_distance: str = DEFAULT_DISTANCE,
     seeds: list[int] = DEFAULT_SEEDS,
     repeats_per_seed: int = DEFAULT_REPEATS_PER_SEED,
-    hdbscan_min_cluster_size: int = HDBSCANClusterer.DEFAULT_MIN_CLUSTER_SIZE,
+    hdbscan_min_cluster_size_values: list[int] = DEFAULT_HDBSCAN_MIN_CLUSTER_SIZE_VALUES,
     hdbscan_min_samples: int = HDBSCANClusterer.DEFAULT_MIN_CLUSTER_SIZE,
     hdbscan_metric: str = HDBSCANClusterer.DEFAULT_METRIC,
     hdbscan_cluster_selection_epsilon: float = HDBSCANClusterer.DEFAULT_CLUSTER_SELECTION_EPSILON,
@@ -319,7 +323,10 @@ def run(
         pacmap_distance: PaCMAP's distance metric, held fixed across the sweep.
         seeds: PaCMAP `random_state` values to sweep for reproducibility.
         repeats_per_seed: Number of repeated fits per (config, seed) pair.
-        hdbscan_min_cluster_size: Fixed (non-swept) HDBSCAN hyperparameter.
+        hdbscan_min_cluster_size_values: HDBSCAN `min_cluster_size` values to
+            sweep, folded into the same config grid as the PaCMAP
+            hyperparameters above (so a config now means a PaCMAP
+            hyperparameter combination *and* a `min_cluster_size` value).
         hdbscan_min_samples: Fixed (non-swept) HDBSCAN hyperparameter; always
             an explicit value (never `None`), so the effective `min_samples`
             HDBSCAN fits with is never left to sklearn's own implicit fallback.
@@ -371,15 +378,15 @@ def run(
     embedding_dim = clustering_io.validate_embedding_dimensions(filtered)
     embedding_matrix = clustering_io.extract_embedding_matrix(filtered)
 
-    hdbscan_clusterer = HDBSCANClusterer(
-        min_cluster_size=hdbscan_min_cluster_size,
-        min_samples=hdbscan_min_samples,
-        metric=hdbscan_metric,
-        cluster_selection_epsilon=hdbscan_cluster_selection_epsilon,
-        cluster_selection_method=hdbscan_cluster_selection_method,
-        alpha=hdbscan_alpha,
-    )
-    hdbscan_clusterer.validate_hyperparameters(n_samples)
+    def build_hdbscan_clusterer(hyperparams: dict) -> HDBSCANClusterer:
+        return HDBSCANClusterer(
+            min_cluster_size=hyperparams["min_cluster_size"],
+            min_samples=hdbscan_min_samples,
+            metric=hdbscan_metric,
+            cluster_selection_epsilon=hdbscan_cluster_selection_epsilon,
+            cluster_selection_method=hdbscan_cluster_selection_method,
+            alpha=hdbscan_alpha,
+        )
 
     fit_reduced = make_fit_pacmap_reduced(pacmap_distance)
     best, all_candidates = reduction_sweep.run_reduction_sweep(
@@ -390,10 +397,11 @@ def run(
             "n_neighbors": n_neighbors_values,
             "mn_ratio": mn_ratio_values,
             "fp_ratio": fp_ratio_values,
+            "min_cluster_size": hdbscan_min_cluster_size_values,
         },
         seeds=seeds,
         repeats_per_seed=repeats_per_seed,
-        hdbscan_clusterer=hdbscan_clusterer,
+        build_hdbscan_clusterer=build_hdbscan_clusterer,
         embedding_matrix=embedding_matrix,
         n_samples=n_samples,
     )
@@ -408,6 +416,7 @@ def run(
 
     representative = reduction_sweep.representative_repeat(best)
     clustered_at = datetime.now(timezone.utc)
+    hdbscan_clusterer = build_hdbscan_clusterer(best.hyperparams)
 
     reduced_rows = build_reduced_embedding_rows(filtered, representative.reduced_matrix, clustered_at)
     clustering_io.write_parquet(reduced_rows, PACMAP_REDUCED_EMBEDDING_PARQUET_SCHEMA, reduced_embeddings_output_path)
@@ -479,7 +488,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--pacmap-n-neighbors",
         type=parse_int_list,
         default=DEFAULT_N_NEIGHBORS,
-        help="Comma-separated list of PaCMAP n_neighbors values to sweep (default: 10)",
+        help="Comma-separated list of PaCMAP n_neighbors values to sweep (default: 10); large "
+        "values (e.g. 30+) risk over-smoothing the projection into one dominant cluster, which "
+        "the MIN_N_CLUSTERS/MAX_CLUSTER_SHARE/MAX_NOISE_FRACTION guards will reject as degenerate "
+        "-- pair with a --hdbscan-min-cluster-size sweep instead of relying on very large values here",
     )
     parser.add_argument(
         "--pacmap-mn-ratio",
@@ -513,9 +525,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--hdbscan-min-cluster-size",
-        type=int,
-        default=HDBSCANClusterer.DEFAULT_MIN_CLUSTER_SIZE,
-        help="Fixed HDBSCAN min_cluster_size, not swept (default: 200)",
+        type=parse_int_list,
+        default=DEFAULT_HDBSCAN_MIN_CLUSTER_SIZE_VALUES,
+        help="Comma-separated list of HDBSCAN min_cluster_size values to sweep, folded into the "
+        "same config grid as the PaCMAP hyperparameters above (default: 200)",
     )
     parser.add_argument(
         "--hdbscan-min-samples",
@@ -590,7 +603,7 @@ def main() -> None:
         pacmap_distance=args.pacmap_distance,
         seeds=args.seeds,
         repeats_per_seed=args.repeats_per_seed,
-        hdbscan_min_cluster_size=args.hdbscan_min_cluster_size,
+        hdbscan_min_cluster_size_values=args.hdbscan_min_cluster_size,
         hdbscan_min_samples=args.hdbscan_min_samples,
         hdbscan_metric=args.hdbscan_metric,
         hdbscan_cluster_selection_epsilon=args.hdbscan_cluster_selection_epsilon,

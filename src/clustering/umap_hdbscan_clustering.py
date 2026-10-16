@@ -75,6 +75,7 @@ DEFAULT_MIN_DIST = [0.1]
 DEFAULT_METRIC = "euclidean"
 DEFAULT_SEEDS = [42]
 DEFAULT_REPEATS_PER_SEED = 10
+DEFAULT_HDBSCAN_MIN_CLUSTER_SIZE_VALUES = [HDBSCANClusterer.DEFAULT_MIN_CLUSTER_SIZE]
 
 UMAP_REDUCED_EMBEDDING_PARQUET_SCHEMA = pa.schema(
     [
@@ -228,7 +229,9 @@ def build_metrics_dict(
         embedding_dim: Original (non-reduced) embedding dimensionality.
         embedding_backend: Backend recorded on the clustered rows.
         embedding_model: Model recorded on the clustered rows.
-        hdbscan_clusterer: The fixed-hyperparameter `HDBSCANClusterer` used across the sweep.
+        hdbscan_clusterer: The winning combination's `HDBSCANClusterer`
+            (built from `best.hyperparams["min_cluster_size"]` plus this
+            run's other, fixed HDBSCAN hyperparameters).
         best: The winning `ReducerConfigCandidate`.
         all_candidates: Every candidate tried, for the audit trail.
         seeds: The full seed list that was swept.
@@ -271,13 +274,14 @@ def build_metrics_dict(
         "metrics_valid": representative.metrics_result["metrics_valid"],
         "relative_validity_index": representative.relative_validity,
         "notes": representative.metrics_result["notes"] + best.notes,
-        "winning_umap_config": best.hyperparams,
+        "winning_umap_config": {k: v for k, v in best.hyperparams.items() if k != "min_cluster_size"},
         "winning_seed": best.winning_seed.seed,
         "winning_seed_noise_fraction_std": best.winning_seed.noise_fraction_std,
         "umap_config_search": {
             "n_components_values": sorted({c.hyperparams["n_components"] for c in all_candidates}),
             "n_neighbors_values": sorted({c.hyperparams["n_neighbors"] for c in all_candidates}),
             "min_dist_values": sorted({c.hyperparams["min_dist"] for c in all_candidates}),
+            "min_cluster_size_values": sorted({c.hyperparams["min_cluster_size"] for c in all_candidates}),
             "metric": umap_metric,
             "seeds": seeds,
             "repeats_per_seed": repeats_per_seed,
@@ -294,7 +298,7 @@ def run(
     umap_metric: str = DEFAULT_METRIC,
     seeds: list[int] = DEFAULT_SEEDS,
     repeats_per_seed: int = DEFAULT_REPEATS_PER_SEED,
-    hdbscan_min_cluster_size: int = HDBSCANClusterer.DEFAULT_MIN_CLUSTER_SIZE,
+    hdbscan_min_cluster_size_values: list[int] = DEFAULT_HDBSCAN_MIN_CLUSTER_SIZE_VALUES,
     hdbscan_min_samples: int = HDBSCANClusterer.DEFAULT_MIN_CLUSTER_SIZE,
     hdbscan_metric: str = HDBSCANClusterer.DEFAULT_METRIC,
     hdbscan_cluster_selection_epsilon: float = HDBSCANClusterer.DEFAULT_CLUSTER_SELECTION_EPSILON,
@@ -315,7 +319,10 @@ def run(
         umap_metric: UMAP's distance metric, held fixed across the sweep.
         seeds: UMAP `random_state` values to sweep for reproducibility.
         repeats_per_seed: Number of repeated fits per (config, seed) pair.
-        hdbscan_min_cluster_size: Fixed (non-swept) HDBSCAN hyperparameter.
+        hdbscan_min_cluster_size_values: HDBSCAN `min_cluster_size` values to
+            sweep, folded into the same config grid as the UMAP
+            hyperparameters above (so a config now means a UMAP
+            hyperparameter combination *and* a `min_cluster_size` value).
         hdbscan_min_samples: Fixed (non-swept) HDBSCAN hyperparameter; always
             an explicit value (never `None`), so the effective `min_samples`
             HDBSCAN fits with is never left to sklearn's own implicit fallback.
@@ -367,15 +374,15 @@ def run(
     embedding_dim = clustering_io.validate_embedding_dimensions(filtered)
     embedding_matrix = clustering_io.extract_embedding_matrix(filtered)
 
-    hdbscan_clusterer = HDBSCANClusterer(
-        min_cluster_size=hdbscan_min_cluster_size,
-        min_samples=hdbscan_min_samples,
-        metric=hdbscan_metric,
-        cluster_selection_epsilon=hdbscan_cluster_selection_epsilon,
-        cluster_selection_method=hdbscan_cluster_selection_method,
-        alpha=hdbscan_alpha,
-    )
-    hdbscan_clusterer.validate_hyperparameters(n_samples)
+    def build_hdbscan_clusterer(hyperparams: dict) -> HDBSCANClusterer:
+        return HDBSCANClusterer(
+            min_cluster_size=hyperparams["min_cluster_size"],
+            min_samples=hdbscan_min_samples,
+            metric=hdbscan_metric,
+            cluster_selection_epsilon=hdbscan_cluster_selection_epsilon,
+            cluster_selection_method=hdbscan_cluster_selection_method,
+            alpha=hdbscan_alpha,
+        )
 
     fit_reduced = make_fit_umap_reduced(umap_metric)
     best, all_candidates = reduction_sweep.run_reduction_sweep(
@@ -385,10 +392,11 @@ def run(
             "n_components": n_components_values,
             "n_neighbors": n_neighbors_values,
             "min_dist": min_dist_values,
+            "min_cluster_size": hdbscan_min_cluster_size_values,
         },
         seeds=seeds,
         repeats_per_seed=repeats_per_seed,
-        hdbscan_clusterer=hdbscan_clusterer,
+        build_hdbscan_clusterer=build_hdbscan_clusterer,
         embedding_matrix=embedding_matrix,
         n_samples=n_samples,
     )
@@ -403,6 +411,7 @@ def run(
 
     representative = reduction_sweep.representative_repeat(best)
     clustered_at = datetime.now(timezone.utc)
+    hdbscan_clusterer = build_hdbscan_clusterer(best.hyperparams)
 
     reduced_rows = build_reduced_embedding_rows(filtered, representative.reduced_matrix, clustered_at)
     clustering_io.write_parquet(reduced_rows, UMAP_REDUCED_EMBEDDING_PARQUET_SCHEMA, reduced_embeddings_output_path)
@@ -503,9 +512,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--hdbscan-min-cluster-size",
-        type=int,
-        default=HDBSCANClusterer.DEFAULT_MIN_CLUSTER_SIZE,
-        help="Fixed HDBSCAN min_cluster_size, not swept (default: 200)",
+        type=parse_int_list,
+        default=DEFAULT_HDBSCAN_MIN_CLUSTER_SIZE_VALUES,
+        help="Comma-separated list of HDBSCAN min_cluster_size values to sweep, folded into the "
+        "same config grid as the UMAP hyperparameters above (default: 200)",
     )
     parser.add_argument(
         "--hdbscan-min-samples",
@@ -579,7 +589,7 @@ def main() -> None:
         umap_metric=args.umap_metric,
         seeds=args.seeds,
         repeats_per_seed=args.repeats_per_seed,
-        hdbscan_min_cluster_size=args.hdbscan_min_cluster_size,
+        hdbscan_min_cluster_size_values=args.hdbscan_min_cluster_size,
         hdbscan_min_samples=args.hdbscan_min_samples,
         hdbscan_metric=args.hdbscan_metric,
         hdbscan_cluster_selection_epsilon=args.hdbscan_cluster_selection_epsilon,
