@@ -554,7 +554,9 @@ condition (`--method`, one of `kmeans`/`hdbscan`/`umap_hdbscan`/
 HTML scatterplot of that condition's criteria in a 2-dimensional UMAP space,
 with points colored by cluster (a distinct color for HDBSCAN-based methods'
 noise points), a legend mapping color to cluster, and a hover tooltip
-showing each point's criterion text.
+showing each point's criterion text. Pass `--input-path` to visualize an
+arbitrary cluster-assignments Parquet file directly instead of looking one
+up from `--method`/`condition`.
 
 The 2D projection always reuses that method's own "optimal run" seed rather
 than introducing new randomness: k-means's `kmeans_params.random_state`;
@@ -587,6 +589,7 @@ HTML file wholesale; there is no append/skip-if-exists/merge behavior.
 | `condition`        | yes      | Condition to visualize, e.g. `"breast cancer"`. Must already be clustered by `--method`. |
 | `--method`          | yes      | Which clustering method's output to visualize: `kmeans`, `hdbscan`, `umap_hdbscan`, or `pacmap_hdbscan`. |
 | `--seed`            | no       | Override the 2D UMAP projection's seed (default: reuse that method's own optimal-run seed, or the fallback default for `hdbscan`). |
+| `--input-path`      | no       | Override the default cluster-assignments Parquet path to visualize (the file whose rows become the plotted points), instead of looking it up from `--method`/`condition`. |
 | `--output-path`     | no       | Override the default output HTML path. |
 
 ### Example: full pipeline for one condition

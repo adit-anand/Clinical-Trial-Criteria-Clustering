@@ -179,21 +179,27 @@ def load_metrics(spec: VisualizationSpec, slug: str) -> dict:
         return json.load(f)
 
 
-def load_assignments(spec: VisualizationSpec, slug: str) -> pa.Table:
+def load_assignments(spec: VisualizationSpec, slug: str, assignments_path: Path | None = None) -> pa.Table:
     """Read a method's cluster assignments Parquet for a condition.
 
     Args:
         spec: The method's `VisualizationSpec`.
         slug: The condition's filesystem-safe slug.
+        assignments_path: Explicit Parquet path to read instead of the
+            default `spec.output_dir / f"{slug}{spec.assignments_suffix}"`
+            location — the file whose rows (`nct_id`, `cluster_id`,
+            `criterion_text`) become the plotted points. If omitted, the
+            default per-method/-condition path is used, as before.
 
     Returns:
         The cluster assignments table.
 
     Raises:
-        FileNotFoundError: If the assignments file doesn't exist, naming the
-            exact path and which clustering module to run first.
+        FileNotFoundError: If the resolved assignments file doesn't exist,
+            naming the exact path and which clustering module to run first.
     """
-    assignments_path = spec.output_dir / f"{slug}{spec.assignments_suffix}"
+    if assignments_path is None:
+        assignments_path = spec.output_dir / f"{slug}{spec.assignments_suffix}"
     if not assignments_path.exists():
         raise FileNotFoundError(
             f"No {spec.key} cluster assignments found at {assignments_path}; run the {spec.key} "
@@ -327,17 +333,25 @@ def run(
     condition: str,
     method: str,
     seed_override: int | None = None,
+    input_path: Path | None = None,
     output_path: Path | None = None,
 ) -> Path:
     """Render and write a 2D UMAP scatterplot for one condition/method pair.
 
     Args:
         condition: Condition string, e.g. "breast cancer" — must match the
-            condition already clustered by `method`.
+            condition already clustered by `method`, unless `input_path` is
+            given (in which case `condition` is only used for the metrics
+            lookup, the plot title, and the default output filename).
         method: Which clustering method's output to visualize — one of
             `VISUALIZATION_SPECS`'s keys.
         seed_override: If given, used instead of that method's own
             recorded/fallback seed.
+        input_path: Explicit cluster-assignments Parquet path to visualize,
+            overriding the default `spec.output_dir /
+            f"{slug}{spec.assignments_suffix}"` lookup — the file whose rows
+            become the plotted points. If omitted, the default
+            per-method/-condition path is used, as before.
         output_path: Where to write the HTML. If omitted, defaults to
             ``spec.output_dir / f"{slug}{spec.scatterplot_suffix}"``.
 
@@ -346,7 +360,8 @@ def run(
 
     Raises:
         ValueError: If `method` isn't a recognized key in `VISUALIZATION_SPECS`.
-        FileNotFoundError: If the condition hasn't been clustered by `method` yet.
+        FileNotFoundError: If the condition hasn't been clustered by `method`
+            yet, or if `input_path` is given but doesn't exist.
     """
     if method not in VISUALIZATION_SPECS:
         raise ValueError(f"Unknown method {method!r}; expected one of {sorted(VISUALIZATION_SPECS)}")
@@ -354,7 +369,7 @@ def run(
     slug = EligibilityCriteriaFetcher.condition_to_slug(condition)
 
     metrics = load_metrics(spec, slug)
-    assignments_table = load_assignments(spec, slug)
+    assignments_table = load_assignments(spec, slug, assignments_path=input_path)
 
     if seed_override is not None:
         seed, seed_explicit = seed_override, True
@@ -383,8 +398,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     Returns:
         An ``argparse.ArgumentParser`` accepting a positional ``condition``
-        argument, a required ``--method`` choice, and optional seed/output
-        overrides.
+        argument, a required ``--method`` choice, and optional
+        seed/input/output overrides.
     """
     parser = argparse.ArgumentParser(
         description="Render an interactive 2D UMAP scatterplot of an already-clustered condition."
@@ -406,6 +421,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Override the 2D UMAP projection's seed (default: reuse that method's own optimal-run seed)",
     )
     parser.add_argument(
+        "--input-path",
+        type=Path,
+        default=None,
+        help="Override the default cluster-assignments Parquet path to visualize (the file whose "
+        "rows become the plotted points), instead of looking it up from --method/condition",
+    )
+    parser.add_argument(
         "--output-path",
         type=Path,
         default=None,
@@ -418,7 +440,7 @@ def main() -> None:
     """CLI entry point: render and write a scatterplot for one condition/method pair."""
     logging.basicConfig(level=logging.INFO)
     args = build_arg_parser().parse_args()
-    run(args.condition, args.method, seed_override=args.seed, output_path=args.output_path)
+    run(args.condition, args.method, seed_override=args.seed, input_path=args.input_path, output_path=args.output_path)
 
 
 if __name__ == "__main__":
