@@ -16,7 +16,7 @@ downstream clustering step can load the file directly without guesswork):
     embedding                list<float32>, null when embedding_success is False
     embedding_success       bool
     embedding_dim           int32, null on failure
-    embedding_backend       string ("vllm" or "huggingface")
+    embedding_backend       string ("vllm", "huggingface", or "bert")
     embedding_model         string (e.g. "gpt-oss-20b")
     embedded_at             timestamp("us", tz="UTC")
 
@@ -43,7 +43,9 @@ import pyarrow.parquet as pq
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from src.embeddings.embedding_cache import EmbeddingCache
 from src.embeddings.embedding_model import EmbeddingModel, build_embedding_model
+from src.paths import REPO_ROOT, slug_from_filename
 
 logger = logging.getLogger(__name__)
 
@@ -241,7 +243,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--backend",
         required=True,
-        choices=["vllm", "huggingface"],
+        choices=["vllm", "huggingface", "bert"],
         help="Embedding backend to use",
     )
     parser.add_argument(
@@ -267,6 +269,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=32,
         help="Number of criteria to embed per backend call (default: 32)",
     )
+    parser.add_argument(
+        "--pooling-strategy",
+        choices=["mean", "cls"],
+        default=None,
+        help="Pooling strategy for the 'bert' backend (default: its own default). Ignored by other backends.",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for the 'bert' backend's on-disk embedding cache "
+            "(default: data/embeddings/cache). Ignored by other backends."
+        ),
+    )
     return parser
 
 
@@ -276,7 +293,15 @@ def main() -> None:
 
     args = build_arg_parser().parse_args()
 
-    embedding_model = build_embedding_model(args.backend, args.model)
+    backend_kwargs = {}
+    if args.backend == "bert":
+        cache_dir = args.cache_dir or (REPO_ROOT / "data" / "embeddings" / "cache")
+        slug = slug_from_filename(args.input_path.name, "_trials_eligibility.csv")
+        cache_path = cache_dir / f"{slug}_embedding_cache.parquet"
+        backend_kwargs["cache"] = EmbeddingCache(cache_path)
+        backend_kwargs["pooling_strategy"] = args.pooling_strategy
+
+    embedding_model = build_embedding_model(args.backend, args.model, **backend_kwargs)
     embedder = CriteriaEmbedder(embedding_model, batch_size=args.batch_size)
     embedder.run(args.input_path, args.output_path)
 

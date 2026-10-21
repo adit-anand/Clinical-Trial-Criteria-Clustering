@@ -1,31 +1,41 @@
 """Text embedding backends for eligibility criteria.
 
-Defines a single `EmbeddingModel` interface implemented by two interchangeable
-backends:
+Defines a single `EmbeddingModel` interface implemented by three
+interchangeable backends:
 
 * `VLLMEmbeddingModel` — calls an already-running, externally-managed vLLM
   server's OpenAI-compatible ``/v1/embeddings`` endpoint over HTTP.
 * `HuggingFaceEmbeddingModel` — runs a `sentence-transformers` model
-  in-process.
+  in-process via its high-level ``.encode()`` method.
+* `BertEmbeddingModel` — runs a BERT-family `sentence-transformers` model
+  in-process via its lower-level `Transformer` submodule, for explicit
+  control over eval mode, fp32 precision, pooling strategy, and L2
+  normalization, plus an on-disk embedding cache. Imports only
+  `sentence_transformers` and `torch` — never `transformers` directly.
 
-Both backends return pooled + normalized vectors on their own (vLLM
-server-side; `sentence-transformers` via ``normalize_embeddings=True``), so no
-manual pooling/normalization is implemented here. Orchestration code (see
-`criteria_embedding.py`) should depend only on `EmbeddingModel` and
-`build_embedding_model`, never on a concrete backend class, so adding a third
-backend never requires touching the orchestration layer.
+`VLLMEmbeddingModel` and `HuggingFaceEmbeddingModel` return pooled +
+normalized vectors on their own (vLLM server-side; `sentence-transformers`
+via ``normalize_embeddings=True``), so no manual pooling/normalization is
+implemented for them. `BertEmbeddingModel` does its own pooling/normalization
+(see its class docstring). Orchestration code (see `criteria_embedding.py`)
+should depend only on `EmbeddingModel` and `build_embedding_model`, never on
+a concrete backend class, so adding a further backend never requires
+touching the orchestration layer.
 """
 
 import logging
 import os
 import time
 from abc import ABC, abstractmethod
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import requests
 from dotenv import load_dotenv
 
 from src.paths import REPO_ROOT
+
+if TYPE_CHECKING:
+    from src.embeddings.embedding_cache import EmbeddingCache
 
 logger = logging.getLogger(__name__)
 
@@ -301,17 +311,230 @@ class HuggingFaceEmbeddingModel(EmbeddingModel):
         return self.model.get_embedding_dimension()
 
 
+class BertEmbeddingModel(EmbeddingModel):
+    """Runs a BERT-family `sentence-transformers` model with explicit pooling/precision control.
+
+    Unlike `HuggingFaceEmbeddingModel` (which delegates pooling and
+    normalization to `SentenceTransformer.encode(normalize_embeddings=True)`),
+    this backend drives the model's lower-level `Transformer` submodule
+    directly — `preprocess()`/`forward()` rather than `.encode()` — so it can
+    apply its own attention-mask-aware pooling and L2 normalization, and so
+    it can consult an injected `EmbeddingCache` before running inference at
+    all. This keeps the backend's imports limited to `sentence_transformers`
+    and `torch`; `transformers` is never imported directly, even though it
+    remains installed transitively as `sentence-transformers`'s own
+    dependency and underlies what `sentence_transformers.models.Transformer`
+    wraps internally.
+
+    The model is forced into eval mode and fp32 once at construction, and
+    `embed_batch` defensively re-asserts eval mode on every call and runs
+    forward passes under `torch.inference_mode()` — never `torch.autocast`,
+    `.half()`, or `.bfloat16()`.
+    """
+
+    backend_name: ClassVar[str] = "bert"
+
+    DEFAULT_MODEL_NAME = "NeuML/pubmedbert-base-embeddings"
+    DEFAULT_POOLING_STRATEGY = "mean"
+    POOLING_STRATEGIES = frozenset({"mean", "cls"})
+    NORMALIZATION_EPSILON = 1e-12
+    CACHE_SCHEMA_VERSION = 1
+
+    def __init__(
+        self,
+        model_name: str | None = None,
+        device: str | None = None,
+        pooling_strategy: str | None = None,
+        cache: "EmbeddingCache | None" = None,
+        load_env: bool = True,
+    ):
+        """Load the `sentence-transformers` model once at construction, forced to eval/fp32.
+
+        Args:
+            model_name: HuggingFace model identifier to load. Defaults to
+                `DEFAULT_MODEL_NAME`.
+            device: Device to load the model onto (e.g. ``"cpu"``,
+                ``"cuda"``). If omitted, defaults to CUDA if available, else
+                CPU.
+            pooling_strategy: Either ``"mean"`` (attention-mask-aware mean
+                pooling) or ``"cls"`` (first-token pooling). Defaults to
+                `DEFAULT_POOLING_STRATEGY`.
+            cache: An already-constructed `EmbeddingCache` instance to
+                consult/populate in `embed_batch`, or `None` to disable
+                caching. Owned by the caller — this class knows nothing
+                about which input file the cache belongs to.
+            load_env: If True, load variables from a ``.env`` file at the
+                repo root (via ``python-dotenv``) before reading `HF_TOKEN`
+                from the environment.
+
+        Raises:
+            ValueError: If `pooling_strategy` isn't one of `POOLING_STRATEGIES`.
+            Exception: Whatever `sentence_transformers.SentenceTransformer`
+                raises if the model can't be resolved/downloaded/loaded;
+                allowed to propagate directly for a fast, clear failure.
+        """
+        import torch
+        from sentence_transformers import SentenceTransformer
+
+        if load_env:
+            load_dotenv(REPO_ROOT / ".env")
+
+        self.pooling_strategy = pooling_strategy or self.DEFAULT_POOLING_STRATEGY
+        if self.pooling_strategy not in self.POOLING_STRATEGIES:
+            raise ValueError(
+                f"Unknown pooling strategy: {self.pooling_strategy!r} "
+                f"(expected one of {sorted(self.POOLING_STRATEGIES)})"
+            )
+
+        self.model_name = model_name or self.DEFAULT_MODEL_NAME
+        self.cache = cache
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.model = SentenceTransformer(
+            self.model_name,
+            device=self.device,
+            model_kwargs={"torch_dtype": torch.float32},
+            token=os.environ.get("HF_TOKEN"),
+        )
+        self.model.eval()
+        self._embedding_dim = self.model.get_embedding_dimension()
+        self._transformer_module = self.model[0]
+
+    def embed_batch(self, texts: list[str]) -> list[list[float] | None]:
+        """Embed a batch of strings, serving cache hits and computing only cache misses.
+
+        Queries the cache first for every text, splits `texts` into
+        cache-hit and cache-miss subsets (preserving original position), and
+        runs the tokenize -> forward -> pool -> normalize pipeline under
+        `torch.inference_mode()` only on the miss subset. If that forward
+        pass raises, cache hits are still returned successfully — only the
+        miss-subset rows become `None`, unlike the other two backends'
+        simple "whole batch fails together" contract.
+
+        Args:
+            texts: The strings to embed, in order.
+
+        Returns:
+            One vector per input, in the same order as `texts`, with `None`
+            for any row whose (non-cached) computation failed.
+        """
+        import torch
+
+        self.model.eval()
+
+        if self.cache is not None:
+            cached = self.cache.get_many(
+                texts, self.model_name, self.backend_name, self.pooling_strategy, self.CACHE_SCHEMA_VERSION
+            )
+        else:
+            cached = [None] * len(texts)
+
+        results: list[list[float] | None] = list(cached)
+        miss_indices = [index for index, embedding in enumerate(cached) if embedding is None]
+        if not miss_indices:
+            return results
+
+        miss_texts = [texts[index] for index in miss_indices]
+        try:
+            with torch.inference_mode():
+                features = self._transformer_module.preprocess(miss_texts)
+                features = {
+                    key: (value.to(self.device) if torch.is_tensor(value) else value)
+                    for key, value in features.items()
+                }
+                features = self._transformer_module.forward(features)
+                token_embeddings = features["token_embeddings"]
+                attention_mask = features["attention_mask"]
+
+                if self.pooling_strategy == "mean":
+                    pooled = self._mean_pool(token_embeddings, attention_mask)
+                else:
+                    pooled = token_embeddings[:, 0, :]
+
+                normalized = self._l2_normalize(pooled)
+
+            miss_vectors = normalized.cpu().numpy().astype("float32").tolist()
+        except Exception:
+            logger.exception("BERT embed_batch: failed on a miss-subset of %d text(s)", len(miss_texts))
+            miss_vectors = [None] * len(miss_texts)
+
+        for index, vector in zip(miss_indices, miss_vectors):
+            results[index] = vector
+
+        if self.cache is not None:
+            self.cache.put_many(
+                miss_texts,
+                miss_vectors,
+                self.model_name,
+                self.backend_name,
+                self.pooling_strategy,
+                self.CACHE_SCHEMA_VERSION,
+            )
+
+        return results
+
+    def embedding_dim(self) -> int | None:
+        """Report this model's embedding dimensionality.
+
+        Returns:
+            The dimensionality read eagerly at construction from the
+            underlying `SentenceTransformer` instance.
+        """
+        return self._embedding_dim
+
+    def _mean_pool(self, token_embeddings: "torch.Tensor", attention_mask: "torch.Tensor") -> "torch.Tensor":
+        """Attention-mask-aware mean pooling over the token dimension.
+
+        Zeroes out padded positions before summing, then divides by each
+        row's actual token count (clamped to a minimum to avoid a
+        theoretical div-by-zero).
+
+        Args:
+            token_embeddings: Per-token hidden states, shape
+                ``(batch, seq_len, hidden)``.
+            attention_mask: ``1`` for real tokens, ``0`` for padding, shape
+                ``(batch, seq_len)``.
+
+        Returns:
+            Pooled per-row vectors, shape ``(batch, hidden)``.
+        """
+        mask = attention_mask.unsqueeze(-1).to(token_embeddings.dtype)
+        summed = (token_embeddings * mask).sum(dim=1)
+        token_counts = mask.sum(dim=1).clamp(min=1e-9)
+        return summed / token_counts
+
+    def _l2_normalize(self, vectors: "torch.Tensor") -> "torch.Tensor":
+        """L2-normalize each row to unit norm.
+
+        Clamps the *denominator* (not the numerator) to `NORMALIZATION_EPSILON`,
+        so a near-zero vector produces a finite (not NaN/Inf) result. An
+        exact-zero input mathematically cannot be rescaled to unit norm by
+        any epsilon trick — that's an unavoidable property of normalization,
+        not a bug.
+
+        Args:
+            vectors: Row vectors to normalize, shape ``(batch, hidden)``.
+
+        Returns:
+            Unit-L2-norm vectors (barring the all-zero-input edge case),
+            same shape as `vectors`.
+        """
+        norm = vectors.norm(p=2, dim=1, keepdim=True)
+        return vectors / norm.clamp(min=self.NORMALIZATION_EPSILON)
+
+
 def build_embedding_model(backend: str, model_name: str | None = None, **kwargs) -> EmbeddingModel:
     """Construct an `EmbeddingModel` for the named backend.
 
-    The single place a future third backend gets registered.
+    The single place a further backend gets registered.
 
     Args:
-        backend: ``"vllm"`` or ``"huggingface"``.
+        backend: ``"vllm"``, ``"huggingface"``, or ``"bert"``.
         model_name: Model identifier to pass through to the backend's
             constructor. If omitted, the backend uses its own default.
         **kwargs: Additional backend-specific constructor arguments (e.g.
-            `base_url`/`api_key` for vLLM, `device` for HuggingFace).
+            `base_url`/`api_key` for vLLM, `device` for HuggingFace,
+            `device`/`pooling_strategy`/`cache` for BERT).
 
     Returns:
         A constructed `EmbeddingModel` instance.
@@ -323,4 +546,6 @@ def build_embedding_model(backend: str, model_name: str | None = None, **kwargs)
         return VLLMEmbeddingModel(model_name=model_name, **kwargs)
     if backend == "huggingface":
         return HuggingFaceEmbeddingModel(model_name=model_name, **kwargs)
-    raise ValueError(f"Unknown embedding backend: {backend!r} (expected 'vllm' or 'huggingface')")
+    if backend == "bert":
+        return BertEmbeddingModel(model_name=model_name, **kwargs)
+    raise ValueError(f"Unknown embedding backend: {backend!r} (expected 'vllm', 'huggingface', or 'bert')")
