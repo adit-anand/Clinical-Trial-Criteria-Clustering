@@ -1,13 +1,13 @@
-"""Render an interactive 2D UMAP scatterplot of an already-clustered condition.
+"""Render an interactive 2D UMAP scatterplot of an already-clustered method's output.
 
 Every clustering step (`kmeans_clustering.py`, `hdbscan_clustering.py`,
 `umap_hdbscan_clustering.py`, `pacmap_hdbscan_clustering.py`) writes cluster
 assignments and metrics, but none of them render anything visual. This
-module reads whichever one of those four methods' output already exists for
-a condition (it never re-runs clustering) and writes an interactive HTML
-scatterplot of that condition's criteria in a 2-dimensional UMAP space,
-colored by cluster assignment, with a legend and a hover tooltip showing
-each point's criterion text.
+module reads whichever one of those four methods' output the caller points
+it at via explicit path flags (it never re-runs clustering) and writes an
+interactive HTML scatterplot of those criteria in a 2-dimensional UMAP
+space, colored by cluster assignment, with a legend and a hover tooltip
+showing each point's criterion text.
 
 The 2-dimensional projection always reuses that method's own "optimal run"
 seed rather than introducing new randomness:
@@ -18,20 +18,16 @@ seed rather than introducing new randomness:
                        silently
     umap_hdbscan    -> `winning_seed`; if that run's winning configuration
                        was already 2-dimensional, its persisted reduced
-                       embeddings are reused directly instead of re-fitting
-                       UMAP
+                       embeddings are reused directly (via
+                       `--reduced-embeddings-path`) instead of re-fitting UMAP
     pacmap_hdbscan  -> `winning_seed` (its own persisted projection is a
                        PaCMAP projection, never substituted for a UMAP one)
 
 Every per-method difference above is captured once in `VISUALIZATION_SPECS`;
 no function below branches on which method it's looking at.
 
-Writes one HTML file per condition/method pair, into that method's own
-existing output directory, named consistently with its `_clusters.parquet`/
-`_cluster_metrics.json` files (e.g.
-``data/clustering/hdbscan/<condition>_trials_hdbscan_scatterplot.html``).
-Re-running this step for the same condition/method overwrites the existing
-file wholesale.
+Writes one HTML file, at the path given via `--output-path`. Re-running this
+step against the same output path overwrites the existing file wholesale.
 """
 
 import argparse
@@ -58,9 +54,8 @@ import umap
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from src.preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
+from src.paths import label_from_slug, slug_from_filename
 from src.clustering import clustering_io
-from src.clustering import hdbscan_clustering, kmeans_clustering, pacmap_hdbscan_clustering, umap_hdbscan_clustering
 
 logger = logging.getLogger(__name__)
 
@@ -76,41 +71,36 @@ class VisualizationSpec:
 
     Attributes:
         key: Short identifier, also the CLI's `--method` value.
-        output_dir: That method's own output directory, imported directly
-            from its module (never duplicated).
         assignments_suffix: Filename suffix for that method's cluster
-            assignments Parquet.
-        metrics_suffix: Filename suffix for that method's metrics JSON.
-        scatterplot_suffix: Filename suffix for this module's own HTML
-            output, mirroring `assignments_suffix`'s naming convention.
+            assignments Parquet — used only to recover a human-readable
+            label from the `--assignments-path` the caller provides.
         extract_seed_fn: `(metrics_dict) -> seed | None`. `None` means this
             method has no recorded clustering-time seed at all.
-        persisted_projection_fn: `(metrics_dict, slug) -> (path, n_components)
-            | None`. Non-`None` only when this method already persisted a
-            *UMAP* projection usable as-is (currently only `umap_hdbscan`,
-            and only when its winning `n_components == 2`).
+        persisted_projection_fn: `(metrics_dict, reduced_embeddings_path) ->
+            (path, n_components) | None`. Non-`None` only when this method
+            already persisted a *UMAP* projection usable as-is (currently
+            only `umap_hdbscan`, and only when its winning `n_components ==
+            2` and the caller passed `--reduced-embeddings-path`).
     """
 
     key: str
-    output_dir: Path
     assignments_suffix: str
-    metrics_suffix: str
-    scatterplot_suffix: str
     extract_seed_fn: Callable[[dict], int | None]
-    persisted_projection_fn: Callable[[dict, str], tuple[Path, int] | None]
+    persisted_projection_fn: Callable[[dict, Path | None], tuple[Path, int] | None]
 
 
-def _umap_hdbscan_persisted_projection(metrics: dict, slug: str) -> tuple[Path, int] | None:
-    """Return `umap_hdbscan_clustering.py`'s persisted reduced embeddings, only if already 2D."""
+def _umap_hdbscan_persisted_projection(metrics: dict, reduced_embeddings_path: Path | None) -> tuple[Path, int] | None:
+    """Return `umap_hdbscan_clustering.py`'s persisted reduced embeddings, only if already 2D and given."""
+    if reduced_embeddings_path is None:
+        return None
     winning_config = metrics.get("winning_umap_config") or {}
     n_components = winning_config.get("n_components")
     if n_components != 2:
         return None
-    path = umap_hdbscan_clustering.OUTPUT_DIR / f"{slug}_trials_umap_reduced_embeddings.parquet"
-    return path, n_components
+    return reduced_embeddings_path, n_components
 
 
-def _no_persisted_projection(metrics: dict, slug: str) -> tuple[Path, int] | None:
+def _no_persisted_projection(metrics: dict, reduced_embeddings_path: Path | None) -> tuple[Path, int] | None:
     """Shared no-op for methods that never persist a reusable UMAP projection."""
     return None
 
@@ -118,92 +108,73 @@ def _no_persisted_projection(metrics: dict, slug: str) -> tuple[Path, int] | Non
 VISUALIZATION_SPECS: dict[str, VisualizationSpec] = {
     "kmeans": VisualizationSpec(
         key="kmeans",
-        output_dir=kmeans_clustering.OUTPUT_DIR,
         assignments_suffix="_trials_clusters.parquet",
-        metrics_suffix="_trials_cluster_metrics.json",
-        scatterplot_suffix="_trials_cluster_scatterplot.html",
         extract_seed_fn=lambda m: (m.get("kmeans_params") or {}).get("random_state"),
         persisted_projection_fn=_no_persisted_projection,
     ),
     "hdbscan": VisualizationSpec(
         key="hdbscan",
-        output_dir=hdbscan_clustering.OUTPUT_DIR,
         assignments_suffix="_trials_hdbscan_clusters.parquet",
-        metrics_suffix="_trials_hdbscan_cluster_metrics.json",
-        scatterplot_suffix="_trials_hdbscan_scatterplot.html",
         extract_seed_fn=lambda m: None,
         persisted_projection_fn=_no_persisted_projection,
     ),
     "umap_hdbscan": VisualizationSpec(
         key="umap_hdbscan",
-        output_dir=umap_hdbscan_clustering.OUTPUT_DIR,
         assignments_suffix="_trials_umap_hdbscan_clusters.parquet",
-        metrics_suffix="_trials_umap_hdbscan_cluster_metrics.json",
-        scatterplot_suffix="_trials_umap_hdbscan_scatterplot.html",
         extract_seed_fn=lambda m: m.get("winning_seed"),
         persisted_projection_fn=_umap_hdbscan_persisted_projection,
     ),
     "pacmap_hdbscan": VisualizationSpec(
         key="pacmap_hdbscan",
-        output_dir=pacmap_hdbscan_clustering.OUTPUT_DIR,
         assignments_suffix="_trials_pacmap_hdbscan_clusters.parquet",
-        metrics_suffix="_trials_pacmap_hdbscan_cluster_metrics.json",
-        scatterplot_suffix="_trials_pacmap_hdbscan_scatterplot.html",
         extract_seed_fn=lambda m: m.get("winning_seed"),
         persisted_projection_fn=_no_persisted_projection,
     ),
 }
 
 
-def load_metrics(spec: VisualizationSpec, slug: str) -> dict:
-    """Read a method's metrics JSON for a condition.
+def load_metrics(spec: VisualizationSpec, metrics_path: Path) -> dict:
+    """Read a method's metrics JSON.
 
     Args:
         spec: The method's `VisualizationSpec`.
-        slug: The condition's filesystem-safe slug.
+        metrics_path: Path to that method's metrics JSON.
 
     Returns:
         The parsed metrics dict.
 
     Raises:
-        FileNotFoundError: If the metrics file doesn't exist, naming the
-            exact path and which clustering module to run first.
+        FileNotFoundError: If `metrics_path` doesn't exist, naming which
+            clustering module to run first.
     """
-    metrics_path = spec.output_dir / f"{slug}{spec.metrics_suffix}"
     if not metrics_path.exists():
         raise FileNotFoundError(
             f"No {spec.key} metrics found at {metrics_path}; run the {spec.key} clustering step "
-            "for this condition before generating a scatterplot for it"
+            "first and pass its metrics path via --metrics-path"
         )
     with open(metrics_path, encoding="utf-8") as f:
         return json.load(f)
 
 
-def load_assignments(spec: VisualizationSpec, slug: str, assignments_path: Path | None = None) -> pa.Table:
-    """Read a method's cluster assignments Parquet for a condition.
+def load_assignments(spec: VisualizationSpec, assignments_path: Path) -> pa.Table:
+    """Read a method's cluster assignments Parquet.
 
     Args:
         spec: The method's `VisualizationSpec`.
-        slug: The condition's filesystem-safe slug.
-        assignments_path: Explicit Parquet path to read instead of the
-            default `spec.output_dir / f"{slug}{spec.assignments_suffix}"`
-            location — the file whose rows (`nct_id`, `cluster_id`,
-            `criterion_text`) become the plotted points. If omitted, the
-            default per-method/-condition path is used, as before.
+        assignments_path: Path to the Parquet file whose rows (`nct_id`,
+            `cluster_id`, `criterion_text`) become the plotted points.
 
     Returns:
         The cluster assignments table.
 
     Raises:
-        FileNotFoundError: If the resolved assignments file doesn't exist,
-            naming the exact path and which clustering module to run first.
+        FileNotFoundError: If `assignments_path` doesn't exist, naming which
+            clustering module to run first.
     """
-    if assignments_path is None:
-        assignments_path = spec.output_dir / f"{slug}{spec.assignments_suffix}"
     if not assignments_path.exists():
         raise FileNotFoundError(
             f"No {spec.key} cluster assignments found at {assignments_path}; run the {spec.key} "
-            "clustering step for this condition before generating a scatterplot for it"
+            "clustering step first and pass its assignments path via --assignments-path"
         )
     return pq.read_table(assignments_path)
 
@@ -234,41 +205,40 @@ def resolve_seed(spec: VisualizationSpec, metrics: dict) -> tuple[int, bool]:
 
 def resolve_points(
     spec: VisualizationSpec,
-    slug: str,
     metrics: dict,
     n_rows: int,
     seed: int,
-    embeddings_path: Path | None = None,
+    embeddings_path: Path | None,
+    reduced_embeddings_path: Path | None,
 ) -> np.ndarray:
-    """Resolve the 2D points to plot, reusing a persisted UMAP projection when one exists.
+    """Resolve the 2D points to plot, reusing a persisted UMAP projection when one is given.
 
     Args:
         spec: The method's `VisualizationSpec`.
-        slug: The condition's filesystem-safe slug.
-        metrics: That method's parsed metrics dict for this condition.
+        metrics: That method's parsed metrics dict.
         n_rows: Expected row count (the cluster assignments table's row
             count), used to sanity-check row alignment against a freshly
             re-read embeddings file.
         seed: The seed resolved by `resolve_seed` (or a CLI override).
-        embeddings_path: Explicit embeddings Parquet path to read when a
-            fresh projection is needed (every method except `umap_hdbscan`
-            with an already-2D winning config), overriding the default
-            `data/embeddings/{slug}_trials_embeddings.parquet` lookup — use
-            this if the condition's embeddings were originally written to a
-            non-default path (e.g. via that clustering step's own
-            `--input-path` override at embedding/clustering time). Ignored
-            when a persisted projection is reused instead.
+        embeddings_path: Embeddings Parquet path to read when a fresh
+            projection is needed (every method except `umap_hdbscan` reusing
+            an already-2D persisted projection). Required in that case;
+            ignored when a persisted projection is reused instead.
+        reduced_embeddings_path: `umap_hdbscan`'s persisted reduced-embeddings
+            Parquet path, reused as-is if its winning config was already 2D.
+            Ignored for every other method.
 
     Returns:
         An `(n_rows, 2)` array of 2D coordinates, row-aligned with the
         cluster assignments table.
 
     Raises:
-        ValueError: If a fresh projection is needed and the re-read
-            embeddings file's successfully-embedded row count doesn't match
-            `n_rows` (e.g. the embeddings file changed since clustering ran).
+        ValueError: If a fresh projection is needed and `embeddings_path` was
+            not given, or if the re-read embeddings file's
+            successfully-embedded row count doesn't match `n_rows` (e.g. the
+            embeddings file changed since clustering ran).
     """
-    persisted = spec.persisted_projection_fn(metrics, slug)
+    persisted = spec.persisted_projection_fn(metrics, reduced_embeddings_path)
     if persisted is not None:
         path, n_components = persisted
         logger.info(
@@ -280,7 +250,9 @@ def resolve_points(
 
     logger.info("resolve_points: computing a fresh 2D UMAP projection for %s (seed=%d)", spec.key, seed)
     if embeddings_path is None:
-        embeddings_path = clustering_io.EMBEDDINGS_INPUT_DIR / f"{slug}_trials_embeddings.parquet"
+        raise ValueError(
+            f"A fresh 2D UMAP projection is needed for {spec.key}, but no --embeddings-path was given"
+        )
     table = clustering_io.read_embeddings_parquet(embeddings_path)
     filtered = clustering_io.filter_successful_rows(table)
     if filtered.num_rows != n_rows:
@@ -316,12 +288,13 @@ def build_plot_frame(assignments_table: pa.Table, points_2d: np.ndarray) -> dict
     }
 
 
-def render_scatterplot(frame: dict[str, list], condition: str, method: str, seed: int, seed_explicit: bool) -> go.Figure:
+def render_scatterplot(frame: dict[str, list], label: str, method: str, seed: int, seed_explicit: bool) -> go.Figure:
     """Build the interactive Plotly scatterplot.
 
     Args:
         frame: As returned by `build_plot_frame`.
-        condition: Condition string the plot is for.
+        label: Human-readable label for the plot title, derived from the
+            cluster-assignments filename.
         method: The clustering method key being visualized.
         seed: The resolved seed.
         seed_explicit: Whether `seed` was actually recorded by clustering
@@ -332,7 +305,7 @@ def render_scatterplot(frame: dict[str, list], condition: str, method: str, seed
         legend, and a criterion-text hover tooltip.
     """
     seed_note = f"seed={seed}" if seed_explicit else f"seed={seed} (fallback default; not recorded by clustering)"
-    title = f'"{condition}" — {method} clusters (2D UMAP, {seed_note})'
+    title = f'"{label}" — {method} clusters (2D UMAP, {seed_note})'
     fig = px.scatter(
         frame,
         x="x",
@@ -346,54 +319,49 @@ def render_scatterplot(frame: dict[str, list], condition: str, method: str, seed
 
 
 def run(
-    condition: str,
     method: str,
+    metrics_path: Path,
+    assignments_path: Path,
+    output_path: Path,
     seed_override: int | None = None,
-    input_path: Path | None = None,
     embeddings_path: Path | None = None,
-    output_path: Path | None = None,
+    reduced_embeddings_path: Path | None = None,
 ) -> Path:
-    """Render and write a 2D UMAP scatterplot for one condition/method pair.
+    """Render and write a 2D UMAP scatterplot for one method's clustering output.
 
     Args:
-        condition: Condition string, e.g. "breast cancer" — must match the
-            condition already clustered by `method`, unless `input_path` is
-            given (in which case `condition` is only used for the metrics
-            lookup, the plot title, and the default output filename).
         method: Which clustering method's output to visualize — one of
             `VISUALIZATION_SPECS`'s keys.
+        metrics_path: That method's metrics JSON path.
+        assignments_path: That method's cluster-assignments Parquet path —
+            the file whose rows become the plotted points.
+        output_path: Where to write the HTML.
         seed_override: If given, used instead of that method's own
             recorded/fallback seed.
-        input_path: Explicit cluster-assignments Parquet path to visualize,
-            overriding the default `spec.output_dir /
-            f"{slug}{spec.assignments_suffix}"` lookup — the file whose rows
-            become the plotted points. If omitted, the default
-            per-method/-condition path is used, as before.
-        embeddings_path: Explicit embeddings Parquet path to read when a
-            fresh 2D projection is needed (see `resolve_points`), overriding
-            the default `data/embeddings/{slug}_trials_embeddings.parquet`
-            lookup — needed if that condition's embeddings were originally
-            written to a non-default path. Ignored for `umap_hdbscan` runs
-            that reuse a persisted 2D projection instead of fitting a fresh one.
-        output_path: Where to write the HTML. If omitted, defaults to
-            ``spec.output_dir / f"{slug}{spec.scatterplot_suffix}"``.
+        embeddings_path: Embeddings Parquet path to read when a fresh 2D
+            projection is needed (see `resolve_points`) — required unless
+            `reduced_embeddings_path` lets a persisted 2D projection be
+            reused instead.
+        reduced_embeddings_path: `umap_hdbscan`'s persisted
+            reduced-embeddings Parquet path, reused as-is if its winning
+            config was already 2D. Ignored for every other method.
 
     Returns:
         The path the scatterplot was written to.
 
     Raises:
-        ValueError: If `method` isn't a recognized key in `VISUALIZATION_SPECS`.
-        FileNotFoundError: If the condition hasn't been clustered by `method`
-            yet, if `input_path` is given but doesn't exist, or if a fresh
-            projection is needed and the resolved embeddings path doesn't exist.
+        ValueError: If `method` isn't a recognized key in
+            `VISUALIZATION_SPECS`, or if a fresh projection is needed and
+            `embeddings_path` was not given.
+        FileNotFoundError: If `metrics_path` or `assignments_path` doesn't exist.
     """
     if method not in VISUALIZATION_SPECS:
         raise ValueError(f"Unknown method {method!r}; expected one of {sorted(VISUALIZATION_SPECS)}")
     spec = VISUALIZATION_SPECS[method]
-    slug = EligibilityCriteriaFetcher.condition_to_slug(condition)
+    label = label_from_slug(slug_from_filename(assignments_path.name, spec.assignments_suffix))
 
-    metrics = load_metrics(spec, slug)
-    assignments_table = load_assignments(spec, slug, assignments_path=input_path)
+    metrics = load_metrics(spec, metrics_path)
+    assignments_table = load_assignments(spec, assignments_path)
 
     if seed_override is not None:
         seed, seed_explicit = seed_override, True
@@ -401,18 +369,19 @@ def run(
     else:
         seed, seed_explicit = resolve_seed(spec, metrics)
 
-    points_2d = resolve_points(spec, slug, metrics, assignments_table.num_rows, seed, embeddings_path=embeddings_path)
+    points_2d = resolve_points(
+        spec, metrics, assignments_table.num_rows, seed,
+        embeddings_path=embeddings_path, reduced_embeddings_path=reduced_embeddings_path,
+    )
     frame = build_plot_frame(assignments_table, points_2d)
-    fig = render_scatterplot(frame, condition, method, seed, seed_explicit)
+    fig = render_scatterplot(frame, label, method, seed, seed_explicit)
 
-    if output_path is None:
-        output_path = spec.output_dir / f"{slug}{spec.scatterplot_suffix}"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.write_html(output_path)
 
     logger.info(
         "run: wrote %s scatterplot for %r (n_points=%d, seed=%d, seed_explicit=%s) -> %s",
-        method, condition, assignments_table.num_rows, seed, seed_explicit, output_path,
+        method, label, assignments_table.num_rows, seed, seed_explicit, output_path,
     )
     return output_path
 
@@ -421,16 +390,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser for this module.
 
     Returns:
-        An ``argparse.ArgumentParser`` accepting a positional ``condition``
-        argument, a required ``--method`` choice, and optional
-        seed/input/output overrides.
+        An ``argparse.ArgumentParser`` accepting a required ``--method``
+        choice, required metrics/assignments/output path flags, and
+        optional seed/embeddings-path overrides.
     """
     parser = argparse.ArgumentParser(
-        description="Render an interactive 2D UMAP scatterplot of an already-clustered condition."
-    )
-    parser.add_argument(
-        "condition",
-        help='Condition to visualize, e.g. "breast cancer" (must already be clustered by --method)',
+        description="Render an interactive 2D UMAP scatterplot of an already-clustered method's output."
     )
     parser.add_argument(
         "--method",
@@ -439,46 +404,58 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Which clustering method's output to visualize",
     )
     parser.add_argument(
+        "--metrics-path",
+        type=Path,
+        required=True,
+        help="That method's metrics JSON path",
+    )
+    parser.add_argument(
+        "--assignments-path",
+        type=Path,
+        required=True,
+        help="That method's cluster-assignments Parquet path (the file whose rows become the plotted points)",
+    )
+    parser.add_argument(
+        "--output-path",
+        type=Path,
+        required=True,
+        help="Output HTML path",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=None,
         help="Override the 2D UMAP projection's seed (default: reuse that method's own optimal-run seed)",
     )
     parser.add_argument(
-        "--input-path",
-        type=Path,
-        default=None,
-        help="Override the default cluster-assignments Parquet path to visualize (the file whose "
-        "rows become the plotted points), instead of looking it up from --method/condition",
-    )
-    parser.add_argument(
         "--embeddings-path",
         type=Path,
         default=None,
-        help="Override the default embeddings Parquet path read when a fresh 2D projection is "
-        "needed (every method except umap_hdbscan reusing an already-2D persisted projection); "
-        "use this if that condition's embeddings were originally written to a non-default path",
+        help="Embeddings Parquet path to read when a fresh 2D projection is needed (every method "
+        "except umap_hdbscan reusing an already-2D persisted projection via --reduced-embeddings-path)",
     )
     parser.add_argument(
-        "--output-path",
+        "--reduced-embeddings-path",
         type=Path,
         default=None,
-        help="Override the default output HTML path",
+        help="For --method umap_hdbscan only: that run's persisted reduced-embeddings Parquet path, "
+        "reused as-is instead of fitting a fresh projection if its winning config was already 2D",
     )
     return parser
 
 
 def main() -> None:
-    """CLI entry point: render and write a scatterplot for one condition/method pair."""
+    """CLI entry point: render and write a scatterplot for one method's clustering output."""
     logging.basicConfig(level=logging.INFO)
     args = build_arg_parser().parse_args()
     run(
-        args.condition,
         args.method,
+        args.metrics_path,
+        args.assignments_path,
+        args.output_path,
         seed_override=args.seed,
-        input_path=args.input_path,
         embeddings_path=args.embeddings_path,
-        output_path=args.output_path,
+        reduced_embeddings_path=args.reduced_embeddings_path,
     )
 
 

@@ -4,8 +4,8 @@ Both `kmeans_clustering.py` (k-means) and `hdbscan_clustering.py` (HDBSCAN)
 read the same embeddings Parquet input format and write cluster assignments
 plus a metrics JSON in a similar shape. This module holds the logic that is
 genuinely common to both — reading/filtering/validating the input embeddings
-table, resolving default I/O paths from a condition string, and writing
-output artifacts — so neither algorithm-specific module re-implements it.
+table and writing output artifacts — so neither algorithm-specific module
+re-implements it.
 
 Nothing here branches on "which algorithm am I"; algorithm-specific concerns
 (fitting, per-algorithm metrics, per-algorithm output columns) stay in each
@@ -21,9 +21,6 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from src.paths import REPO_ROOT
-from src.preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
-
-EMBEDDINGS_INPUT_DIR = REPO_ROOT / "data" / "embeddings"
 
 
 def read_embeddings_parquet(input_path: Path) -> pa.Table:
@@ -172,40 +169,8 @@ def compute_cluster_sizes(labels: np.ndarray) -> dict[str, int]:
     return dict(sorted(cluster_sizes.items(), key=lambda kv: int(kv[0])))
 
 
-def resolve_default_paths(
-    condition: str,
-    output_dir: Path,
-    assignments_suffix: str,
-    metrics_suffix: str,
-    input_dir: Path = EMBEDDINGS_INPUT_DIR,
-) -> tuple[Path, Path, Path]:
-    """Derive default input/output paths for a clustering run from a condition string.
-
-    Args:
-        condition: Condition string, e.g. "breast cancer" — the same string
-            passed to `criteria_embedding.py`.
-        output_dir: Algorithm-specific output directory (e.g.
-            `data/clustering/kmeans` or `data/clustering/hdbscan`).
-        assignments_suffix: Filename suffix for the cluster-assignments
-            Parquet file (e.g. `"_trials_clusters.parquet"`).
-        metrics_suffix: Filename suffix for the metrics JSON file (e.g.
-            `"_trials_cluster_metrics.json"`).
-        input_dir: Directory the embeddings Parquet lives in. Defaults to
-            `EMBEDDINGS_INPUT_DIR`.
-
-    Returns:
-        A tuple `(input_path, assignments_output_path, metrics_output_path)`.
-    """
-    slug = EligibilityCriteriaFetcher.condition_to_slug(condition)
-    input_path = input_dir / f"{slug}_trials_embeddings.parquet"
-    assignments_output_path = output_dir / f"{slug}{assignments_suffix}"
-    metrics_output_path = output_dir / f"{slug}{metrics_suffix}"
-    return input_path, assignments_output_path, metrics_output_path
-
-
 def build_base_metrics_dict(
-    condition: str,
-    slug: str,
+    label: str,
     input_path: Path,
     assignments_output_path: Path,
     n_samples: int,
@@ -223,8 +188,10 @@ def build_base_metrics_dict(
     `hdbscan_params`/`noise_count`/`noise_fraction` for HDBSCAN).
 
     Args:
-        condition: Condition string passed to `run`.
-        slug: `condition`'s filesystem-safe slug.
+        label: Human-readable label for this run, derived from `input_path`'s
+            filename (see `src.paths.slug_from_filename`/`label_from_slug`),
+            recorded here only for traceability — no longer used to resolve
+            any path.
         input_path: The embeddings Parquet path that was read.
         assignments_output_path: Where cluster assignments were written.
         n_samples: Number of successfully-embedded rows clustered.
@@ -241,8 +208,7 @@ def build_base_metrics_dict(
         A dict with the envelope fields shared by both metrics JSON schemas.
     """
     return {
-        "condition": condition,
-        "condition_slug": slug,
+        "condition": label,
         "input_path": relative_to_repo_root(input_path),
         "assignments_output_path": relative_to_repo_root(assignments_output_path),
         "n_samples": n_samples,

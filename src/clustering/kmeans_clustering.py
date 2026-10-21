@@ -1,15 +1,14 @@
-"""Cluster per-condition eligibility criteria embeddings via k-means, sweeping hyperparameters.
+"""Cluster eligibility criteria embeddings via k-means, sweeping hyperparameters.
 
 Reads an embeddings Parquet file produced by
-`src/embeddings/criteria_embedding.py`
-(``data/embeddings/<condition>_trials_embeddings.parquet``), drops rows whose
-embedding failed (``embedding_success`` is False — there is no vector to
-cluster for those), and fits `sklearn.cluster.KMeans` once per combination in
-the Cartesian product of the supplied `--k-min`/`--k-max`/`--random-state`
-value lists (`--n-init`/`--max-iter` are held fixed across the whole sweep,
-not swept). Passing a single value for each (the default) is simply a sweep
-of size one — every invocation goes through the same combination-evaluation
-and winner-selection path, whether there's one candidate or fifty.
+`src/embeddings/criteria_embedding.py`, drops rows whose embedding failed
+(``embedding_success`` is False — there is no vector to cluster for those),
+and fits `sklearn.cluster.KMeans` once per combination in the Cartesian
+product of the supplied `--k-min`/`--k-max`/`--random-state` value lists
+(`--n-init`/`--max-iter` are held fixed across the whole sweep, not swept).
+Passing a single value for each (the default) is simply a sweep of size one
+— every invocation goes through the same combination-evaluation and
+winner-selection path, whether there's one candidate or fifty.
 
 For each `(k_min, k_max, random_state)` combination, `k` is itself
 auto-selected by sweeping `[k_min, k_max]` with that `random_state` and
@@ -18,19 +17,19 @@ keeping the `k` with the highest silhouette score (exactly as this module's
 is then the one whose chosen `k` has the highest silhouette score of all.
 Passing ``--n-clusters`` instead fixes `k` and skips all `k`-selection
 entirely — only `--random-state` is swept in that case, over the fixed `k`.
-Either way, the run writes two output artifacts:
+Either way, the run writes two output artifacts, at the paths given via
+`--assignments-output-path`/`--metrics-output-path`:
 
-    data/clustering/kmeans/<condition>_trials_clusters.parquet
-        One row per successfully-embedded criterion, carrying its assigned
-        ``cluster_id`` plus enough source columns (``nct_id``,
-        ``criterion_text``, etc.) to join back to the embeddings file.
+    Cluster assignments: one row per successfully-embedded criterion,
+        carrying its assigned ``cluster_id`` plus enough source columns
+        (``nct_id``, ``criterion_text``, etc.) to join back to the
+        embeddings file.
 
-    data/clustering/kmeans/<condition>_trials_cluster_metrics.json
-        Clustering performance metrics (inertia, silhouette score,
-        Davies-Bouldin index, Calinski-Harabasz index) plus run provenance
-        (sample/cluster counts, k-means parameters, the winning combination,
-        and the full sweep audit trail), so clustering quality can be
-        reviewed without re-running the clustering step.
+    Cluster metrics: clustering performance metrics (inertia, silhouette
+        score, Davies-Bouldin index, Calinski-Harabasz index) plus run
+        provenance (sample/cluster counts, k-means parameters, the winning
+        combination, and the full sweep audit trail), so clustering quality
+        can be reviewed without re-running the clustering step.
 
 A combination whose `[k_min, k_max]` range is invalid for the dataset (e.g.
 `k_max < k_min`) is skipped with a logged reason rather than aborting the
@@ -40,8 +39,8 @@ written. The total number of combinations is capped at
 `MAX_SWEEP_COMBINATIONS`; exceeding it raises an error before any fitting is
 attempted.
 
-Re-running this step on the same condition overwrites both existing output
-files wholesale — there is no append/skip-if-exists/merge behavior.
+Re-running this step against the same output paths overwrites both existing
+output files wholesale — there is no append/skip-if-exists/merge behavior.
 
 Read/validate/write logic shared with the HDBSCAN clustering pipeline (see
 `hdbscan_clustering.py`) lives in `clustering_io.py`; this module holds only
@@ -74,12 +73,9 @@ from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score, silho
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from src.paths import REPO_ROOT
-from src.preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
+from src.paths import label_from_slug, slug_from_filename
 from src.clustering import clustering_io
 from src.clustering.hdbscan_clustering import parse_int_list
-
-OUTPUT_DIR = REPO_ROOT / "data" / "clustering" / "kmeans"
 
 logger = logging.getLogger(__name__)
 
@@ -392,8 +388,7 @@ class KMeansClusterer:
 
     def build_metrics_dict(
         self,
-        condition: str,
-        slug: str,
+        label: str,
         input_path: Path,
         assignments_output_path: Path,
         n_samples: int,
@@ -417,8 +412,8 @@ class KMeansClusterer:
         """Assemble the full metrics JSON payload for one clustering run.
 
         Args:
-            condition: Condition string passed to `run_sweep`.
-            slug: `condition`'s filesystem-safe slug.
+            label: Human-readable label for this run, derived from
+                `input_path`'s filename.
             input_path: The embeddings Parquet path that was read.
             assignments_output_path: Where cluster assignments were written.
             n_samples: Number of successfully-embedded rows clustered.
@@ -447,8 +442,7 @@ class KMeansClusterer:
             A JSON-serializable dict matching the documented metrics schema.
         """
         base = clustering_io.build_base_metrics_dict(
-            condition=condition,
-            slug=slug,
+            label=label,
             input_path=input_path,
             assignments_output_path=assignments_output_path,
             n_samples=n_samples,
@@ -697,7 +691,9 @@ def serialize_candidates(candidates: list[KMeansSweepCandidate]) -> list[dict]:
 
 
 def run_sweep(
-    condition: str,
+    input_path: Path,
+    assignments_output_path: Path,
+    metrics_output_path: Path,
     n_clusters: int | None = None,
     k_min_values: list[int] | None = None,
     k_max_values: list[int | None] | None = None,
@@ -705,11 +701,8 @@ def run_sweep(
     n_init: int = KMeansClusterer.DEFAULT_N_INIT,
     max_iter: int = KMeansClusterer.DEFAULT_MAX_ITER,
     metric: str = KMeansClusterer.DEFAULT_METRIC,
-    input_path: Path | None = None,
-    assignments_output_path: Path | None = None,
-    metrics_output_path: Path | None = None,
 ) -> tuple[Path, Path] | None:
-    """Sweep k-means hyperparameters for a condition and write the best result.
+    """Sweep k-means hyperparameters and write the best result.
 
     This is the module's only orchestration entry point — a single value per
     list (the CLI defaults) is simply a sweep of size one; the winner-
@@ -717,8 +710,10 @@ def run_sweep(
     combinations were tried.
 
     Args:
-        condition: Condition string, e.g. "breast cancer" — the same string
-            passed to `criteria_embedding.py`.
+        input_path: Embeddings Parquet to read.
+        assignments_output_path: Where to write the winning combination's
+            cluster assignments.
+        metrics_output_path: Where to write the winning combination's metrics.
         n_clusters: If given, fixes `k` and sweeps only `random_state_values`
             over that fixed `k` — `k_min_values`/`k_max_values` are ignored.
             If `None` (the default), `k` is auto-selected per combination by
@@ -742,14 +737,6 @@ def run_sweep(
             a strictly monotonic function of their cosine distance, so this
             gives identical cluster assignments to a true cosine-distance
             k-means, not an approximation.
-        input_path: Embeddings Parquet to read. If omitted, defaults to
-            the embeddings directory's `{slug}_trials_embeddings.parquet`.
-        assignments_output_path: Where to write the winning combination's
-            cluster assignments. If omitted, defaults to
-            ``OUTPUT_DIR / f"{slug}_trials_clusters.parquet"``.
-        metrics_output_path: Where to write the winning combination's
-            metrics. If omitted, defaults to
-            ``OUTPUT_DIR / f"{slug}_trials_cluster_metrics.json"``.
 
     Returns:
         `(assignments_output_path, metrics_output_path)` for the winning
@@ -757,7 +744,7 @@ def run_sweep(
         (in which case nothing is written).
 
     Raises:
-        FileNotFoundError: If the resolved input Parquet does not exist.
+        FileNotFoundError: If the input Parquet does not exist.
         ValueError: If there are no successfully-embedded rows to cluster,
             if embedding dimensionality is inconsistent, if `metric` isn't
             one of `KMeansClusterer.VALID_METRICS`, or if the requested
@@ -772,16 +759,7 @@ def run_sweep(
     if metric not in KMeansClusterer.VALID_METRICS:
         raise ValueError(f"Unknown metric {metric!r}; expected one of {KMeansClusterer.VALID_METRICS}")
 
-    slug = EligibilityCriteriaFetcher.condition_to_slug(condition)
-    default_input_path, default_assignments_path, default_metrics_path = clustering_io.resolve_default_paths(
-        condition, OUTPUT_DIR, "_trials_clusters.parquet", "_trials_cluster_metrics.json"
-    )
-    if input_path is None:
-        input_path = default_input_path
-    if assignments_output_path is None:
-        assignments_output_path = default_assignments_path
-    if metrics_output_path is None:
-        metrics_output_path = default_metrics_path
+    label = label_from_slug(slug_from_filename(input_path.name, "_trials_embeddings.parquet"))
 
     table = clustering_io.read_embeddings_parquet(input_path)
     total_rows = table.num_rows
@@ -813,7 +791,7 @@ def run_sweep(
             )
         logger.info(
             "run_sweep: evaluating %d random_state value(s) for fixed n_clusters=%d, %r (n_samples=%d)",
-            len(random_state_values), n_clusters, condition, n_samples,
+            len(random_state_values), n_clusters, label, n_samples,
         )
         candidates = [
             evaluate_fixed_k_combination(n_clusters, random_state, n_init, max_iter, metric, embedding_matrix, n_samples)
@@ -829,7 +807,7 @@ def run_sweep(
         combos = generate_k_range_combinations(resolved_k_min_values, resolved_k_max_values, random_state_values)
         logger.info(
             "run_sweep: evaluating %d (k_min, k_max, random_state) combination(s) for %r (n_samples=%d)",
-            len(combos), condition, n_samples,
+            len(combos), label, n_samples,
         )
         candidates = [
             evaluate_k_range_combination(combo, n_init, max_iter, metric, embedding_matrix, n_samples) for combo in combos
@@ -842,7 +820,7 @@ def run_sweep(
     if best is None:
         logger.warning(
             "run_sweep: no combination produced a usable silhouette score for %r; writing nothing",
-            condition,
+            label,
         )
         return None
 
@@ -857,8 +835,7 @@ def run_sweep(
     embedding_model = filtered.column("embedding_model")[0].as_py()
 
     metrics_dict = winning_clusterer.build_metrics_dict(
-        condition=condition,
-        slug=slug,
+        label=label,
         input_path=input_path,
         assignments_output_path=assignments_output_path,
         n_samples=n_samples,
@@ -893,7 +870,7 @@ def run_sweep(
         best.metrics_result["n_clusters_actual"],
         selection_summary,
         best.random_state,
-        condition,
+        label,
         assignments_output_path,
         metrics_output_path,
         embedding_dim,
@@ -908,17 +885,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser for this module.
 
     Returns:
-        An ``argparse.ArgumentParser`` accepting a positional ``condition``
-        argument plus comma-separated value lists for the swept
-        hyperparameters, fixed-value flags for the un-swept ones, and
-        path-override options.
+        An ``argparse.ArgumentParser`` accepting comma-separated value lists
+        for the swept hyperparameters, fixed-value flags for the un-swept
+        ones, and required input/output path flags.
     """
     parser = argparse.ArgumentParser(
-        description="Cluster a condition's criterion embeddings via k-means, sweeping hyperparameters."
-    )
-    parser.add_argument(
-        "condition",
-        help='Condition to cluster, e.g. "breast cancer" (same string passed to criteria_embedding.py)',
+        description="Cluster criterion embeddings via k-means, sweeping hyperparameters."
     )
     parser.add_argument(
         "--n-clusters",
@@ -977,32 +949,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--input-path",
         type=Path,
-        default=None,
-        help="Override the default input embeddings Parquet path",
+        required=True,
+        help="Input embeddings Parquet path (as written by criteria_embedding.py)",
     )
     parser.add_argument(
         "--assignments-output-path",
         type=Path,
-        default=None,
-        help="Override the default output cluster-assignments Parquet path",
+        required=True,
+        help="Output cluster-assignments Parquet path",
     )
     parser.add_argument(
         "--metrics-output-path",
         type=Path,
-        default=None,
-        help="Override the default output metrics JSON path",
+        required=True,
+        help="Output metrics JSON path",
     )
     return parser
 
 
 def main() -> None:
-    """CLI entry point: sweep, cluster, and write cluster assignments/metrics for one condition."""
+    """CLI entry point: sweep, cluster, and write cluster assignments/metrics."""
     logging.basicConfig(level=logging.INFO)
 
     args = build_arg_parser().parse_args()
 
     run_sweep(
-        args.condition,
+        args.input_path,
+        args.assignments_output_path,
+        args.metrics_output_path,
         n_clusters=args.n_clusters,
         k_min_values=args.k_min,
         k_max_values=args.k_max,
@@ -1010,9 +984,6 @@ def main() -> None:
         n_init=args.n_init,
         max_iter=args.max_iter,
         metric=args.metric,
-        input_path=args.input_path,
-        assignments_output_path=args.assignments_output_path,
-        metrics_output_path=args.metrics_output_path,
     )
 
 

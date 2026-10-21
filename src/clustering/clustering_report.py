@@ -1,11 +1,12 @@
-"""Generate a consolidated clustering performance report for a condition.
+"""Generate a consolidated clustering performance report across algorithms.
 
 Reads the existing per-algorithm clustering metrics JSON artifacts already
 written by `kmeans_clustering.py`, `hdbscan_clustering.py`,
-`umap_hdbscan_clustering.py`, and `pacmap_hdbscan_clustering.py` for a given
-condition and renders one consolidated, human-readable Markdown report
-comparing their clustering performance side by side. This module never
-re-runs clustering — it only reads artifacts that already exist on disk.
+`umap_hdbscan_clustering.py`, and `pacmap_hdbscan_clustering.py` (whichever
+of their metrics paths the caller passes in) and renders one consolidated,
+human-readable Markdown report comparing their clustering performance side
+by side. This module never re-runs clustering — it only reads artifacts
+that already exist on disk.
 
 Each algorithm's presence in the report is driven entirely by one
 `AlgorithmSpec` registry entry (see `ALGORITHM_SPECS` below); adding support
@@ -13,17 +14,13 @@ for a future additional clustering algorithm means adding one entry to that
 list plus one small extractor function — no other function in this module
 branches on which algorithm it's looking at.
 
-A missing or unparseable metrics file for one algorithm never aborts the
-whole report: it's reflected as a clearly labeled per-algorithm status
-(`"missing"` or `"malformed"`) so the report still renders for whichever
-algorithm(s) are available.
+An algorithm whose metrics path wasn't given, or whose metrics file is
+missing/unparseable, never aborts the whole report: it's reflected as a
+clearly labeled per-algorithm status (`"missing"` or `"malformed"`) so the
+report still renders for whichever algorithm(s) are available.
 
-The report is written to:
-
-    data/clustering/reports/<condition_slug>_clustering_report_<timestamp>.md
-
-Each run writes a new timestamped file; prior reports for the same condition
-are never overwritten or appended to.
+The report is written to the path given via `--output-path`. Each run
+overwrites that path wholesale.
 """
 
 import argparse
@@ -44,11 +41,7 @@ from typing import Callable, Literal
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from src.paths import REPO_ROOT
-from src.preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
-from src.clustering import hdbscan_clustering, kmeans_clustering, pacmap_hdbscan_clustering, umap_hdbscan_clustering
-
-DEFAULT_REPORT_OUTPUT_DIR = REPO_ROOT / "data" / "clustering" / "reports"
+from src.paths import label_from_slug, slug_from_filename
 
 logger = logging.getLogger(__name__)
 
@@ -73,13 +66,13 @@ class AlgorithmSpec:
     """Registry entry describing one clustering algorithm's report inputs.
 
     Attributes:
-        key: Short identifier used to key per-algorithm results (e.g. "kmeans").
+        key: Short identifier used to key per-algorithm results (e.g.
+            "kmeans"); also used to derive this algorithm's CLI flag
+            (`--{key.replace("_", "-")}-metrics-path`).
         display_name: Human-readable name shown in the report (e.g. "K-Means").
-        output_dir: The algorithm's own output directory (imported directly
-            from that algorithm's module, never duplicated, so this report
-            can't drift from where the algorithm actually writes).
-        metrics_suffix: Filename suffix appended to the condition's slug to
-            find that algorithm's metrics JSON (e.g. "_trials_cluster_metrics.json").
+        metrics_suffix: This algorithm's metrics JSON filename suffix (e.g.
+            "_trials_cluster_metrics.json") — used only to recover a
+            human-readable label from whichever metrics path the caller gives.
         extra_fields_fn: Extracts this algorithm's non-shared metric fields
             from its parsed metrics dict as a list of (label, formatted value)
             pairs for display in that algorithm's own report subsection.
@@ -87,7 +80,6 @@ class AlgorithmSpec:
 
     key: str
     display_name: str
-    output_dir: Path
     metrics_suffix: str
     extra_fields_fn: Callable[[dict], list[tuple[str, str]]]
 
@@ -237,44 +229,61 @@ ALGORITHM_SPECS: list[AlgorithmSpec] = [
     AlgorithmSpec(
         key="kmeans",
         display_name="K-Means",
-        output_dir=kmeans_clustering.OUTPUT_DIR,
         metrics_suffix="_trials_cluster_metrics.json",
         extra_fields_fn=kmeans_extra_fields,
     ),
     AlgorithmSpec(
         key="hdbscan",
         display_name="HDBSCAN",
-        output_dir=hdbscan_clustering.OUTPUT_DIR,
         metrics_suffix="_trials_hdbscan_cluster_metrics.json",
         extra_fields_fn=hdbscan_extra_fields,
     ),
     AlgorithmSpec(
         key="umap_hdbscan",
         display_name="UMAP + HDBSCAN",
-        output_dir=umap_hdbscan_clustering.OUTPUT_DIR,
         metrics_suffix="_trials_umap_hdbscan_cluster_metrics.json",
         extra_fields_fn=umap_hdbscan_extra_fields,
     ),
     AlgorithmSpec(
         key="pacmap_hdbscan",
         display_name="PaCMAP + HDBSCAN",
-        output_dir=pacmap_hdbscan_clustering.OUTPUT_DIR,
         metrics_suffix="_trials_pacmap_hdbscan_cluster_metrics.json",
         extra_fields_fn=pacmap_hdbscan_extra_fields,
     ),
 ]
 
 
-def resolve_metrics_path(spec: AlgorithmSpec, slug: str) -> Path:
-    """Derive the expected metrics JSON path for `spec` and a condition slug."""
-    return spec.output_dir / f"{slug}{spec.metrics_suffix}"
+def metrics_path_flag(spec: AlgorithmSpec) -> str:
+    """Derive this algorithm's CLI flag name, e.g. "--umap-hdbscan-metrics-path"."""
+    return f"--{spec.key.replace('_', '-')}-metrics-path"
+
+
+def resolve_report_label(metrics_paths: dict[str, Path | None]) -> str:
+    """Derive a human-readable label for the report title/header.
+
+    Uses the first algorithm (in `ALGORITHM_SPECS` order) whose metrics path
+    was given, stripping that algorithm's `metrics_suffix` from the
+    filename to recover the original slug.
+
+    Args:
+        metrics_paths: Maps each `AlgorithmSpec.key` to the metrics path
+            given for it, or `None` if omitted.
+
+    Returns:
+        The recovered label, or `"unknown"` if no metrics path was given at all.
+    """
+    for spec in ALGORITHM_SPECS:
+        path = metrics_paths.get(spec.key)
+        if path is not None:
+            return label_from_slug(slug_from_filename(path.name, spec.metrics_suffix))
+    return "unknown"
 
 
 def load_metrics(metrics_path: Path) -> LoadResult:
     """Load and sanity-check one algorithm's metrics JSON.
 
     Args:
-        metrics_path: Path resolved by `resolve_metrics_path`.
+        metrics_path: Path to this algorithm's metrics JSON, as given by the caller.
 
     Returns:
         A `LoadResult` with `status="missing"` if `metrics_path` doesn't
@@ -305,23 +314,27 @@ def load_metrics(metrics_path: Path) -> LoadResult:
     return LoadResult(status="ok", data=data)
 
 
-def load_all(condition: str, slug: str) -> dict[str, LoadResult]:
-    """Load every registered algorithm's metrics for a condition.
+def load_all(metrics_paths: dict[str, Path | None]) -> dict[str, LoadResult]:
+    """Load every registered algorithm's metrics.
 
     Args:
-        condition: Condition string the report is being generated for.
-        slug: `condition`'s filesystem-safe slug.
+        metrics_paths: Maps each `AlgorithmSpec.key` to the metrics path
+            given for it on the CLI, or `None` if that algorithm's flag was
+            omitted (treated as `"missing"` without attempting a read).
 
     Returns:
         A dict mapping each `AlgorithmSpec.key` to its `LoadResult`.
     """
     results: dict[str, LoadResult] = {}
     for spec in ALGORITHM_SPECS:
-        metrics_path = resolve_metrics_path(spec, slug)
-        result = load_metrics(metrics_path)
+        metrics_path = metrics_paths.get(spec.key)
+        if metrics_path is None:
+            result = LoadResult(status="missing", detail=f"No {metrics_path_flag(spec)} given")
+        else:
+            result = load_metrics(metrics_path)
         logger.info(
-            "load_all: %s metrics for %r -> status=%s (%s)",
-            spec.display_name, condition, result.status, metrics_path,
+            "load_all: %s metrics -> status=%s (%s)",
+            spec.display_name, result.status, metrics_path,
         )
         results[spec.key] = result
     return results
@@ -411,7 +424,7 @@ def render_shared_metrics_table(loaded: dict[str, LoadResult]) -> str:
     ok_specs = [spec for spec in ALGORITHM_SPECS if loaded[spec.key].status == "ok"]
     lines = ["## Shared Metrics Comparison", ""]
     if not ok_specs:
-        lines.append("No algorithm has produced metrics yet for this condition.")
+        lines.append("No algorithm has produced metrics yet.")
         return "\n".join(lines)
 
     header = ["Metric", "Direction"] + [spec.display_name for spec in ok_specs]
@@ -441,7 +454,7 @@ def render_algorithm_section(spec: AlgorithmSpec, result: LoadResult) -> str:
     """
     lines = [f"### {spec.display_name}", ""]
     if result.status == "missing":
-        lines.append(f"Not yet run for this condition ({result.detail}).")
+        lines.append(f"Not yet run ({result.detail}).")
         return "\n".join(lines)
     if result.status == "malformed":
         lines.append(f"Metrics file could not be read: {result.detail}")
@@ -461,12 +474,12 @@ def render_algorithm_section(spec: AlgorithmSpec, result: LoadResult) -> str:
     return "\n".join(lines)
 
 
-def render_markdown(condition: str, slug: str, loaded: dict[str, LoadResult], generated_at: datetime) -> str:
+def render_markdown(label: str, loaded: dict[str, LoadResult], generated_at: datetime) -> str:
     """Assemble the full Markdown report.
 
     Args:
-        condition: Condition string the report is being generated for.
-        slug: `condition`'s filesystem-safe slug.
+        label: Human-readable label for the report title, as returned by
+            `resolve_report_label`.
         loaded: Per-algorithm `LoadResult`s, as returned by `load_all`.
         generated_at: Wall-clock time this report was generated.
 
@@ -477,9 +490,8 @@ def render_markdown(condition: str, slug: str, loaded: dict[str, LoadResult], ge
     algorithm_names = ", ".join(spec.display_name for spec in ALGORITHM_SPECS)
 
     sections = [
-        f"# Clustering Performance Report: {condition}",
+        f"# Clustering Performance Report: {label}",
         "",
-        f"- **Condition slug:** `{slug}`",
         f"- **Generated at:** {generated_at.isoformat()}",
         f"- **Algorithms considered:** {algorithm_names}",
         "",
@@ -495,18 +507,17 @@ def render_markdown(condition: str, slug: str, loaded: dict[str, LoadResult], ge
 
 
 def generate_report(
-    condition: str,
-    output_dir: Path = DEFAULT_REPORT_OUTPUT_DIR,
+    output_path: Path,
+    metrics_paths: dict[str, Path | None],
     print_to_console: bool = False,
     generated_at: datetime | None = None,
 ) -> Path:
-    """Generate and write a clustering performance report for `condition`.
+    """Generate and write a clustering performance report.
 
     Args:
-        condition: Condition string, e.g. "breast cancer" — the same string
-            passed to `kmeans_clustering.py`/`hdbscan_clustering.py`.
-        output_dir: Directory the report is written under. Defaults to
-            `data/clustering/reports`.
+        output_path: Where to write the rendered Markdown report.
+        metrics_paths: Maps each `AlgorithmSpec.key` to the metrics path
+            given for it, or `None` if omitted (see `load_all`).
         print_to_console: If True, also print the rendered Markdown to stdout.
         generated_at: Wall-clock time to record as this report's generation
             time. Defaults to `datetime.now(timezone.utc)`.
@@ -517,19 +528,17 @@ def generate_report(
     if generated_at is None:
         generated_at = datetime.now(timezone.utc)
 
-    slug = EligibilityCriteriaFetcher.condition_to_slug(condition)
-    loaded = load_all(condition, slug)
-    markdown = render_markdown(condition, slug, loaded, generated_at)
+    label = resolve_report_label(metrics_paths)
+    loaded = load_all(metrics_paths)
+    markdown = render_markdown(label, loaded, generated_at)
 
-    timestamp = generated_at.strftime("%Y%m%dT%H%M%SZ")
-    output_path = output_dir / f"{slug}_clustering_report_{timestamp}.md"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(markdown, encoding="utf-8")
 
     n_available = sum(1 for result in loaded.values() if result.status == "ok")
     logger.info(
         "generate_report: wrote report for %r (%d of %d algorithm(s) available) -> %s",
-        condition, n_available, len(ALGORITHM_SPECS), output_path,
+        label, n_available, len(ALGORITHM_SPECS), output_path,
     )
 
     if print_to_console:
@@ -542,22 +551,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser for this module.
 
     Returns:
-        An ``argparse.ArgumentParser`` accepting a positional ``condition``
-        argument plus output-location and console-printing options.
+        An ``argparse.ArgumentParser`` accepting a required ``--output-path``
+        flag, one optional ``--<algorithm>-metrics-path`` flag per registered
+        algorithm (see `ALGORITHM_SPECS`), and a console-printing option.
     """
     parser = argparse.ArgumentParser(
-        description="Generate a consolidated clustering performance report for a condition."
+        description="Generate a consolidated clustering performance report across algorithms."
     )
     parser.add_argument(
-        "condition",
-        help='Condition to report on, e.g. "breast cancer" (same string passed to kmeans_clustering.py / hdbscan_clustering.py)',
-    )
-    parser.add_argument(
-        "--output-dir",
+        "--output-path",
         type=Path,
-        default=DEFAULT_REPORT_OUTPUT_DIR,
-        help="Override the default report output directory (data/clustering/reports)",
+        required=True,
+        help="Output Markdown report path",
     )
+    for spec in ALGORITHM_SPECS:
+        parser.add_argument(
+            metrics_path_flag(spec),
+            dest=f"{spec.key}_metrics_path",
+            type=Path,
+            default=None,
+            help=f"{spec.display_name} metrics JSON path (omit if this algorithm hasn't been run)",
+        )
     parser.add_argument(
         "--print",
         dest="print_to_console",
@@ -570,9 +584,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     args = build_arg_parser().parse_args()
+    metrics_paths = {spec.key: getattr(args, f"{spec.key}_metrics_path") for spec in ALGORITHM_SPECS}
     generate_report(
-        args.condition,
-        output_dir=args.output_dir,
+        args.output_path,
+        metrics_paths,
         print_to_console=args.print_to_console,
     )
 

@@ -12,16 +12,13 @@ Orchestrates the fetch-parse-write pipeline for one condition by composing:
   inclusion/exclusion criteria.
 
 `EligibilityCriteriaFetcher` is the single public entry point other pipeline
-modules depend on (in particular its `condition_to_slug` staticmethod, used
-throughout `src/embeddings/` and `src/clustering/` to derive default
-input/output paths).
+modules depend on.
 """
 
 import argparse
 import csv
 import logging
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -40,8 +37,6 @@ from src.paths import REPO_ROOT
 from src.preprocessing.clinicaltrials_client import ClinicalTrialsGovClient
 from src.preprocessing.criteria_parser import parse_eligibility_criteria
 from src.preprocessing.ctrp_client import CTRPClient
-
-OUTPUT_DIR = REPO_ROOT / "data" / "eligibility_criteria"
 
 logger = logging.getLogger(__name__)
 
@@ -188,37 +183,16 @@ class EligibilityCriteriaFetcher:
             writer.writeheader()
             writer.writerows(records)
 
-    @staticmethod
-    def condition_to_slug(condition: str) -> str:
-        """Convert a free-text condition into a filesystem-safe slug.
-
-        Args:
-            condition: Condition string as passed to
-                `ClinicalTrialsGovClient.fetch_matching_trials`, e.g.
-                "breast cancer".
-
-        Returns:
-            A lowercase slug with runs of non-alphanumeric characters
-            collapsed to a single underscore and leading/trailing underscores
-            stripped, e.g. "breast_cancer".
-        """
-        return re.sub(r"[^a-z0-9]+", "_", condition.strip().lower()).strip("_")
-
-    def run(self, condition: str, output_path: Path | None = None) -> Path:
+    def run(self, condition: str, output_path: Path) -> Path:
         """Run the full fetch-parse-write pipeline for one condition.
 
         Args:
             condition: Condition to search for, e.g. "breast cancer".
-            output_path: Where to write the resulting CSV. If omitted,
-                defaults to
-                ``OUTPUT_DIR / f"{condition_to_slug(condition)}_trials_eligibility.csv"``.
+            output_path: Where to write the resulting CSV.
 
         Returns:
             The path the CSV was written to.
         """
-        if output_path is None:
-            output_path = OUTPUT_DIR / f"{self.condition_to_slug(condition)}_trials_eligibility.csv"
-
         _, records = self.fetch_trials_with_eligibility(condition)
         self.write_eligibility_csv(records, output_path)
 
@@ -230,8 +204,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser for this module.
 
     Returns:
-        An ``argparse.ArgumentParser`` accepting a single positional
-        ``condition`` argument.
+        An ``argparse.ArgumentParser`` accepting a positional ``condition``
+        argument and a required ``--output-path`` flag.
     """
     parser = argparse.ArgumentParser(
         description="Fetch NCI-affiliated clinical trials and their eligibility criteria."
@@ -239,6 +213,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "condition",
         help='Condition to search for, e.g. "breast cancer" (passed as ClinicalTrials.gov query.cond)',
+    )
+    parser.add_argument(
+        "--output-path",
+        type=Path,
+        required=True,
+        help="Output CSV path to write the fetched eligibility criteria to",
     )
     return parser
 
@@ -255,7 +235,7 @@ def main() -> None:
             "CTRP_API_KEY is not set. Add it to a local .env file before running this script."
         )
 
-    fetcher.run(args.condition)
+    fetcher.run(args.condition, args.output_path)
 
 
 if __name__ == "__main__":

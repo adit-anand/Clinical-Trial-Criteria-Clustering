@@ -1,12 +1,10 @@
-"""Embed per-condition eligibility criteria CSVs into per-condition Parquet files.
+"""Embed a criteria CSV into a Parquet file of per-criterion vectors.
 
 Reads a criteria CSV produced by `src/preprocessing/criteria_retrieval.py`
-(``data/eligibility_criteria/<condition>_trials_eligibility.csv``, with
-columns ``nct_id``, ``study_first_posted_date``, ``criterion_text``,
+(with columns ``nct_id``, ``study_first_posted_date``, ``criterion_text``,
 ``criterion_type``), embeds each row's ``criterion_text`` via a configurable
 `EmbeddingModel` backend (see `EmbeddingModel.py`), and writes the result as
-one row per input row to
-``data/embeddings/<condition>_trials_embeddings.parquet``.
+one row per input row to the given output Parquet path.
 
 Output schema (one row per input criterion row, including failed ones, so a
 downstream clustering step can load the file directly without guesswork):
@@ -22,7 +20,7 @@ downstream clustering step can load the file directly without guesswork):
     embedding_model         string (e.g. "gpt-oss-20b")
     embedded_at             timestamp("us", tz="UTC")
 
-Re-running this step on the same condition overwrites the existing output
+Re-running this step against the same output path overwrites the existing
 file wholesale — there is no append/skip-if-exists/merge behavior.
 """
 
@@ -45,12 +43,7 @@ import pyarrow.parquet as pq
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from src.paths import REPO_ROOT
-from src.preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
 from src.embeddings.embedding_model import EmbeddingModel, build_embedding_model
-
-INPUT_DIR = REPO_ROOT / "data" / "eligibility_criteria"
-OUTPUT_DIR = REPO_ROOT / "data" / "embeddings"
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +64,7 @@ PARQUET_SCHEMA = pa.schema(
 
 
 class CriteriaEmbedder:
-    """Orchestrates the read -> embed -> write pipeline for one condition's criteria.
+    """Orchestrates the read -> embed -> write pipeline for one criteria CSV.
 
     Holds a constructed `EmbeddingModel` instance across calls the same way
     `EligibilityCriteriaFetcher` holds its HTTP session, so backend setup
@@ -80,7 +73,7 @@ class CriteriaEmbedder:
 
     Typical usage:
         embedder = CriteriaEmbedder(build_embedding_model("huggingface"))
-        output_path = embedder.run("breast cancer")
+        output_path = embedder.run(input_path, output_path)
     """
 
     def __init__(self, embedding_model: EmbeddingModel, batch_size: int = 32):
@@ -198,24 +191,12 @@ class CriteriaEmbedder:
         table = pa.Table.from_pydict(columns, schema=PARQUET_SCHEMA)
         pq.write_table(table, output_path)
 
-    def run(
-        self,
-        condition: str,
-        input_path: Path | None = None,
-        output_path: Path | None = None,
-    ) -> Path:
-        """Run the full read-embed-write pipeline for one condition.
+    def run(self, input_path: Path, output_path: Path) -> Path:
+        """Run the full read-embed-write pipeline for one criteria CSV.
 
         Args:
-            condition: Condition string, e.g. "breast cancer" — the same
-                string passed to `EligibilityCriteriaFetcher.run`. Used to
-                derive default input/output paths via
-                `EligibilityCriteriaFetcher.condition_to_slug`.
-            input_path: Criteria CSV to read. If omitted, defaults to
-                ``INPUT_DIR / f"{slug}_trials_eligibility.csv"``.
-            output_path: Where to write the resulting Parquet file. If
-                omitted, defaults to
-                ``OUTPUT_DIR / f"{slug}_trials_embeddings.parquet"``.
+            input_path: Criteria CSV to read.
+            output_path: Where to write the resulting Parquet file.
 
         Returns:
             The path the Parquet file was written to.
@@ -224,12 +205,6 @@ class CriteriaEmbedder:
             FileNotFoundError: If the resolved input CSV does not exist.
             ValueError: If the input CSV has no data rows.
         """
-        slug = EligibilityCriteriaFetcher.condition_to_slug(condition)
-        if input_path is None:
-            input_path = INPUT_DIR / f"{slug}_trials_eligibility.csv"
-        if output_path is None:
-            output_path = OUTPUT_DIR / f"{slug}_trials_embeddings.parquet"
-
         records = self.read_criteria_csv(input_path)
         if not records:
             raise ValueError(f"No criterion rows found in {input_path}; refusing to write an empty output")
@@ -257,15 +232,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser for this module.
 
     Returns:
-        An ``argparse.ArgumentParser`` accepting a positional ``condition``
-        argument and backend/model/path/batch-size options.
+        An ``argparse.ArgumentParser`` accepting required input/output path
+        flags plus backend/model/batch-size options.
     """
     parser = argparse.ArgumentParser(
-        description="Embed a condition's eligibility criteria CSV into a Parquet vector file."
-    )
-    parser.add_argument(
-        "condition",
-        help='Condition to embed, e.g. "breast cancer" (same string passed to criteria_retrieval.py)',
+        description="Embed an eligibility criteria CSV into a Parquet vector file."
     )
     parser.add_argument(
         "--backend",
@@ -281,14 +252,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--input-path",
         type=Path,
-        default=None,
-        help="Override the default input CSV path",
+        required=True,
+        help="Input criteria CSV path (as written by criteria_retrieval.py)",
     )
     parser.add_argument(
         "--output-path",
         type=Path,
-        default=None,
-        help="Override the default output Parquet path",
+        required=True,
+        help="Output Parquet path to write embeddings to",
     )
     parser.add_argument(
         "--batch-size",
@@ -300,14 +271,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    """CLI entry point: embed and write eligibility criteria for one condition."""
+    """CLI entry point: embed and write eligibility criteria."""
     logging.basicConfig(level=logging.INFO)
 
     args = build_arg_parser().parse_args()
 
     embedding_model = build_embedding_model(args.backend, args.model)
     embedder = CriteriaEmbedder(embedding_model, batch_size=args.batch_size)
-    embedder.run(args.condition, input_path=args.input_path, output_path=args.output_path)
+    embedder.run(args.input_path, args.output_path)
 
 
 if __name__ == "__main__":

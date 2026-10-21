@@ -1,8 +1,7 @@
-"""Reduce per-condition criterion embeddings with UMAP, then cluster via HDBSCAN.
+"""Reduce criterion embeddings with UMAP, then cluster via HDBSCAN.
 
-Reads the same embeddings Parquet file `hdbscan_clustering.py` reads
-(``data/embeddings/<condition>_trials_embeddings.parquet``), drops rows whose
-embedding failed, then sweeps a grid of UMAP hyperparameter combinations
+Reads the same embeddings Parquet file format `hdbscan_clustering.py` reads,
+drops rows whose embedding failed, then sweeps a grid of UMAP hyperparameter combinations
 (``n_components``/``n_neighbors``/``min_dist``). For each combination, every
 seed in a user-supplied seed list is fit ``repeats_per_seed`` times (default
 10) so the most *reproducible* seed — the one whose repeats agree most with
@@ -13,25 +12,27 @@ against this step's own reduced-embeddings output). The config/seed/repeat sweep
 mechanics — reducer-agnostic — live in ``reduction_sweep.py``; this module
 only supplies UMAP's own fit/validate functions and this step's I/O.
 
-The run writes three output artifacts:
+The run writes three output artifacts, at the paths given via
+`--reduced-embeddings-output-path`/`--assignments-output-path`/
+`--metrics-output-path`:
 
-    data/clustering/umap_hdbscan/<condition>_trials_umap_reduced_embeddings.parquet
-        One row per successfully-embedded criterion, carrying its
-        UMAP-reduced vector, independently joinable back to the source
-        criteria via ``nct_id`` without needing the cluster assignments.
+    Reduced embeddings: one row per successfully-embedded criterion,
+        carrying its UMAP-reduced vector, independently joinable back to the
+        source criteria via ``nct_id`` without needing the cluster assignments.
 
-    data/clustering/umap_hdbscan/<condition>_trials_umap_hdbscan_clusters.parquet
-        One row per successfully-embedded criterion, carrying its assigned
-        ``cluster_id`` (``-1`` for noise) and ``cluster_probability`` — same
-        schema `hdbscan_clustering.py` itself writes.
+    Cluster assignments: one row per successfully-embedded criterion,
+        carrying its assigned ``cluster_id`` (``-1`` for noise) and
+        ``cluster_probability`` — same schema `hdbscan_clustering.py` itself
+        writes.
 
-    data/clustering/umap_hdbscan/<condition>_trials_umap_hdbscan_cluster_metrics.json
-        Clustering performance metrics for the winning configuration, plus
-        the winning UMAP config/seed and the full config/seed/repeat sweep
-        audit trail, so the choice is traceable rather than a black box.
+    Cluster metrics: clustering performance metrics for the winning
+        configuration, plus the winning UMAP config/seed and the full
+        config/seed/repeat sweep audit trail, so the choice is traceable
+        rather than a black box.
 
-Re-running this step on the same condition overwrites all three existing
-output files wholesale; there is no append/skip-if-exists/merge behavior.
+Re-running this step against the same output paths overwrites all three
+existing output files wholesale; there is no append/skip-if-exists/merge
+behavior.
 """
 
 import argparse
@@ -54,8 +55,7 @@ import umap
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from src.paths import REPO_ROOT
-from src.preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
+from src.paths import label_from_slug, slug_from_filename
 from src.clustering import clustering_io
 from src.clustering import reduction_sweep
 from src.clustering.hdbscan_clustering import (
@@ -64,8 +64,6 @@ from src.clustering.hdbscan_clustering import (
     parse_float_list,
     parse_int_list,
 )
-
-OUTPUT_DIR = REPO_ROOT / "data" / "clustering" / "umap_hdbscan"
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +140,7 @@ def validate_umap_hyperparameters(hyperparams: dict, n_samples: int) -> None:
     if n_neighbors >= n_samples:
         raise ValueError(
             f"n_neighbors={n_neighbors} must be less than the number of available embeddings "
-            f"({n_samples}); reduce --umap-n-neighbors or provide more data"
+            f"({n_samples}); reduce --n-neighbors or provide more data"
         )
 
 
@@ -198,8 +196,7 @@ def build_reduced_embedding_rows(table: pa.Table, reduced_matrix: np.ndarray, re
 
 
 def build_metrics_dict(
-    condition: str,
-    slug: str,
+    label: str,
     input_path: Path,
     reduced_embeddings_output_path: Path,
     assignments_output_path: Path,
@@ -219,8 +216,7 @@ def build_metrics_dict(
     """Assemble the full metrics JSON payload for one UMAP+HDBSCAN run.
 
     Args:
-        condition: Condition string passed to `run`.
-        slug: `condition`'s filesystem-safe slug.
+        label: Human-readable label for this run, derived from `input_path`'s filename.
         input_path: The embeddings Parquet path that was read.
         reduced_embeddings_output_path: Where the reduced embeddings were written.
         assignments_output_path: Where cluster assignments were written.
@@ -244,8 +240,7 @@ def build_metrics_dict(
     """
     representative = reduction_sweep.representative_repeat(best)
     base = clustering_io.build_base_metrics_dict(
-        condition=condition,
-        slug=slug,
+        label=label,
         input_path=input_path,
         assignments_output_path=assignments_output_path,
         n_samples=n_samples,
@@ -291,7 +286,10 @@ def build_metrics_dict(
 
 
 def run(
-    condition: str,
+    input_path: Path,
+    reduced_embeddings_output_path: Path,
+    assignments_output_path: Path,
+    metrics_output_path: Path,
     n_components_values: list[int] = DEFAULT_N_COMPONENTS,
     n_neighbors_values: list[int] = DEFAULT_N_NEIGHBORS,
     min_dist_values: list[float] = DEFAULT_MIN_DIST,
@@ -304,15 +302,14 @@ def run(
     hdbscan_cluster_selection_epsilon: float = HDBSCANClusterer.DEFAULT_CLUSTER_SELECTION_EPSILON,
     hdbscan_cluster_selection_method: str = HDBSCANClusterer.DEFAULT_CLUSTER_SELECTION_METHOD,
     hdbscan_alpha: float = HDBSCANClusterer.DEFAULT_ALPHA,
-    input_path: Path | None = None,
-    reduced_embeddings_output_path: Path | None = None,
-    assignments_output_path: Path | None = None,
-    metrics_output_path: Path | None = None,
 ) -> tuple[Path, Path, Path] | None:
-    """Run the full read-filter-sweep-write pipeline for one condition.
+    """Run the full read-filter-sweep-write pipeline.
 
     Args:
-        condition: Condition string, e.g. "breast cancer".
+        input_path: Embeddings Parquet to read.
+        reduced_embeddings_output_path: Where to write reduced embeddings.
+        assignments_output_path: Where to write cluster assignments.
+        metrics_output_path: Where to write metrics.
         n_components_values: UMAP `n_components` values to sweep.
         n_neighbors_values: UMAP `n_neighbors` values to sweep.
         min_dist_values: UMAP `min_dist` values to sweep.
@@ -330,16 +327,6 @@ def run(
         hdbscan_cluster_selection_epsilon: Fixed (non-swept) HDBSCAN hyperparameter.
         hdbscan_cluster_selection_method: Fixed (non-swept) HDBSCAN hyperparameter.
         hdbscan_alpha: Fixed (non-swept) HDBSCAN hyperparameter.
-        input_path: Embeddings Parquet to read. If omitted, defaults as
-            `hdbscan_clustering.py` itself does.
-        reduced_embeddings_output_path: Where to write reduced embeddings.
-            If omitted, defaults to
-            ``OUTPUT_DIR / f"{slug}_trials_umap_reduced_embeddings.parquet"``.
-        assignments_output_path: Where to write cluster assignments. If
-            omitted, defaults to
-            ``OUTPUT_DIR / f"{slug}_trials_umap_hdbscan_clusters.parquet"``.
-        metrics_output_path: Where to write metrics. If omitted, defaults to
-            ``OUTPUT_DIR / f"{slug}_trials_umap_hdbscan_cluster_metrics.json"``.
 
     Returns:
         `(reduced_embeddings_output_path, assignments_output_path,
@@ -347,23 +334,12 @@ def run(
         usable clustering result (in which case nothing is written).
 
     Raises:
-        FileNotFoundError: If the resolved input Parquet does not exist.
+        FileNotFoundError: If the input Parquet does not exist.
         ValueError: If there are no successfully-embedded rows to cluster,
             if embedding dimensionality is inconsistent, or if the sweep
             grid/seed list/repeat count exceed `reduction_sweep`'s caps.
     """
-    slug = EligibilityCriteriaFetcher.condition_to_slug(condition)
-    default_input_path, default_assignments_path, default_metrics_path = clustering_io.resolve_default_paths(
-        condition, OUTPUT_DIR, "_trials_umap_hdbscan_clusters.parquet", "_trials_umap_hdbscan_cluster_metrics.json"
-    )
-    if input_path is None:
-        input_path = default_input_path
-    if assignments_output_path is None:
-        assignments_output_path = default_assignments_path
-    if metrics_output_path is None:
-        metrics_output_path = default_metrics_path
-    if reduced_embeddings_output_path is None:
-        reduced_embeddings_output_path = OUTPUT_DIR / f"{slug}_trials_umap_reduced_embeddings.parquet"
+    label = label_from_slug(slug_from_filename(input_path.name, "_trials_embeddings.parquet"))
 
     table = clustering_io.read_embeddings_parquet(input_path)
     total_rows = table.num_rows
@@ -405,7 +381,7 @@ def run(
     if best is None:
         logger.warning(
             "run: no UMAP configuration produced a usable relative validity index for %r; writing nothing",
-            condition,
+            label,
         )
         return None
 
@@ -424,8 +400,7 @@ def run(
     embedding_backend = filtered.column("embedding_backend")[0].as_py()
     embedding_model = filtered.column("embedding_model")[0].as_py()
     metrics_dict = build_metrics_dict(
-        condition=condition,
-        slug=slug,
+        label=label,
         input_path=input_path,
         reduced_embeddings_output_path=reduced_embeddings_output_path,
         assignments_output_path=assignments_output_path,
@@ -448,7 +423,7 @@ def run(
         "run: winning UMAP config %s (seed=%d) clustered %d row(s) into %d cluster(s) for %r -> %s, %s, %s "
         "(noise=%d/%d (%.1f%%), silhouette=%s, excluded=%d failed-embedding row(s))",
         best.hyperparams, best.winning_seed.seed, n_samples, representative.metrics_result["n_clusters_actual"],
-        condition, reduced_embeddings_output_path, assignments_output_path, metrics_output_path,
+        label, reduced_embeddings_output_path, assignments_output_path, metrics_output_path,
         representative.metrics_result["noise_count"], n_samples, representative.metrics_result["noise_fraction"] * 100,
         representative.metrics_result["metrics"]["silhouette_score"], n_excluded,
     )
@@ -459,41 +434,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser for this module.
 
     Returns:
-        An ``argparse.ArgumentParser`` accepting a positional ``condition``
-        argument plus UMAP sweep options, fixed HDBSCAN hyperparameter
-        flags, and path-override options. UMAP-side flags are prefixed
-        ``--umap-`` and HDBSCAN-side flags ``--hdbscan-`` throughout, since
-        this module (unlike the single-algorithm modules) composites both
-        algorithms' hyperparameters in one CLI and a bare ``--metric`` would
-        be ambiguous between them.
+        An ``argparse.ArgumentParser`` accepting UMAP sweep options, fixed
+        HDBSCAN hyperparameter flags, and required input/output path flags.
+        Flag names are agnostic to which algorithm they configure (e.g.
+        ``--n-components``, ``--cluster-selection-method``); the one
+        exception is ``--distance-metric``, used for UMAP's own distance
+        metric since a bare ``--metric`` would be ambiguous with HDBSCAN's
+        (mirrored by `pacmap_hdbscan_clustering.build_arg_parser`, which
+        uses the same ``--distance-metric`` name for PaCMAP's).
     """
     parser = argparse.ArgumentParser(
-        description="Reduce a condition's criterion embeddings via UMAP, then cluster via HDBSCAN."
+        description="Reduce criterion embeddings via UMAP, then cluster via HDBSCAN."
     )
     parser.add_argument(
-        "condition",
-        help='Condition to cluster, e.g. "breast cancer" (same string passed to criteria_embedding.py)',
-    )
-    parser.add_argument(
-        "--umap-n-components",
+        "--n-components",
         type=parse_int_list,
         default=DEFAULT_N_COMPONENTS,
         help="Comma-separated list of UMAP n_components values to sweep (default: 2)",
     )
     parser.add_argument(
-        "--umap-n-neighbors",
+        "--n-neighbors",
         type=parse_int_list,
         default=DEFAULT_N_NEIGHBORS,
         help="Comma-separated list of UMAP n_neighbors values to sweep (default: 15)",
     )
     parser.add_argument(
-        "--umap-min-dist",
+        "--min-dist",
         type=parse_float_list,
         default=DEFAULT_MIN_DIST,
         help="Comma-separated list of UMAP min_dist values to sweep (default: 0.1)",
     )
     parser.add_argument(
-        "--umap-metric",
+        "--distance-metric",
         type=str,
         default=DEFAULT_METRIC,
         help="UMAP distance metric, held fixed across the sweep (default: euclidean)",
@@ -511,39 +483,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Number of repeated fits per (config, seed) pair, used to measure reproducibility (default: 10)",
     )
     parser.add_argument(
-        "--hdbscan-min-cluster-size",
+        "--min-cluster-size",
         type=parse_int_list,
         default=DEFAULT_HDBSCAN_MIN_CLUSTER_SIZE_VALUES,
         help="Comma-separated list of HDBSCAN min_cluster_size values to sweep, folded into the "
         "same config grid as the UMAP hyperparameters above (default: 200)",
     )
     parser.add_argument(
-        "--hdbscan-min-samples",
+        "--min-samples",
         type=int,
         default=HDBSCANClusterer.DEFAULT_MIN_CLUSTER_SIZE,
         help="Fixed HDBSCAN min_samples, not swept (default: 200)",
     )
     parser.add_argument(
-        "--hdbscan-metric",
+        "--metric",
         type=str,
         default=HDBSCANClusterer.DEFAULT_METRIC,
         help="Fixed HDBSCAN distance metric, not swept (default: euclidean)",
     )
     parser.add_argument(
-        "--hdbscan-cluster-selection-epsilon",
+        "--cluster-selection-epsilon",
         type=float,
         default=HDBSCANClusterer.DEFAULT_CLUSTER_SELECTION_EPSILON,
         help="Fixed HDBSCAN cluster_selection_epsilon, not swept (default: 0.0)",
     )
     parser.add_argument(
-        "--hdbscan-cluster-selection-method",
+        "--cluster-selection-method",
         type=str,
         choices=["eom", "leaf"],
         default=HDBSCANClusterer.DEFAULT_CLUSTER_SELECTION_METHOD,
         help="Fixed HDBSCAN cluster_selection_method, not swept (default: eom)",
     )
     parser.add_argument(
-        "--hdbscan-alpha",
+        "--alpha",
         type=float,
         default=HDBSCANClusterer.DEFAULT_ALPHA,
         help="Fixed HDBSCAN alpha, not swept (default: 1.0)",
@@ -551,54 +523,53 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--input-path",
         type=Path,
-        default=None,
-        help="Override the default input embeddings Parquet path",
+        required=True,
+        help="Input embeddings Parquet path (as written by criteria_embedding.py)",
     )
     parser.add_argument(
         "--reduced-embeddings-output-path",
         type=Path,
-        default=None,
-        help="Override the default output reduced-embeddings Parquet path",
+        required=True,
+        help="Output reduced-embeddings Parquet path",
     )
     parser.add_argument(
         "--assignments-output-path",
         type=Path,
-        default=None,
-        help="Override the default output cluster-assignments Parquet path",
+        required=True,
+        help="Output cluster-assignments Parquet path",
     )
     parser.add_argument(
         "--metrics-output-path",
         type=Path,
-        default=None,
-        help="Override the default output metrics JSON path",
+        required=True,
+        help="Output metrics JSON path",
     )
     return parser
 
 
 def main() -> None:
-    """CLI entry point: sweep, cluster, and write reduced embeddings/cluster assignments/metrics for one condition."""
+    """CLI entry point: sweep, cluster, and write reduced embeddings/cluster assignments/metrics."""
     logging.basicConfig(level=logging.INFO)
 
     args = build_arg_parser().parse_args()
 
     run(
-        args.condition,
-        n_components_values=args.umap_n_components,
-        n_neighbors_values=args.umap_n_neighbors,
-        min_dist_values=args.umap_min_dist,
-        umap_metric=args.umap_metric,
+        args.input_path,
+        args.reduced_embeddings_output_path,
+        args.assignments_output_path,
+        args.metrics_output_path,
+        n_components_values=args.n_components,
+        n_neighbors_values=args.n_neighbors,
+        min_dist_values=args.min_dist,
+        umap_metric=args.distance_metric,
         seeds=args.seeds,
         repeats_per_seed=args.repeats_per_seed,
-        hdbscan_min_cluster_size_values=args.hdbscan_min_cluster_size,
-        hdbscan_min_samples=args.hdbscan_min_samples,
-        hdbscan_metric=args.hdbscan_metric,
-        hdbscan_cluster_selection_epsilon=args.hdbscan_cluster_selection_epsilon,
-        hdbscan_cluster_selection_method=args.hdbscan_cluster_selection_method,
-        hdbscan_alpha=args.hdbscan_alpha,
-        input_path=args.input_path,
-        reduced_embeddings_output_path=args.reduced_embeddings_output_path,
-        assignments_output_path=args.assignments_output_path,
-        metrics_output_path=args.metrics_output_path,
+        hdbscan_min_cluster_size_values=args.min_cluster_size,
+        hdbscan_min_samples=args.min_samples,
+        hdbscan_metric=args.metric,
+        hdbscan_cluster_selection_epsilon=args.cluster_selection_epsilon,
+        hdbscan_cluster_selection_method=args.cluster_selection_method,
+        hdbscan_alpha=args.alpha,
     )
 
 

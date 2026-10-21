@@ -1,8 +1,7 @@
-"""Cluster per-condition eligibility criteria embeddings via HDBSCAN, sweeping hyperparameters.
+"""Cluster eligibility criteria embeddings via HDBSCAN, sweeping hyperparameters.
 
-Reads the same embeddings Parquet file as `kmeans_clustering.py`
-(``data/embeddings/<condition>_trials_embeddings.parquet``), drops rows whose
-embedding failed, and fits `sklearn.cluster.HDBSCAN` once per combination in
+Reads the same embeddings Parquet file format as `kmeans_clustering.py`,
+drops rows whose embedding failed, and fits `sklearn.cluster.HDBSCAN` once per combination in
 the Cartesian product of the supplied `--min-cluster-size`/`--min-samples`/
 `--cluster-selection-epsilon`/`--alpha` value lists (`--metric`/
 `--cluster-selection-method` are held fixed across the whole sweep, not
@@ -17,18 +16,18 @@ Each combination's clustering performance metrics are logged as the sweep
 runs; no separate sweep-results file is written. Once every combination has
 been tried, the single best one — ranked by relative validity index (DBCV,
 higher is better), tie-broken by noise fraction (lower is better) — has its
-cluster assignments and metrics written:
+cluster assignments and metrics written to the paths given via
+`--assignments-output-path`/`--metrics-output-path`:
 
-    data/clustering/hdbscan/<condition>_trials_hdbscan_clusters.parquet
-        One row per successfully-embedded criterion, carrying its assigned
-        ``cluster_id`` (``-1`` for noise), HDBSCAN's cluster membership
-        ``cluster_probability``, plus enough source columns (``nct_id``,
-        ``criterion_text``, etc.) to join back to the embeddings file.
+    Cluster assignments: one row per successfully-embedded criterion,
+        carrying its assigned ``cluster_id`` (``-1`` for noise), HDBSCAN's
+        cluster membership ``cluster_probability``, plus enough source
+        columns (``nct_id``, ``criterion_text``, etc.) to join back to the
+        embeddings file.
 
-    data/clustering/hdbscan/<condition>_trials_hdbscan_cluster_metrics.json
-        Clustering performance metrics (silhouette score, Davies-Bouldin
-        index, Calinski-Harabasz index — computed only over non-noise
-        points) plus noise statistics, run provenance, and
+    Cluster metrics: clustering performance metrics (silhouette score,
+        Davies-Bouldin index, Calinski-Harabasz index — computed only over
+        non-noise points) plus noise statistics, run provenance, and
         ``relative_validity_index`` (the DBCV score that decided the
         winner), so clustering quality can be reviewed without re-running
         the clustering step.
@@ -46,8 +45,8 @@ combinations (the product of all four swept lists' lengths) is capped at
 `MAX_SWEEP_COMBINATIONS`; exceeding it raises an error before any fitting is
 attempted.
 
-Re-running this step on the same condition overwrites both existing output
-files wholesale — there is no append/skip-if-exists/merge behavior.
+Re-running this step against the same output paths overwrites both existing
+output files wholesale — there is no append/skip-if-exists/merge behavior.
 
 Read/validate/write logic shared with the k-means clustering pipeline (see
 `kmeans_clustering.py`) lives in `clustering_io.py`; this module holds only
@@ -82,11 +81,8 @@ from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score, silho
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from src.paths import REPO_ROOT
-from src.preprocessing.criteria_retrieval import EligibilityCriteriaFetcher
+from src.paths import label_from_slug, slug_from_filename
 from src.clustering import clustering_io
-
-OUTPUT_DIR = REPO_ROOT / "data" / "clustering" / "hdbscan"
 
 logger = logging.getLogger(__name__)
 
@@ -384,8 +380,7 @@ class HDBSCANClusterer:
 
     def build_metrics_dict(
         self,
-        condition: str,
-        slug: str,
+        label: str,
         input_path: Path,
         assignments_output_path: Path,
         n_samples: int,
@@ -400,8 +395,8 @@ class HDBSCANClusterer:
         """Assemble the full metrics JSON payload for one clustering run.
 
         Args:
-            condition: Condition string passed to `run_sweep`.
-            slug: `condition`'s filesystem-safe slug.
+            label: Human-readable label for this run, derived from
+                `input_path`'s filename.
             input_path: The embeddings Parquet path that was read.
             assignments_output_path: Where cluster assignments were written.
             n_samples: Number of successfully-embedded rows clustered.
@@ -419,8 +414,7 @@ class HDBSCANClusterer:
             A JSON-serializable dict matching the documented metrics schema.
         """
         base = clustering_io.build_base_metrics_dict(
-            condition=condition,
-            slug=slug,
+            label=label,
             input_path=input_path,
             assignments_output_path=assignments_output_path,
             n_samples=n_samples,
@@ -679,18 +673,17 @@ def _log_candidate(index: int, total: int, candidate: SweepCandidate) -> None:
 
 
 def run_sweep(
-    condition: str,
+    input_path: Path,
+    assignments_output_path: Path,
+    metrics_output_path: Path,
     min_cluster_size_values: list[int],
     min_samples_values: list[int],
     cluster_selection_epsilon_values: list[float],
     alpha_values: list[float],
     metric: str = HDBSCANClusterer.DEFAULT_METRIC,
     cluster_selection_method: str = HDBSCANClusterer.DEFAULT_CLUSTER_SELECTION_METHOD,
-    input_path: Path | None = None,
-    assignments_output_path: Path | None = None,
-    metrics_output_path: Path | None = None,
 ) -> tuple[Path, Path] | None:
-    """Sweep HDBSCAN hyperparameters for a condition and write the best result.
+    """Sweep HDBSCAN hyperparameters and write the best result.
 
     This is the module's only orchestration entry point — a single value per
     list (the CLI defaults) is simply a sweep of size one; the winner-
@@ -698,22 +691,16 @@ def run_sweep(
     combinations were tried.
 
     Args:
-        condition: Condition string, e.g. "breast cancer" — the same string
-            passed to `criteria_embedding.py`.
+        input_path: Embeddings Parquet to read.
+        assignments_output_path: Where to write the winning combination's
+            cluster assignments.
+        metrics_output_path: Where to write the winning combination's metrics.
         min_cluster_size_values: Candidate `min_cluster_size` values.
         min_samples_values: Candidate `min_samples` values.
         cluster_selection_epsilon_values: Candidate `cluster_selection_epsilon` values.
         alpha_values: Candidate `alpha` values.
         metric: Distance metric to use, held fixed across the sweep.
         cluster_selection_method: Held fixed across the sweep.
-        input_path: Embeddings Parquet to read. If omitted, defaults to
-            the embeddings directory's `{slug}_trials_embeddings.parquet`.
-        assignments_output_path: Where to write the winning combination's
-            cluster assignments. If omitted, defaults to
-            ``OUTPUT_DIR / f"{slug}_trials_hdbscan_clusters.parquet"``.
-        metrics_output_path: Where to write the winning combination's
-            metrics. If omitted, defaults to
-            ``OUTPUT_DIR / f"{slug}_trials_hdbscan_cluster_metrics.json"``.
 
     Returns:
         `(assignments_output_path, metrics_output_path)` for the winning
@@ -721,21 +708,12 @@ def run_sweep(
         (in which case nothing is written).
 
     Raises:
-        FileNotFoundError: If the resolved input Parquet does not exist.
+        FileNotFoundError: If the input Parquet does not exist.
         ValueError: If there are no successfully-embedded rows to cluster,
             if embedding dimensionality is inconsistent, or if the requested
             sweep has more than `MAX_SWEEP_COMBINATIONS` combinations.
     """
-    slug = EligibilityCriteriaFetcher.condition_to_slug(condition)
-    default_input_path, default_assignments_path, default_metrics_path = clustering_io.resolve_default_paths(
-        condition, OUTPUT_DIR, "_trials_hdbscan_clusters.parquet", "_trials_hdbscan_cluster_metrics.json"
-    )
-    if input_path is None:
-        input_path = default_input_path
-    if assignments_output_path is None:
-        assignments_output_path = default_assignments_path
-    if metrics_output_path is None:
-        metrics_output_path = default_metrics_path
+    label = label_from_slug(slug_from_filename(input_path.name, "_trials_embeddings.parquet"))
 
     table = clustering_io.read_embeddings_parquet(input_path)
     total_rows = table.num_rows
@@ -749,7 +727,7 @@ def run_sweep(
     combos = generate_combinations(
         min_cluster_size_values, min_samples_values, cluster_selection_epsilon_values, alpha_values
     )
-    logger.info("run_sweep: evaluating %d combination(s) for %r (n_samples=%d)", len(combos), condition, n_samples)
+    logger.info("run_sweep: evaluating %d combination(s) for %r (n_samples=%d)", len(combos), label, n_samples)
 
     candidates = []
     for index, hyperparams in enumerate(combos, start=1):
@@ -761,7 +739,7 @@ def run_sweep(
     if best is None:
         logger.warning(
             "run_sweep: no combination produced a usable relative validity index for %r; writing nothing",
-            condition,
+            label,
         )
         return None
 
@@ -780,8 +758,7 @@ def run_sweep(
     embedding_backend = filtered.column("embedding_backend")[0].as_py()
     embedding_model = filtered.column("embedding_model")[0].as_py()
     metrics_dict = clusterer.build_metrics_dict(
-        condition=condition,
-        slug=slug,
+        label=label,
         input_path=input_path,
         assignments_output_path=assignments_output_path,
         n_samples=n_samples,
@@ -798,7 +775,7 @@ def run_sweep(
 
     logger.info(
         "run_sweep: best combination for %r is %s (relative_validity=%.4f, noise=%.1f%%) -> %s, %s",
-        condition, best.hyperparams, best.relative_validity,
+        label, best.hyperparams, best.relative_validity,
         best.metrics_result["noise_fraction"] * 100, assignments_output_path, metrics_output_path,
     )
     return assignments_output_path, metrics_output_path
@@ -808,17 +785,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser for this module.
 
     Returns:
-        An ``argparse.ArgumentParser`` accepting a positional ``condition``
-        argument plus comma-separated value lists for the swept
-        hyperparameters, fixed-value flags for the un-swept ones, and
-        path-override options.
+        An ``argparse.ArgumentParser`` accepting comma-separated value lists
+        for the swept hyperparameters, fixed-value flags for the un-swept
+        ones, and required input/output path flags.
     """
     parser = argparse.ArgumentParser(
-        description="Cluster a condition's criterion embeddings via HDBSCAN, sweeping hyperparameters."
-    )
-    parser.add_argument(
-        "condition",
-        help='Condition to cluster, e.g. "breast cancer" (same string passed to criteria_embedding.py)',
+        description="Cluster criterion embeddings via HDBSCAN, sweeping hyperparameters."
     )
     parser.add_argument(
         "--min-cluster-size",
@@ -860,39 +832,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--input-path",
         type=Path,
-        default=None,
-        help="Override the default input embeddings Parquet path",
+        required=True,
+        help="Input embeddings Parquet path (as written by criteria_embedding.py)",
     )
     parser.add_argument(
         "--assignments-output-path",
         type=Path,
-        default=None,
-        help="Override the default output cluster-assignments Parquet path",
+        required=True,
+        help="Output cluster-assignments Parquet path",
     )
     parser.add_argument(
         "--metrics-output-path",
         type=Path,
-        default=None,
-        help="Override the default output metrics JSON path",
+        required=True,
+        help="Output metrics JSON path",
     )
     return parser
 
 
 def main() -> None:
-    """CLI entry point: sweep, cluster, and write cluster assignments/metrics for one condition."""
+    """CLI entry point: sweep, cluster, and write cluster assignments/metrics."""
     logging.basicConfig(level=logging.INFO)
     args = build_arg_parser().parse_args()
     run_sweep(
-        args.condition,
+        args.input_path,
+        args.assignments_output_path,
+        args.metrics_output_path,
         min_cluster_size_values=args.min_cluster_size,
         min_samples_values=args.min_samples,
         cluster_selection_epsilon_values=args.cluster_selection_epsilon,
         alpha_values=args.alpha,
         metric=args.metric,
         cluster_selection_method=args.cluster_selection_method,
-        input_path=args.input_path,
-        assignments_output_path=args.assignments_output_path,
-        metrics_output_path=args.metrics_output_path,
     )
 
 
