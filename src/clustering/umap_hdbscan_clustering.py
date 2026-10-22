@@ -379,7 +379,7 @@ def run(
         }
 
     study_name = f"{slug}_umap_hdbscan"
-    storage_path = config.study_dir / f"{study_name}_study.db"
+    storage_path = config.study_dir / f"{study_name}_study.csv"
     study = optuna_search.build_study(storage_path, study_name, config.sampler_seed)
 
     trial_cache: dict[int, dict] = {}
