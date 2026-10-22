@@ -1,9 +1,9 @@
 """Generate a consolidated clustering performance report across algorithms.
 
 Reads the existing per-algorithm clustering metrics JSON artifacts already
-written by `kmeans_clustering.py`, `hdbscan_clustering.py`,
-`umap_hdbscan_clustering.py`, and `pacmap_hdbscan_clustering.py` (whichever
-of their metrics paths the caller passes in) and renders one consolidated,
+written by `kmeans_clustering.py`, `umap_hdbscan_clustering.py`, and
+`pacmap_hdbscan_clustering.py` (whichever of their metrics paths the caller
+passes in) and renders one consolidated,
 human-readable Markdown report comparing their clustering performance side
 by side. This module never re-runs clustering — it only reads artifacts
 that already exist on disk.
@@ -140,31 +140,6 @@ def kmeans_extra_fields(data: dict) -> list[tuple[str, str]]:
     ]
 
 
-def hdbscan_extra_fields(data: dict) -> list[tuple[str, str]]:
-    """Extract HDBSCAN-only fields (no equivalent in other algorithms).
-
-    Args:
-        data: A parsed HDBSCAN metrics dict (as produced by
-            `hdbscan_clustering.HDBSCANClusterer.build_metrics_dict`).
-
-    Returns:
-        Label/formatted-value pairs for cluster count and noise statistics.
-        Uses `.get(...)` throughout so an unexpected/partial schema degrades
-        to "N/A" fields rather than raising.
-    """
-    noise_count = data.get("noise_count")
-    n_samples = data.get("n_samples")
-    if noise_count is not None and n_samples is not None:
-        noise_display = _format_percent(noise_count, n_samples)
-    else:
-        noise_display = "N/A"
-
-    return [
-        ("Clusters found", str(data.get("n_clusters_actual", "N/A"))),
-        ("Noise points", noise_display),
-    ]
-
-
 def umap_hdbscan_extra_fields(data: dict) -> list[tuple[str, str]]:
     """Extract UMAP+HDBSCAN-only fields (no equivalent in other algorithms).
 
@@ -231,12 +206,6 @@ ALGORITHM_SPECS: list[AlgorithmSpec] = [
         display_name="K-Means",
         metrics_suffix="_trials_cluster_metrics.json",
         extra_fields_fn=kmeans_extra_fields,
-    ),
-    AlgorithmSpec(
-        key="hdbscan",
-        display_name="HDBSCAN",
-        metrics_suffix="_trials_hdbscan_cluster_metrics.json",
-        extra_fields_fn=hdbscan_extra_fields,
     ),
     AlgorithmSpec(
         key="umap_hdbscan",

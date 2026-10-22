@@ -42,11 +42,12 @@ attempted.
 Re-running this step against the same output paths overwrites both existing
 output files wholesale — there is no append/skip-if-exists/merge behavior.
 
-Read/validate/write logic shared with the HDBSCAN clustering pipeline (see
-`hdbscan_clustering.py`) lives in `clustering_io.py`; this module holds only
-k-means-specific logic (fitting, `k` selection, k-means's own metrics guard,
-and the hyperparameter sweep itself). `parse_int_list` (comma-separated CLI
-value parsing) is reused from `hdbscan_clustering.py` rather than redefined.
+Read/validate/write logic shared with the other clustering pipelines (see
+`pacmap_hdbscan_clustering.py`/`umap_hdbscan_clustering.py`) lives in
+`clustering_io.py`; this module holds only k-means-specific logic (fitting,
+`k` selection, k-means's own metrics guard, and the hyperparameter sweep
+itself — k-means is the only remaining clustering step still using a
+CLI-flag-driven grid sweep rather than an Optuna search).
 """
 
 import argparse
@@ -75,7 +76,6 @@ if not __package__:
 
 from src.paths import label_from_slug, slug_from_filename
 from src.clustering import clustering_io
-from src.clustering.hdbscan_clustering import parse_int_list
 
 logger = logging.getLogger(__name__)
 
@@ -879,6 +879,26 @@ def run_sweep(
         n_excluded,
     )
     return assignments_output_path, metrics_output_path
+
+
+def parse_int_list(value: str) -> list[int]:
+    """Parse a comma-separated CLI value into a list of ints.
+
+    Args:
+        value: e.g. `"5,10,15"`.
+
+    Returns:
+        `[5, 10, 15]`.
+
+    Raises:
+        argparse.ArgumentTypeError: If any comma-separated entry isn't a
+            valid int, naming the offending entry.
+    """
+    parts = [p.strip() for p in value.split(",")]
+    try:
+        return [int(p) for p in parts]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected a comma-separated list of integers, got {value!r}") from exc
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

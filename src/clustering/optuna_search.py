@@ -116,9 +116,10 @@ class EligibilityBounds:
     """The degenerate-result eligibility bounds a composite score penalizes against.
 
     Callers pass `HDBSCANClusterer.MIN_N_CLUSTERS`/`MAX_N_CLUSTERS`/
-    `MAX_CLUSTER_SHARE` here. This module never imports `HDBSCANClusterer`
-    itself (that would create an import cycle, since `hdbscan_clustering.py`
-    imports this module) — these three numbers are all it ever needs from it.
+    `MAX_CLUSTER_SHARE` (from `hdbscan_model.py`) here rather than this
+    module importing `HDBSCANClusterer` itself, keeping this module generic
+    and reusable by any future clustering algorithm's objective, not just
+    HDBSCAN-based ones.
     """
 
     min_n_clusters: int

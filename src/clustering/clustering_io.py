@@ -1,11 +1,11 @@
 """Shared, algorithm-agnostic I/O for the clustering pipeline stages.
 
-Both `kmeans_clustering.py` (k-means) and `hdbscan_clustering.py` (HDBSCAN)
-read the same embeddings Parquet input format and write cluster assignments
-plus a metrics JSON in a similar shape. This module holds the logic that is
-genuinely common to both — reading/filtering/validating the input embeddings
-table and writing output artifacts — so neither algorithm-specific module
-re-implements it.
+`kmeans_clustering.py`, `pacmap_hdbscan_clustering.py`, and
+`umap_hdbscan_clustering.py` all read the same embeddings Parquet input
+format and write cluster assignments plus a metrics JSON in a similar
+shape. This module holds the logic that is genuinely common to all of them
+— reading/filtering/validating the input embeddings table and writing
+output artifacts — so no algorithm-specific module re-implements it.
 
 Nothing here branches on "which algorithm am I"; algorithm-specific concerns
 (fitting, per-algorithm metrics, per-algorithm output columns) stay in each

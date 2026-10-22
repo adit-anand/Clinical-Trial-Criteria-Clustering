@@ -1,8 +1,8 @@
 """Reduce criterion embeddings with PaCMAP, then cluster via HDBSCAN, tuned by an Optuna search.
 
 Mirrors `umap_hdbscan_clustering.py` exactly, swapping UMAP for PaCMAP as the
-reducer. Reads the same embeddings Parquet file format `hdbscan_clustering.py`
-reads, drops rows whose embedding failed, then runs an Optuna study whose
+reducer. Reads the same embeddings Parquet file format `criteria_embedding.py`
+writes, drops rows whose embedding failed, then runs an Optuna study whose
 every trial suggests a combined hyperparameter set — PaCMAP's own
 (`n_components`/`n_neighbors`/`MN_ratio`/`FP_ratio`) *and* HDBSCAN's own —
 from the search space defined in a `--config-path` YAML file. PaCMAP has no
@@ -17,7 +17,7 @@ Each trial's composite objective score (`optuna_search.score_reduction_candidate
 DBCV plus trustworthiness/continuity/steadiness/cohesiveness — computed via
 `zadu`, using cosine distance per the fixed `distance` config value — folded
 with the same noise/dominant-cluster/cluster-count/micro-cluster penalties
-`hdbscan_clustering.py` uses) both drives Optuna's own trial selection and
+this module shares with `umap_hdbscan_clustering.py` via `hdbscan_model.py`) both drives Optuna's own trial selection and
 determines which trial's result gets written. The study is resumable, and a
 full per-trial history CSV is written under `data/clustering/reports/` on
 every run — see `optuna_search.py`.
@@ -58,7 +58,7 @@ from src.paths import REPO_ROOT, label_from_slug, slug_from_filename
 from src.clustering import clustering_io
 from src.clustering import optuna_search
 from src.clustering import reduction_sweep
-from src.clustering.hdbscan_clustering import HDBSCAN_CLUSTER_PARQUET_SCHEMA, HDBSCAN_PARAM_NAMES, HDBSCANClusterer
+from src.clustering.hdbscan_model import HDBSCAN_CLUSTER_PARQUET_SCHEMA, HDBSCAN_PARAM_NAMES, HDBSCANClusterer
 
 logger = logging.getLogger(__name__)
 
