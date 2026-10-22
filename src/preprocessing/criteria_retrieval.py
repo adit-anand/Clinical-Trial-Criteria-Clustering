@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from src.logging_utils import configure_logging
 from src.paths import REPO_ROOT
 from src.preprocessing.clinicaltrials_client import ClinicalTrialsGovClient
 from src.preprocessing.criteria_parser import parse_eligibility_criteria
@@ -220,14 +221,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         help="Output CSV path to write the fetched eligibility criteria to",
     )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="If given, also append logs to this file (in addition to the console)",
+    )
     return parser
 
 
 def main() -> None:
     """CLI entry point: fetch and write eligibility criteria for one condition."""
-    logging.basicConfig(level=logging.INFO)
-
     args = build_arg_parser().parse_args()
+    configure_logging(args.log_file)
 
     fetcher = EligibilityCriteriaFetcher()
     if not fetcher.api_key:

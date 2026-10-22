@@ -50,6 +50,7 @@ import umap
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from src.logging_utils import configure_logging
 from src.paths import label_from_slug, slug_from_filename
 from src.clustering import clustering_io
 
@@ -433,13 +434,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="For --method umap_hdbscan only: that run's persisted reduced-embeddings Parquet path, "
         "reused as-is instead of fitting a fresh projection if its winning config was already 2D",
     )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="If given, also append logs to this file (in addition to the console)",
+    )
     return parser
 
 
 def main() -> None:
     """CLI entry point: render and write a scatterplot for one method's clustering output."""
-    logging.basicConfig(level=logging.INFO)
     args = build_arg_parser().parse_args()
+    configure_logging(args.log_file)
     run(
         args.method,
         args.metrics_path,

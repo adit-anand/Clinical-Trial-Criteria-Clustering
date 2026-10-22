@@ -45,6 +45,7 @@ if not __package__:
 
 from src.embeddings.embedding_cache import EmbeddingCache
 from src.embeddings.embedding_model import EmbeddingModel, build_embedding_model
+from src.logging_utils import configure_logging
 from src.paths import REPO_ROOT, slug_from_filename
 
 logger = logging.getLogger(__name__)
@@ -284,14 +285,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "(default: data/embeddings/cache). Ignored by other backends."
         ),
     )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="If given, also append logs to this file (in addition to the console)",
+    )
     return parser
 
 
 def main() -> None:
     """CLI entry point: embed and write eligibility criteria."""
-    logging.basicConfig(level=logging.INFO)
-
     args = build_arg_parser().parse_args()
+    configure_logging(args.log_file)
 
     backend_kwargs = {}
     if args.backend == "bert":

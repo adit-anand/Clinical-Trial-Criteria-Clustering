@@ -64,6 +64,7 @@ import umap
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from src.logging_utils import configure_logging
 from src.paths import REPO_ROOT, label_from_slug, slug_from_filename
 from src.clustering import clustering_io
 from src.clustering import optuna_search
@@ -542,14 +543,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "weights, trial budget, reproducibility seeds/repeats); default: "
         "config/umap_hdbscan_optuna.yaml",
     )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="If given, also append logs to this file (in addition to the console)",
+    )
     return parser
 
 
 def main() -> None:
     """CLI entry point: run the Optuna search and write reduced embeddings/cluster assignments/metrics."""
-    logging.basicConfig(level=logging.INFO)
-
     args = build_arg_parser().parse_args()
+    configure_logging(args.log_file)
 
     run(
         args.input_path,

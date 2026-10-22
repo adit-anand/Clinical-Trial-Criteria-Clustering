@@ -41,6 +41,7 @@ from typing import Callable, Literal
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from src.logging_utils import configure_logging
 from src.paths import label_from_slug, slug_from_filename
 
 logger = logging.getLogger(__name__)
@@ -547,12 +548,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Also print the generated report to stdout",
     )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="If given, also append logs to this file (in addition to the console)",
+    )
     return parser
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
     args = build_arg_parser().parse_args()
+    configure_logging(args.log_file)
     metrics_paths = {spec.key: getattr(args, f"{spec.key}_metrics_path") for spec in ALGORITHM_SPECS}
     generate_report(
         args.output_path,
