@@ -414,9 +414,7 @@ def run(
             "hyperparams": hyperparams,
         }
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     study_name = f"{slug}_pacmap_hdbscan"
-    trial_results_path = f"{config.study_dir}/{study_name}_trial_{config.n_trials - n_remaining}.csv"
     study = optuna_search.build_study(study_name, config.sampler_seed)
 
     trial_cache: dict[int, dict] = {}
@@ -453,6 +451,7 @@ def run(
         logger.info("run: running %d new trial(s) for %r (total budget=%d)", n_remaining, label, config.n_trials)
         study.optimize(objective, n_trials=n_remaining)
         df_optuna_trials = study.trials_dataframe()
+        trial_results_path = f"{config.study_dir}/{study_name}_trial_{config.n_trials - n_remaining}.csv"
         df_optuna_trials.to_csv(trial_results_path, index = False)
     else:
         logger.info("run: study %r already has >= %d trial(s); skipping new trials", study_name, config.n_trials)
