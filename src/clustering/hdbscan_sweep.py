@@ -1,12 +1,13 @@
 """Backward-compatible alias for `hdbscan_clustering.py`.
 
-`hdbscan_clustering.py` now performs the hyperparameter sweep this module
-used to perform on its own — every invocation of that module sweeps
-(a single value per flag is simply a sweep of size one), so there is no
-longer a distinct "sweep" step. This module keeps
-``uv run python -m src.clustering.hdbscan_sweep ...`` working for existing
-callers without duplicating any logic: it just re-exports
-`hdbscan_clustering.py`'s CLI and functions under this module's name.
+`hdbscan_clustering.py` now runs an Optuna-driven hyperparameter search
+instead of the grid sweep this module used to expose a CLI alias for. This
+module keeps ``uv run python -m src.clustering.hdbscan_sweep ...`` working
+for existing callers without duplicating any logic: it just re-exports
+`hdbscan_clustering.py`'s CLI under this module's name. The grid-sweep-era
+`parse_float_list`/`parse_int_list`/`run_sweep` functions no longer exist
+(there's nothing left to parse comma-separated lists for), so this module no
+longer re-exports them either.
 
 Prefer invoking `hdbscan_clustering.py` directly for new usage.
 """
@@ -23,13 +24,7 @@ from pathlib import Path
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from src.clustering.hdbscan_clustering import (  # noqa: F401
-    build_arg_parser,
-    main,
-    parse_float_list,
-    parse_int_list,
-    run_sweep,
-)
+from src.clustering.hdbscan_clustering import build_arg_parser, main  # noqa: F401
 
 if __name__ == "__main__":
     main()

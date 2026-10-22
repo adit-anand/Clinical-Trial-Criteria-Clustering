@@ -1,0 +1,43 @@
+# Optuna search config for `src/clustering/hdbscan_clustering.py`.
+#
+# search_space entries: {kind: int|float|categorical, low, high, choices, log}.
+# `metric` stays fixed (not swept) — DBCV scores computed under different
+# distance metrics aren't comparable within one study's ranking.
+
+search_space:
+  min_cluster_size:
+    kind: int
+    low: 50
+    high: 500
+  min_samples:
+    kind: int
+    low: 5
+    high: 500
+  cluster_selection_epsilon:
+    kind: float
+    low: 0.0
+    high: 1.0
+  cluster_selection_method:
+    kind: categorical
+    choices: [eom, leaf]
+  alpha:
+    kind: float
+    low: 0.5
+    high: 2.0
+
+fixed:
+  metric: euclidean
+
+objective_weights:
+  noise_penalty: 1.0
+  dominant_cluster_penalty: 1.0
+  cluster_count_violation_penalty: 2.0
+  micro_cluster_penalty: 1.0
+  micro_cluster_size_multiplier: 1.5
+  missing_validity_fallback_score: 0.0
+
+n_trials: 50
+sampler_seed: 42
+
+study_dir: data/clustering/hdbscan/optuna_studies
+reports_dir: data/clustering/reports

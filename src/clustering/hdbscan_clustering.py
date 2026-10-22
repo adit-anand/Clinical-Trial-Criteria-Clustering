@@ -1,72 +1,57 @@
-"""Cluster eligibility criteria embeddings via HDBSCAN, sweeping hyperparameters.
+"""Cluster eligibility criteria embeddings via HDBSCAN, tuned by an Optuna search.
 
 Reads the same embeddings Parquet file format as `kmeans_clustering.py`,
-drops rows whose embedding failed, and fits `sklearn.cluster.HDBSCAN` once per combination in
-the Cartesian product of the supplied `--min-cluster-size`/`--min-samples`/
-`--cluster-selection-epsilon`/`--alpha` value lists (`--metric`/
-`--cluster-selection-method` are held fixed across the whole sweep, not
-swept). Passing a single value for each (the default) is simply a sweep of
-size one — the module always goes through the same combination-evaluation
-and winner-selection path, whether there's one candidate or fifty. Unlike
-k-means, there is no `k` to choose for any individual fit — HDBSCAN discovers
-clusters of varying density directly from the data, and explicitly labels
-points that don't belong to any cluster as noise (``cluster_id == -1``).
+drops rows whose embedding failed, and runs an Optuna study that fits
+`sklearn.cluster.HDBSCAN` once per trial, suggesting `min_cluster_size`/
+`min_samples`/`cluster_selection_epsilon`/`cluster_selection_method`/`alpha`
+from the search space defined in a `--config-path` YAML file (`metric` is
+held fixed, not swept — DBCV scores computed under different distance
+metrics aren't comparable within one study). Unlike k-means, there is no `k`
+to choose for any individual fit — HDBSCAN discovers clusters of varying
+density directly from the data, and explicitly labels points that don't
+belong to any cluster as noise (``cluster_id == -1``).
 
-Each combination's clustering performance metrics are logged as the sweep
-runs; no separate sweep-results file is written. Once every combination has
-been tried, the single best one — ranked by relative validity index (DBCV,
-higher is better), tie-broken by noise fraction (lower is better) — has its
-cluster assignments and metrics written to the paths given via
-`--assignments-output-path`/`--metrics-output-path`:
+Each trial's composite objective score (`optuna_search.score_candidate`:
+DBCV, folded with noise-fraction/dominant-cluster/cluster-count/micro-
+cluster penalties) is the single ranking criterion — it both drives
+Optuna's own trial selection and determines which trial's result gets
+written. The study is resumable (SQLite-backed, via `optuna_search.build_study`):
+re-running the same command against the same input continues the same
+study rather than starting over, and the configured `n_trials` is treated
+as a *total* budget across resumes. A full per-trial history CSV is written
+under `data/clustering/reports/` on every run.
 
-    Cluster assignments: one row per successfully-embedded criterion,
-        carrying its assigned ``cluster_id`` (``-1`` for noise), HDBSCAN's
-        cluster membership ``cluster_probability``, plus enough source
-        columns (``nct_id``, ``criterion_text``, etc.) to join back to the
-        embeddings file.
-
-    Cluster metrics: clustering performance metrics (silhouette score,
-        Davies-Bouldin index, Calinski-Harabasz index — computed only over
-        non-noise points) plus noise statistics, run provenance, and
-        ``relative_validity_index`` (the DBCV score that decided the
-        winner), so clustering quality can be reviewed without re-running
-        the clustering step.
-
-A combination that's invalid for the dataset (e.g. `min_samples` exceeding
-the sample count) is skipped with a logged reason rather than aborting the
-rest of the sweep. A combination that fits but produces a degenerate result
-— per `HDBSCANClusterer.compute_metrics`'s eligibility constraints (cluster
-count outside `MIN_N_CLUSTERS`/`MAX_N_CLUSTERS`, a dominant cluster
-exceeding `MAX_CLUSTER_SHARE`, or noise exceeding `MAX_NOISE_FRACTION`) —
-is logged but never eligible to be the "best." If no
-combination qualifies — including when only the single default combination
-was tried and it's degenerate — nothing is written. The total number of
-combinations (the product of all four swept lists' lengths) is capped at
-`MAX_SWEEP_COMBINATIONS`; exceeding it raises an error before any fitting is
-attempted.
+If every trial that fit is degenerate (none satisfy `HDBSCANClusterer.
+compute_metrics`'s eligibility constraints — cluster count outside
+`MIN_N_CLUSTERS`/`MAX_N_CLUSTERS`, a dominant cluster exceeding
+`MAX_CLUSTER_SHARE`, or noise exceeding `MAX_NOISE_FRACTION`), the
+least-bad trial by the same composite score is still written, with
+`metrics_valid=False` recorded. Nothing is written only if every trial in
+the study was `"invalid"` (its hyperparameters were rejected before a fit
+was ever attempted).
 
 Re-running this step against the same output paths overwrites both existing
-output files wholesale — there is no append/skip-if-exists/merge behavior.
+output files (and the trial-history CSV) wholesale — only the Optuna
+study's own SQLite storage accumulates across runs, a deliberate exception
+to that convention (see `optuna_search.py`).
 
 Read/validate/write logic shared with the k-means clustering pipeline (see
 `kmeans_clustering.py`) lives in `clustering_io.py`; this module holds only
-HDBSCAN-specific logic (fitting, noise-aware metrics, probability output,
-and the hyperparameter sweep itself). `hdbscan_sweep.py` is a thin,
-backward-compatible alias for this module's CLI — all sweep logic lives
-here, not there.
+HDBSCAN-specific logic (fitting, noise-aware metrics, probability output).
+`hdbscan_sweep.py` is a thin, backward-compatible alias for this module's
+CLI.
 """
 
 import argparse
-import itertools
 import logging
 import math
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
 
 import numpy as np
+import optuna
 import pyarrow as pa
 from hdbscan import validity
 from sklearn.cluster import HDBSCAN
@@ -81,15 +66,18 @@ from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score, silho
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from src.paths import label_from_slug, slug_from_filename
+from src.paths import REPO_ROOT, label_from_slug, slug_from_filename
 from src.clustering import clustering_io
+from src.clustering import optuna_search
 
 logger = logging.getLogger(__name__)
 
-# The total number of combinations (the product of all four swept lists'
-# lengths) is capped here; exceeding it raises an error before any fitting
-# is attempted.
-MAX_SWEEP_COMBINATIONS = 100
+# Shared with pacmap_hdbscan_clustering.py/umap_hdbscan_clustering.py: splits
+# a reducer-pipeline trial's combined search_space dict into HDBSCAN's own
+# hyperparameters vs. the reducer's.
+HDBSCAN_PARAM_NAMES = frozenset(
+    {"min_cluster_size", "min_samples", "cluster_selection_epsilon", "cluster_selection_method", "alpha"}
+)
 
 HDBSCAN_CLUSTER_PARQUET_SCHEMA = pa.schema(
     [
@@ -112,8 +100,8 @@ class HDBSCANClusterer:
     Unlike `KMeansClusterer`, there is no "auto vs. fixed k" branching —
     HDBSCAN always discovers its own cluster count from the data; only its
     density hyperparameters are configurable. This class fits and scores one
-    combination; `run_sweep` (module-level, below) constructs one instance
-    per combination it tries.
+    combination; `run_optuna_search` (module-level, below) constructs one
+    instance per Optuna trial it tries.
 
     Typical usage:
         clusterer = HDBSCANClusterer()
@@ -127,7 +115,7 @@ class HDBSCANClusterer:
     DEFAULT_ALPHA = 1.0
 
     # A result's non-noise cluster count must fall in this range to be
-    # considered valid/eligible to win a sweep — too few clusters is as
+    # considered valid/eligible to win a search — too few clusters is as
     # undesirable a result as too many, for this pipeline's purposes.
     MIN_N_CLUSTERS = 10
     MAX_N_CLUSTERS = 100
@@ -161,14 +149,26 @@ class HDBSCANClusterer:
                 `min_cluster_size`.
             metric: The distance metric to use.
             cluster_selection_epsilon: A distance threshold below which
-                clusters are merged (0.0 disables this).
+                clusters are merged (0.0 disables this). Forced to `0.0`
+                whenever `metric == "cosine"` — see the note below.
             cluster_selection_method: `"eom"` (excess of mass) or `"leaf"`.
             alpha: Distance scaling parameter used in robust single linkage.
         """
         self.min_cluster_size = min_cluster_size
         self.min_samples = min_samples
         self.metric = metric
-        self.cluster_selection_epsilon = cluster_selection_epsilon
+        # Workaround for a confirmed bug in the installed scikit-learn
+        # (1.9.1): HDBSCAN(metric="cosine", cluster_selection_epsilon=<any
+        # nonzero value>).fit(...) raises
+        # "TypeError: only 0-dimensional arrays can be converted to Python
+        # scalars" inside sklearn's own _tree.pyx epsilon-merge code,
+        # regardless of cluster_selection_method or the input data — cosine
+        # distance's epsilon-merge path is simply broken in this version.
+        # Clamping here (rather than only at the `fit_hdbscan` call site)
+        # means every downstream consumer of `self.cluster_selection_epsilon`
+        # (metrics-JSON provenance, DBCV, logging) reports the value that
+        # was actually used, not what a caller originally asked for.
+        self.cluster_selection_epsilon = 0.0 if metric == "cosine" else cluster_selection_epsilon
         self.cluster_selection_method = cluster_selection_method
         self.alpha = alpha
 
@@ -238,7 +238,7 @@ class HDBSCANClusterer:
         always reported, regardless of whether the metrics could be computed.
 
         Independently of whether the metrics were computable, a result is
-        only considered valid/eligible to win a sweep if it also satisfies
+        only considered valid/eligible to win a search if it also satisfies
         three additional, business-level constraints — each violated
         independently of the others, and independently of whether the
         metrics above were computable:
@@ -444,276 +444,61 @@ class HDBSCANClusterer:
         }
 
 
-@dataclass(frozen=True)
-class SweepCandidate:
-    """The outcome of evaluating one hyperparameter combination.
+def compute_relative_validity_index(embedding_matrix: np.ndarray, labels: np.ndarray, metric: str) -> float | None:
+    """Compute the DBCV relative validity index for a fitted HDBSCAN result.
 
-    Attributes:
-        hyperparams: The swept `min_cluster_size`/`min_samples`/
-            `cluster_selection_epsilon`/`alpha` values this candidate used.
-        status: `"invalid"` if `HDBSCANClusterer.validate_hyperparameters`
-            rejected the combination for this dataset (never fit);
-            `"degenerate"` if fitting succeeded but `metrics_valid` came back
-            `False` (see `HDBSCANClusterer.compute_metrics`'s eligibility
-            constraints); `"ok"` otherwise.
-        detail: Human-readable explanation, set for `"invalid"`/`"degenerate"`.
-        metrics_result: `HDBSCANClusterer.compute_metrics(...)`'s return
-            value, set whenever fitting was attempted (`"degenerate"`/`"ok"`).
-        relative_validity: The DBCV relative validity index, set only for
-            `"ok"` candidates where it was itself successfully computed.
-        labels: The fitted model's cluster labels, kept so the eventual
-            winner never needs to be refit.
-        probabilities: The fitted model's cluster membership probabilities.
-    """
-
-    hyperparams: dict
-    status: Literal["ok", "invalid", "degenerate"]
-    detail: str | None = None
-    metrics_result: dict | None = None
-    relative_validity: float | None = None
-    labels: np.ndarray | None = None
-    probabilities: np.ndarray | None = None
-
-
-def parse_int_list(value: str) -> list[int]:
-    """Parse a comma-separated CLI value into a list of ints.
+    Shared helper reused by `reduction_sweep.evaluate_repeat` — do not
+    duplicate this logic there.
 
     Args:
-        value: e.g. `"5,10,15"`.
+        embedding_matrix: The matrix HDBSCAN was fit on.
+        labels: `model.labels_` (may include `-1` for noise).
+        metric: The distance metric HDBSCAN was fit with.
 
     Returns:
-        `[5, 10, 15]`.
-
-    Raises:
-        argparse.ArgumentTypeError: If any comma-separated entry isn't a
-            valid int, naming the offending entry.
+        The DBCV score, or `None` if it's not computable (a NaN result, or
+        any exception from `hdbscan.validity.validity_index`) — never raises.
     """
-    parts = [p.strip() for p in value.split(",")]
-    try:
-        return [int(p) for p in parts]
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"expected a comma-separated list of integers, got {value!r}") from exc
-
-
-def parse_float_list(value: str) -> list[float]:
-    """Parse a comma-separated CLI value into a list of floats.
-
-    Args:
-        value: e.g. `"0.0,0.1,0.2"`.
-
-    Returns:
-        `[0.0, 0.1, 0.2]`.
-
-    Raises:
-        argparse.ArgumentTypeError: If any comma-separated entry isn't a
-            valid float, naming the offending entry.
-    """
-    parts = [p.strip() for p in value.split(",")]
-    try:
-        return [float(p) for p in parts]
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"expected a comma-separated list of numbers, got {value!r}") from exc
-
-
-def generate_combinations(
-    min_cluster_size_values: list[int],
-    min_samples_values: list[int],
-    cluster_selection_epsilon_values: list[float],
-    alpha_values: list[float],
-) -> list[dict]:
-    """Build the Cartesian product of the four swept hyperparameters.
-
-    Args:
-        min_cluster_size_values: Candidate `min_cluster_size` values.
-        min_samples_values: Candidate `min_samples` values.
-        cluster_selection_epsilon_values: Candidate `cluster_selection_epsilon` values.
-        alpha_values: Candidate `alpha` values.
-
-    Returns:
-        One dict per combination, each with keys `min_cluster_size`,
-        `min_samples`, `cluster_selection_epsilon`, `alpha`.
-
-    Raises:
-        ValueError: If the product size exceeds `MAX_SWEEP_COMBINATIONS`,
-            naming the actual count and the limit.
-    """
-    combos = [
-        {
-            "min_cluster_size": min_cluster_size,
-            "min_samples": min_samples,
-            "cluster_selection_epsilon": cluster_selection_epsilon,
-            "alpha": alpha,
-        }
-        for min_cluster_size, min_samples, cluster_selection_epsilon, alpha in itertools.product(
-            min_cluster_size_values, min_samples_values, cluster_selection_epsilon_values, alpha_values
-        )
-    ]
-    if len(combos) > MAX_SWEEP_COMBINATIONS:
-        raise ValueError(
-            f"Requested sweep has {len(combos)} combination(s), exceeding the limit of "
-            f"{MAX_SWEEP_COMBINATIONS}; narrow one or more of --min-cluster-size/--min-samples/"
-            "--cluster-selection-epsilon/--alpha"
-        )
-    return combos
-
-
-def evaluate_combination(
-    hyperparams: dict,
-    metric: str,
-    cluster_selection_method: str,
-    embedding_matrix: np.ndarray,
-    n_samples: int,
-) -> SweepCandidate:
-    """Fit and score HDBSCAN for one hyperparameter combination.
-
-    Args:
-        hyperparams: One combination from `generate_combinations`.
-        metric: Distance metric, held fixed across the sweep.
-        cluster_selection_method: Held fixed across the sweep.
-        embedding_matrix: Array of shape `(n_samples, embedding_dim)`.
-        n_samples: `embedding_matrix.shape[0]`.
-
-    Returns:
-        A `SweepCandidate` reflecting whether the combination was invalid,
-        degenerate, or a usable result.
-    """
-    clusterer = HDBSCANClusterer(
-        min_cluster_size=hyperparams["min_cluster_size"],
-        min_samples=hyperparams["min_samples"],
-        metric=metric,
-        cluster_selection_epsilon=hyperparams["cluster_selection_epsilon"],
-        cluster_selection_method=cluster_selection_method,
-        alpha=hyperparams["alpha"],
-    )
-
-    try:
-        clusterer.validate_hyperparameters(n_samples)
-    except ValueError as exc:
-        return SweepCandidate(hyperparams=hyperparams, status="invalid", detail=str(exc))
-
-    model = clusterer.fit_hdbscan(embedding_matrix)
-    labels = model.labels_
-    probabilities = model.probabilities_
-    metrics_result = clusterer.compute_metrics(embedding_matrix, labels)
-
-    if not metrics_result["metrics_valid"]:
-        return SweepCandidate(
-            hyperparams=hyperparams,
-            status="degenerate",
-            detail="; ".join(metrics_result["notes"]) or "No usable quality metrics for this combination",
-            metrics_result=metrics_result,
-            labels=labels,
-            probabilities=probabilities,
-        )
-
     try:
         # hdbscan.validity.validity_index requires float64 input (its Cython
-        # core is compiled against double_t); clustering_io's embedding
-        # matrices are float32, so cast just for this call.
-        relative_validity = float(
-            validity.validity_index(embedding_matrix.astype(np.float64), labels, metric=metric)
-        )
-        if math.isnan(relative_validity):
-            relative_validity = None
-            metrics_result["notes"].append("Relative validity index (DBCV) computed to NaN for this combination")
-    except Exception as exc:  # noqa: BLE001 - DBCV computation failure shouldn't abort the sweep
-        relative_validity = None
-        metrics_result["notes"].append(f"Could not compute relative validity index (DBCV): {exc}")
-
-    return SweepCandidate(
-        hyperparams=hyperparams,
-        status="ok",
-        metrics_result=metrics_result,
-        relative_validity=relative_validity,
-        labels=labels,
-        probabilities=probabilities,
-    )
-
-
-def select_best(candidates: list[SweepCandidate]) -> SweepCandidate | None:
-    """Pick the best candidate by relative validity index, tie-broken by noise fraction.
-
-    Args:
-        candidates: As produced by `evaluate_combination`, one per combination.
-
-    Returns:
-        The `"ok"` candidate with the highest `relative_validity` (ties
-        broken by the lowest `noise_fraction`), or `None` if no candidate
-        has a computed relative validity index.
-    """
-    eligible = [c for c in candidates if c.status == "ok" and c.relative_validity is not None]
-    if not eligible:
+        # core is compiled against double_t); embedding matrices here are
+        # typically float32, so cast just for this call.
+        value = float(validity.validity_index(embedding_matrix.astype(np.float64), labels, metric=metric))
+        if math.isnan(value):
+            return None
+        return value
+    except Exception:  # noqa: BLE001 - DBCV computation failure shouldn't abort a trial
         return None
-    return min(eligible, key=lambda c: (-c.relative_validity, c.metrics_result["noise_fraction"]))
 
 
-def _log_candidate(index: int, total: int, candidate: SweepCandidate) -> None:
-    """Log one INFO line summarizing a single evaluated combination."""
-    if candidate.status == "invalid":
-        logger.info(
-            "evaluate_combination: [%d/%d] %s -> invalid (%s)",
-            index, total, candidate.hyperparams, candidate.detail,
-        )
-        return
-    if candidate.status == "degenerate":
-        logger.info(
-            "evaluate_combination: [%d/%d] %s -> degenerate, noise=%.1f%% (%s)",
-            index, total, candidate.hyperparams,
-            candidate.metrics_result["noise_fraction"] * 100, candidate.detail,
-        )
-        return
-    logger.info(
-        "evaluate_combination: [%d/%d] %s -> ok, clusters=%d, noise=%.1f%%, silhouette=%s, relative_validity=%s",
-        index, total, candidate.hyperparams,
-        candidate.metrics_result["n_clusters_actual"],
-        candidate.metrics_result["noise_fraction"] * 100,
-        candidate.metrics_result["metrics"]["silhouette_score"],
-        candidate.relative_validity,
-    )
-
-
-def run_sweep(
+def run_optuna_search(
     input_path: Path,
     assignments_output_path: Path,
     metrics_output_path: Path,
-    min_cluster_size_values: list[int],
-    min_samples_values: list[int],
-    cluster_selection_epsilon_values: list[float],
-    alpha_values: list[float],
-    metric: str = HDBSCANClusterer.DEFAULT_METRIC,
-    cluster_selection_method: str = HDBSCANClusterer.DEFAULT_CLUSTER_SELECTION_METHOD,
+    config_path: Path,
 ) -> tuple[Path, Path] | None:
-    """Sweep HDBSCAN hyperparameters and write the best result.
-
-    This is the module's only orchestration entry point — a single value per
-    list (the CLI defaults) is simply a sweep of size one; the winner-
-    selection and output-writing logic is identical regardless of how many
-    combinations were tried.
+    """Run an Optuna-driven HDBSCAN hyperparameter search and write the winning trial's result.
 
     Args:
         input_path: Embeddings Parquet to read.
-        assignments_output_path: Where to write the winning combination's
-            cluster assignments.
-        metrics_output_path: Where to write the winning combination's metrics.
-        min_cluster_size_values: Candidate `min_cluster_size` values.
-        min_samples_values: Candidate `min_samples` values.
-        cluster_selection_epsilon_values: Candidate `cluster_selection_epsilon` values.
-        alpha_values: Candidate `alpha` values.
-        metric: Distance metric to use, held fixed across the sweep.
-        cluster_selection_method: Held fixed across the sweep.
+        assignments_output_path: Where to write the winning trial's cluster assignments.
+        metrics_output_path: Where to write the winning trial's metrics.
+        config_path: YAML config (search space, objective weights, trial
+            budget, study/report directories) — see `optuna_search.load_optuna_config`.
 
     Returns:
         `(assignments_output_path, metrics_output_path)` for the winning
-        combination, or `None` if no combination produced a usable result
-        (in which case nothing is written).
+        trial, or `None` if every trial in the study was invalid (nothing
+        ever fit — nothing is written in that case).
 
     Raises:
-        FileNotFoundError: If the input Parquet does not exist.
+        FileNotFoundError: If the input Parquet or `config_path` does not exist.
         ValueError: If there are no successfully-embedded rows to cluster,
-            if embedding dimensionality is inconsistent, or if the requested
-            sweep has more than `MAX_SWEEP_COMBINATIONS` combinations.
+            if embedding dimensionality is inconsistent, or if `config_path`
+            fails validation (see `optuna_search.load_optuna_config`).
     """
-    label = label_from_slug(slug_from_filename(input_path.name, "_trials_embeddings.parquet"))
+    slug = slug_from_filename(input_path.name, "_trials_embeddings.parquet")
+    label = label_from_slug(slug)
 
     table = clustering_io.read_embeddings_parquet(input_path)
     total_rows = table.num_rows
@@ -724,39 +509,114 @@ def run_sweep(
     embedding_dim = clustering_io.validate_embedding_dimensions(filtered)
     embedding_matrix = clustering_io.extract_embedding_matrix(filtered)
 
-    combos = generate_combinations(
-        min_cluster_size_values, min_samples_values, cluster_selection_epsilon_values, alpha_values
+    config = optuna_search.load_optuna_config(config_path, require_reproducibility=False)
+    bounds = optuna_search.EligibilityBounds(
+        min_n_clusters=HDBSCANClusterer.MIN_N_CLUSTERS,
+        max_n_clusters=HDBSCANClusterer.MAX_N_CLUSTERS,
+        max_cluster_share=HDBSCANClusterer.MAX_CLUSTER_SHARE,
     )
-    logger.info("run_sweep: evaluating %d combination(s) for %r (n_samples=%d)", len(combos), label, n_samples)
 
-    candidates = []
-    for index, hyperparams in enumerate(combos, start=1):
-        candidate = evaluate_combination(hyperparams, metric, cluster_selection_method, embedding_matrix, n_samples)
-        _log_candidate(index, len(combos), candidate)
-        candidates.append(candidate)
+    def fit_trial(hyperparams: dict) -> dict:
+        """Fit one HDBSCAN hyperparameter combination into a trial-cache-shaped record.
 
-    best = select_best(candidates)
-    if best is None:
-        logger.warning(
-            "run_sweep: no combination produced a usable relative validity index for %r; writing nothing",
-            label,
+        Pulled out of the objective closure so the post-`study.optimize` winner
+        resolution can call it too: a resumed study's `study.best_trial` may be
+        from a *previous* process invocation, never present in this process's
+        own `trial_cache` (Optuna's storage persists only hyperparameters/score,
+        not our fit artifacts) — refitting is the only way to recover its
+        labels/probabilities, and is safe since HDBSCAN is fully deterministic
+        given the same hyperparameters and data.
+        """
+        clusterer = HDBSCANClusterer(
+            min_cluster_size=hyperparams["min_cluster_size"],
+            min_samples=hyperparams["min_samples"],
+            metric=config.fixed["metric"],
+            cluster_selection_epsilon=hyperparams["cluster_selection_epsilon"],
+            cluster_selection_method=hyperparams["cluster_selection_method"],
+            alpha=hyperparams["alpha"],
         )
+        try:
+            clusterer.validate_hyperparameters(n_samples)
+            model = clusterer.fit_hdbscan(embedding_matrix)
+        except Exception as exc:  # noqa: BLE001 - an invalid/failed trial shouldn't abort the study
+            return {"status": "invalid", "detail": str(exc), "hyperparams": hyperparams}
+
+        labels = model.labels_
+        probabilities = model.probabilities_
+        metrics_result = clusterer.compute_metrics(embedding_matrix, labels)
+        relative_validity = compute_relative_validity_index(embedding_matrix, labels, config.fixed["metric"])
+        return {
+            "status": "ok" if metrics_result["metrics_valid"] else "degenerate",
+            "metrics_result": metrics_result,
+            "relative_validity": relative_validity,
+            "labels": labels,
+            "probabilities": probabilities,
+            "clusterer": clusterer,
+            "hyperparams": hyperparams,
+        }
+
+    study_name = f"{slug}_hdbscan"
+    storage_path = config.study_dir / f"{study_name}_study.db"
+    study = optuna_search.build_study(storage_path, study_name, config.sampler_seed)
+
+    trial_cache: dict[int, dict] = {}
+
+    def objective(trial: optuna.Trial) -> float:
+        hyperparams = optuna_search.suggest_hyperparams(trial, config.search_space)
+        record = fit_trial(hyperparams)
+        trial_cache[trial.number] = record
+        # Persisted to the study's storage (unlike trial_cache, which is this
+        # process's own memory) so count_trial_statuses reflects every trial
+        # across every resumed invocation, not just this one.
+        trial.set_user_attr("status", record["status"])
+        if record["status"] == "invalid":
+            return optuna_search.INVALID_TRIAL_SCORE
+        return optuna_search.score_candidate(
+            record["metrics_result"], record["relative_validity"], record["labels"],
+            hyperparams["min_cluster_size"], config.objective_weights, bounds,
+        )
+
+    n_remaining = optuna_search.remaining_trials(study, config.n_trials)
+    if n_remaining > 0:
+        logger.info(
+            "run_optuna_search: running %d new trial(s) for %r (total budget=%d)",
+            n_remaining, label, config.n_trials,
+        )
+        study.optimize(objective, n_trials=n_remaining)
+    else:
+        logger.info(
+            "run_optuna_search: study %r already has >= %d trial(s); skipping new trials",
+            study_name, config.n_trials,
+        )
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    trial_history_path = config.reports_dir / f"{study_name}_optuna_trials_{timestamp}.csv"
+    optuna_search.export_trial_history(study, trial_history_path)
+
+    best_trial = optuna_search.best_trial_or_none(study)
+    if best_trial is None:
+        logger.warning("run_optuna_search: study has no trials for %r; writing nothing", label)
+        return None
+    winner = trial_cache.get(best_trial.number)
+    if winner is None:
+        logger.info(
+            "run_optuna_search: best trial #%d for %r predates this process; refitting its hyperparameters",
+            best_trial.number, label,
+        )
+        winner = fit_trial(best_trial.params)
+    if winner["status"] == "invalid":
+        logger.warning("run_optuna_search: no trial ever fit for %r; writing nothing", label)
         return None
 
     clustered_at = datetime.now(timezone.utc)
-    clusterer = HDBSCANClusterer(
-        min_cluster_size=best.hyperparams["min_cluster_size"],
-        min_samples=best.hyperparams["min_samples"],
-        metric=metric,
-        cluster_selection_epsilon=best.hyperparams["cluster_selection_epsilon"],
-        cluster_selection_method=cluster_selection_method,
-        alpha=best.hyperparams["alpha"],
-    )
-    rows = clusterer.build_assignment_rows(filtered, best.labels, best.probabilities, clustered_at)
+    clusterer: HDBSCANClusterer = winner["clusterer"]
+    rows = clusterer.build_assignment_rows(filtered, winner["labels"], winner["probabilities"], clustered_at)
     clustering_io.write_parquet(rows, HDBSCAN_CLUSTER_PARQUET_SCHEMA, assignments_output_path)
 
     embedding_backend = filtered.column("embedding_backend")[0].as_py()
     embedding_model = filtered.column("embedding_model")[0].as_py()
+    status_counts = optuna_search.count_trial_statuses(study)
+
     metrics_dict = clusterer.build_metrics_dict(
         label=label,
         input_path=input_path,
@@ -766,17 +626,31 @@ def run_sweep(
         embedding_dim=embedding_dim,
         embedding_backend=embedding_backend,
         embedding_model=embedding_model,
-        metrics_result=best.metrics_result,
-        labels=best.labels,
+        metrics_result=winner["metrics_result"],
+        labels=winner["labels"],
         clustered_at=clustered_at,
     )
-    metrics_dict["relative_validity_index"] = best.relative_validity
+    metrics_dict["relative_validity_index"] = winner["relative_validity"]
+    metrics_dict["optuna_study_summary"] = {
+        "study_name": study_name,
+        "storage_path": clustering_io.relative_to_repo_root(storage_path),
+        "trial_history_path": clustering_io.relative_to_repo_root(trial_history_path),
+        "n_trials_total_in_study": len(study.get_trials(deepcopy=False)),
+        "n_trials_ok": status_counts["ok"],
+        "n_trials_degenerate": status_counts["degenerate"],
+        "n_trials_invalid": status_counts["invalid"],
+        "best_trial_number": best_trial.number,
+        "best_score": best_trial.value,
+    }
+    metrics_dict["objective_weights"] = asdict(config.objective_weights)
     clustering_io.write_json(metrics_dict, metrics_output_path)
 
     logger.info(
-        "run_sweep: best combination for %r is %s (relative_validity=%.4f, noise=%.1f%%) -> %s, %s",
-        label, best.hyperparams, best.relative_validity,
-        best.metrics_result["noise_fraction"] * 100, assignments_output_path, metrics_output_path,
+        "run_optuna_search: best trial #%d for %r (score=%.4f, status=%s) -> %s, %s "
+        "(trials: %d ok, %d degenerate, %d invalid)",
+        best_trial.number, label, best_trial.value, winner["status"],
+        assignments_output_path, metrics_output_path,
+        status_counts["ok"], status_counts["degenerate"], status_counts["invalid"],
     )
     return assignments_output_path, metrics_output_path
 
@@ -785,49 +659,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser for this module.
 
     Returns:
-        An ``argparse.ArgumentParser`` accepting comma-separated value lists
-        for the swept hyperparameters, fixed-value flags for the un-swept
-        ones, and required input/output path flags.
+        An ``argparse.ArgumentParser`` accepting required input/output path
+        flags plus a `--config-path` override for the Optuna search config.
     """
     parser = argparse.ArgumentParser(
-        description="Cluster criterion embeddings via HDBSCAN, sweeping hyperparameters."
-    )
-    parser.add_argument(
-        "--min-cluster-size",
-        type=parse_int_list,
-        default=[HDBSCANClusterer.DEFAULT_MIN_CLUSTER_SIZE],
-        help="Comma-separated list of min_cluster_size values to try (default: 200)",
-    )
-    parser.add_argument(
-        "--min-samples",
-        type=parse_int_list,
-        default=[HDBSCANClusterer.DEFAULT_MIN_CLUSTER_SIZE],
-        help="Comma-separated list of min_samples values to try (default: 200)",
-    )
-    parser.add_argument(
-        "--cluster-selection-epsilon",
-        type=parse_float_list,
-        default=[HDBSCANClusterer.DEFAULT_CLUSTER_SELECTION_EPSILON],
-        help="Comma-separated list of cluster_selection_epsilon values to try (default: 0.0)",
-    )
-    parser.add_argument(
-        "--alpha",
-        type=parse_float_list,
-        default=[HDBSCANClusterer.DEFAULT_ALPHA],
-        help="Comma-separated list of alpha values to try (default: 1.0)",
-    )
-    parser.add_argument(
-        "--metric",
-        type=str,
-        default=HDBSCANClusterer.DEFAULT_METRIC,
-        help="Distance metric to use, held fixed across the sweep (default: euclidean)",
-    )
-    parser.add_argument(
-        "--cluster-selection-method",
-        type=str,
-        choices=["eom", "leaf"],
-        default=HDBSCANClusterer.DEFAULT_CLUSTER_SELECTION_METHOD,
-        help="Cluster selection method, held fixed across the sweep: 'eom' or 'leaf' (default: eom)",
+        description="Cluster criterion embeddings via HDBSCAN, tuned by an Optuna search."
     )
     parser.add_argument(
         "--input-path",
@@ -847,23 +683,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         help="Output metrics JSON path",
     )
+    parser.add_argument(
+        "--config-path",
+        type=Path,
+        default=REPO_ROOT / "config" / "hdbscan_optuna.yaml",
+        help="Optuna search config YAML (search space, objective weights, trial budget); "
+        "default: config/hdbscan_optuna.yaml",
+    )
     return parser
 
 
 def main() -> None:
-    """CLI entry point: sweep, cluster, and write cluster assignments/metrics."""
+    """CLI entry point: run the Optuna search and write cluster assignments/metrics."""
     logging.basicConfig(level=logging.INFO)
     args = build_arg_parser().parse_args()
-    run_sweep(
+    run_optuna_search(
         args.input_path,
         args.assignments_output_path,
         args.metrics_output_path,
-        min_cluster_size_values=args.min_cluster_size,
-        min_samples_values=args.min_samples,
-        cluster_selection_epsilon_values=args.cluster_selection_epsilon,
-        alpha_values=args.alpha,
-        metric=args.metric,
-        cluster_selection_method=args.cluster_selection_method,
+        args.config_path,
     )
 
 

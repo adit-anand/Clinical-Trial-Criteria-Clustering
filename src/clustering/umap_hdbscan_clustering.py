@@ -1,16 +1,24 @@
-"""Reduce criterion embeddings with UMAP, then cluster via HDBSCAN.
+"""Reduce criterion embeddings with UMAP, then cluster via HDBSCAN, tuned by an Optuna search.
 
-Reads the same embeddings Parquet file format `hdbscan_clustering.py` reads,
-drops rows whose embedding failed, then sweeps a grid of UMAP hyperparameter combinations
-(``n_components``/``n_neighbors``/``min_dist``). For each combination, every
-seed in a user-supplied seed list is fit ``repeats_per_seed`` times (default
-10) so the most *reproducible* seed — the one whose repeats agree most with
-each other, not the one that scores best — can be selected; HDBSCAN's own
-hyperparameters are held fixed across the whole sweep rather than swept
-(``hdbscan_clustering.py`` already covers sweeping those alone, including
-against this step's own reduced-embeddings output). The config/seed/repeat sweep
-mechanics — reducer-agnostic — live in ``reduction_sweep.py``; this module
-only supplies UMAP's own fit/validate functions and this step's I/O.
+Mirrors `pacmap_hdbscan_clustering.py` exactly, swapping PaCMAP for UMAP as
+the reducer. Reads the same embeddings Parquet file format
+`hdbscan_clustering.py` reads, drops rows whose embedding failed, then runs
+an Optuna study whose every trial suggests a combined hyperparameter set —
+UMAP's own (`n_components`/`n_neighbors`/`min_dist`) *and* HDBSCAN's own —
+from the search space defined in a `--config-path` YAML file. Each trial
+internally runs the configured `reproducibility.seeds` x `repeats_per_seed`
+grid via `reduction_sweep.evaluate_config` (unchanged reducer-agnostic
+machinery) so the most *reproducible* seed can be selected before the trial
+is scored.
+
+Each trial's composite objective score (`optuna_search.score_reduction_candidate`:
+DBCV plus trustworthiness/continuity/steadiness/cohesiveness — computed via
+`zadu`, using cosine distance per the fixed `metric` config value — folded
+with the same noise/dominant-cluster/cluster-count/micro-cluster penalties
+`hdbscan_clustering.py` uses) both drives Optuna's own trial selection and
+determines which trial's result gets written. The study is resumable, and a
+full per-trial history CSV is written under `data/clustering/reports/` on
+every run — see `optuna_search.py`.
 
 The run writes three output artifacts, at the paths given via
 `--reduced-embeddings-output-path`/`--assignments-output-path`/
@@ -25,24 +33,25 @@ The run writes three output artifacts, at the paths given via
         ``cluster_probability`` — same schema `hdbscan_clustering.py` itself
         writes.
 
-    Cluster metrics: clustering performance metrics for the winning
-        configuration, plus the winning UMAP config/seed and the full
-        config/seed/repeat sweep audit trail, so the choice is traceable
-        rather than a black box.
+    Cluster metrics: clustering performance metrics for the winning trial,
+        plus the winning UMAP config/seed and the Optuna study summary, so
+        the choice is traceable rather than a black box.
 
 Re-running this step against the same output paths overwrites all three
-existing output files wholesale; there is no append/skip-if-exists/merge
-behavior.
+existing output files (and the trial-history CSV) wholesale; only the
+Optuna study's own SQLite storage accumulates across runs.
 """
 
 import argparse
 import logging
 import sys
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
 import numpy as np
+import optuna
 import pyarrow as pa
 import umap
 
@@ -55,25 +64,13 @@ import umap
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from src.paths import label_from_slug, slug_from_filename
+from src.paths import REPO_ROOT, label_from_slug, slug_from_filename
 from src.clustering import clustering_io
+from src.clustering import optuna_search
 from src.clustering import reduction_sweep
-from src.clustering.hdbscan_clustering import (
-    HDBSCAN_CLUSTER_PARQUET_SCHEMA,
-    HDBSCANClusterer,
-    parse_float_list,
-    parse_int_list,
-)
+from src.clustering.hdbscan_clustering import HDBSCAN_CLUSTER_PARQUET_SCHEMA, HDBSCAN_PARAM_NAMES, HDBSCANClusterer
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_N_COMPONENTS = [2]
-DEFAULT_N_NEIGHBORS = [15]
-DEFAULT_MIN_DIST = [0.1]
-DEFAULT_METRIC = "euclidean"
-DEFAULT_SEEDS = [42]
-DEFAULT_REPEATS_PER_SEED = 10
-DEFAULT_HDBSCAN_MIN_CLUSTER_SIZE_VALUES = [HDBSCANClusterer.DEFAULT_MIN_CLUSTER_SIZE]
 
 UMAP_REDUCED_EMBEDDING_PARQUET_SCHEMA = pa.schema(
     [
@@ -93,7 +90,7 @@ def make_fit_umap_reduced(metric: str) -> Callable[..., np.ndarray]:
     """Bind UMAP's fixed (non-swept) distance metric into a `reduction_sweep`-compatible callable.
 
     Args:
-        metric: UMAP's own distance metric, held fixed across the whole sweep.
+        metric: UMAP's own distance metric, held fixed across the whole search.
 
     Returns:
         A callable `(embedding_matrix, seed, n_components, n_neighbors,
@@ -120,7 +117,7 @@ def validate_umap_hyperparameters(hyperparams: dict, n_samples: int) -> None:
     """Confirm one UMAP hyperparameter combination is usable for this dataset.
 
     Args:
-        hyperparams: This config's `n_components`/`n_neighbors`/`min_dist`.
+        hyperparams: This trial's `n_components`/`n_neighbors`/`min_dist`.
         n_samples: Number of embeddings available to reduce.
 
     Raises:
@@ -144,26 +141,24 @@ def validate_umap_hyperparameters(hyperparams: dict, n_samples: int) -> None:
         )
 
 
-def annotate_dimensionality_notes(candidates: list[reduction_sweep.ReducerConfigCandidate], embedding_dim: int) -> None:
-    """Append a non-fatal note to any candidate whose `n_components` doesn't meaningfully reduce dimensionality.
+def annotate_dimensionality_note(candidate: reduction_sweep.ReducerConfigCandidate, embedding_dim: int) -> None:
+    """Append a non-fatal note to the winning candidate if `n_components` doesn't meaningfully reduce dimensionality.
 
     Per the spec, `n_components >= embedding_dim` is not an error — just
-    something to surface. `ReducerConfigCandidate.notes` is a plain list, so
-    appending to it in place is safe even though the dataclass is frozen
-    (frozen only blocks reassigning the `notes` attribute itself).
+    something to surface. See `pacmap_hdbscan_clustering.annotate_dimensionality_note`
+    for the identical PaCMAP-side version of this note.
 
     Args:
-        candidates: Every candidate from this sweep, mutated in place.
+        candidate: The winning trial's candidate, mutated in place.
         embedding_dim: The original, non-reduced embedding dimensionality.
     """
-    for candidate in candidates:
-        n_components = candidate.hyperparams["n_components"]
-        if n_components >= embedding_dim:
-            candidate.notes.append(
-                f"n_components={n_components} is >= the original embedding_dim={embedding_dim}; this is "
-                "not an error, but UMAP's dimensionality reduction is not meaningfully reducing "
-                "dimensionality in this configuration"
-            )
+    n_components = candidate.hyperparams["n_components"]
+    if n_components >= embedding_dim:
+        candidate.notes.append(
+            f"n_components={n_components} is >= the original embedding_dim={embedding_dim}; this is "
+            "not an error, but UMAP's dimensionality reduction is not meaningfully reducing "
+            "dimensionality in this configuration"
+        )
 
 
 def build_reduced_embedding_rows(table: pa.Table, reduced_matrix: np.ndarray, reduced_at: datetime) -> list[dict]:
@@ -206,14 +201,19 @@ def build_metrics_dict(
     embedding_backend: str | None,
     embedding_model: str | None,
     hdbscan_clusterer: HDBSCANClusterer,
-    best: reduction_sweep.ReducerConfigCandidate,
-    all_candidates: list[reduction_sweep.ReducerConfigCandidate],
+    candidate: reduction_sweep.ReducerConfigCandidate,
     seeds: list[int],
     repeats_per_seed: int,
     umap_metric: str,
     clustered_at: datetime,
 ) -> dict:
     """Assemble the full metrics JSON payload for one UMAP+HDBSCAN run.
+
+    See `pacmap_hdbscan_clustering.build_metrics_dict` for the identical
+    PaCMAP-side version of this function; the only difference is the
+    `winning_umap_config` field name and its `min_dist` naming. The caller
+    (`run`) merges in `optuna_study_summary`/`objective_weights`/`dr_metrics`
+    afterward.
 
     Args:
         label: Human-readable label for this run, derived from `input_path`'s filename.
@@ -225,12 +225,9 @@ def build_metrics_dict(
         embedding_dim: Original (non-reduced) embedding dimensionality.
         embedding_backend: Backend recorded on the clustered rows.
         embedding_model: Model recorded on the clustered rows.
-        hdbscan_clusterer: The winning combination's `HDBSCANClusterer`
-            (built from `best.hyperparams["min_cluster_size"]` plus this
-            run's other, fixed HDBSCAN hyperparameters).
-        best: The winning `ReducerConfigCandidate`.
-        all_candidates: Every candidate tried, for the audit trail.
-        seeds: The full seed list that was swept.
+        hdbscan_clusterer: The winning trial's `HDBSCANClusterer`.
+        candidate: The winning trial's `ReducerConfigCandidate`.
+        seeds: The configured reproducibility seed list.
         repeats_per_seed: Number of repeats run per seed.
         umap_metric: UMAP's fixed distance metric.
         clustered_at: Wall-clock time this run completed.
@@ -238,7 +235,7 @@ def build_metrics_dict(
     Returns:
         A JSON-serializable dict.
     """
-    representative = reduction_sweep.representative_repeat(best)
+    representative = reduction_sweep.representative_repeat(candidate)
     base = clustering_io.build_base_metrics_dict(
         label=label,
         input_path=input_path,
@@ -268,20 +265,13 @@ def build_metrics_dict(
         "metrics": representative.metrics_result["metrics"],
         "metrics_valid": representative.metrics_result["metrics_valid"],
         "relative_validity_index": representative.relative_validity,
-        "notes": representative.metrics_result["notes"] + best.notes,
-        "winning_umap_config": {k: v for k, v in best.hyperparams.items() if k != "min_cluster_size"},
-        "winning_seed": best.winning_seed.seed,
-        "winning_seed_noise_fraction_std": best.winning_seed.noise_fraction_std,
-        "umap_config_search": {
-            "n_components_values": sorted({c.hyperparams["n_components"] for c in all_candidates}),
-            "n_neighbors_values": sorted({c.hyperparams["n_neighbors"] for c in all_candidates}),
-            "min_dist_values": sorted({c.hyperparams["min_dist"] for c in all_candidates}),
-            "min_cluster_size_values": sorted({c.hyperparams["min_cluster_size"] for c in all_candidates}),
-            "metric": umap_metric,
-            "seeds": seeds,
-            "repeats_per_seed": repeats_per_seed,
-            "candidates": reduction_sweep.serialize_candidates(all_candidates),
-        },
+        "notes": representative.metrics_result["notes"] + candidate.notes,
+        "winning_umap_config": {k: v for k, v in candidate.hyperparams.items() if k not in HDBSCAN_PARAM_NAMES},
+        "winning_seed": candidate.winning_seed.seed,
+        "winning_seed_noise_fraction_std": candidate.winning_seed.noise_fraction_std,
+        "umap_fixed_metric": umap_metric,
+        "reproducibility_seeds": seeds,
+        "reproducibility_repeats_per_seed": repeats_per_seed,
     }
 
 
@@ -290,56 +280,36 @@ def run(
     reduced_embeddings_output_path: Path,
     assignments_output_path: Path,
     metrics_output_path: Path,
-    n_components_values: list[int] = DEFAULT_N_COMPONENTS,
-    n_neighbors_values: list[int] = DEFAULT_N_NEIGHBORS,
-    min_dist_values: list[float] = DEFAULT_MIN_DIST,
-    umap_metric: str = DEFAULT_METRIC,
-    seeds: list[int] = DEFAULT_SEEDS,
-    repeats_per_seed: int = DEFAULT_REPEATS_PER_SEED,
-    hdbscan_min_cluster_size_values: list[int] = DEFAULT_HDBSCAN_MIN_CLUSTER_SIZE_VALUES,
-    hdbscan_min_samples: int = HDBSCANClusterer.DEFAULT_MIN_CLUSTER_SIZE,
-    hdbscan_metric: str = HDBSCANClusterer.DEFAULT_METRIC,
-    hdbscan_cluster_selection_epsilon: float = HDBSCANClusterer.DEFAULT_CLUSTER_SELECTION_EPSILON,
-    hdbscan_cluster_selection_method: str = HDBSCANClusterer.DEFAULT_CLUSTER_SELECTION_METHOD,
-    hdbscan_alpha: float = HDBSCANClusterer.DEFAULT_ALPHA,
+    config_path: Path,
 ) -> tuple[Path, Path, Path] | None:
-    """Run the full read-filter-sweep-write pipeline.
+    """Run the full read-filter-search-write pipeline.
+
+    See `pacmap_hdbscan_clustering.run` for the identical PaCMAP-side version
+    of this function; the only differences are UMAP's hyperparameter names
+    (`min_dist` instead of `mn_ratio`/`fp_ratio`) and output paths.
 
     Args:
         input_path: Embeddings Parquet to read.
         reduced_embeddings_output_path: Where to write reduced embeddings.
         assignments_output_path: Where to write cluster assignments.
         metrics_output_path: Where to write metrics.
-        n_components_values: UMAP `n_components` values to sweep.
-        n_neighbors_values: UMAP `n_neighbors` values to sweep.
-        min_dist_values: UMAP `min_dist` values to sweep.
-        umap_metric: UMAP's distance metric, held fixed across the sweep.
-        seeds: UMAP `random_state` values to sweep for reproducibility.
-        repeats_per_seed: Number of repeated fits per (config, seed) pair.
-        hdbscan_min_cluster_size_values: HDBSCAN `min_cluster_size` values to
-            sweep, folded into the same config grid as the UMAP
-            hyperparameters above (so a config now means a UMAP
-            hyperparameter combination *and* a `min_cluster_size` value).
-        hdbscan_min_samples: Fixed (non-swept) HDBSCAN hyperparameter; always
-            an explicit value (never `None`), so the effective `min_samples`
-            HDBSCAN fits with is never left to sklearn's own implicit fallback.
-        hdbscan_metric: Fixed (non-swept) HDBSCAN hyperparameter.
-        hdbscan_cluster_selection_epsilon: Fixed (non-swept) HDBSCAN hyperparameter.
-        hdbscan_cluster_selection_method: Fixed (non-swept) HDBSCAN hyperparameter.
-        hdbscan_alpha: Fixed (non-swept) HDBSCAN hyperparameter.
+        config_path: YAML config (combined UMAP + HDBSCAN search space,
+            objective weights, trial budget, reproducibility seeds/repeats,
+            study/report directories) — see `optuna_search.load_optuna_config`.
 
     Returns:
         `(reduced_embeddings_output_path, assignments_output_path,
-        metrics_output_path)`, or `None` if no UMAP configuration produced a
-        usable clustering result (in which case nothing is written).
+        metrics_output_path)`, or `None` if every trial in the study was
+        invalid (nothing ever fit — nothing is written in that case).
 
     Raises:
-        FileNotFoundError: If the input Parquet does not exist.
+        FileNotFoundError: If the input Parquet or `config_path` does not exist.
         ValueError: If there are no successfully-embedded rows to cluster,
-            if embedding dimensionality is inconsistent, or if the sweep
-            grid/seed list/repeat count exceed `reduction_sweep`'s caps.
+            if embedding dimensionality is inconsistent, or if `config_path`
+            fails validation (see `optuna_search.load_optuna_config`).
     """
-    label = label_from_slug(slug_from_filename(input_path.name, "_trials_embeddings.parquet"))
+    slug = slug_from_filename(input_path.name, "_trials_embeddings.parquet")
+    label = label_from_slug(slug)
 
     table = clustering_io.read_embeddings_parquet(input_path)
     total_rows = table.num_rows
@@ -350,45 +320,130 @@ def run(
     embedding_dim = clustering_io.validate_embedding_dimensions(filtered)
     embedding_matrix = clustering_io.extract_embedding_matrix(filtered)
 
+    config = optuna_search.load_optuna_config(config_path, require_reproducibility=True)
+    bounds = optuna_search.EligibilityBounds(
+        min_n_clusters=HDBSCANClusterer.MIN_N_CLUSTERS,
+        max_n_clusters=HDBSCANClusterer.MAX_N_CLUSTERS,
+        max_cluster_share=HDBSCANClusterer.MAX_CLUSTER_SHARE,
+    )
+    umap_metric = config.fixed["metric"]
+    fit_reduced = make_fit_umap_reduced(umap_metric)
+
+    reducer_space = {name: spec for name, spec in config.search_space.items() if name not in HDBSCAN_PARAM_NAMES}
+    hdbscan_space = {name: spec for name, spec in config.search_space.items() if name in HDBSCAN_PARAM_NAMES}
+
     def build_hdbscan_clusterer(hyperparams: dict) -> HDBSCANClusterer:
         return HDBSCANClusterer(
             min_cluster_size=hyperparams["min_cluster_size"],
-            min_samples=hdbscan_min_samples,
-            metric=hdbscan_metric,
-            cluster_selection_epsilon=hdbscan_cluster_selection_epsilon,
-            cluster_selection_method=hdbscan_cluster_selection_method,
-            alpha=hdbscan_alpha,
+            min_samples=hyperparams["min_samples"],
+            metric=umap_metric,
+            cluster_selection_epsilon=hyperparams["cluster_selection_epsilon"],
+            cluster_selection_method=hyperparams["cluster_selection_method"],
+            alpha=hyperparams["alpha"],
         )
 
-    fit_reduced = make_fit_umap_reduced(umap_metric)
-    best, all_candidates = reduction_sweep.run_reduction_sweep(
-        fit_reduced=fit_reduced,
-        validate_fn=validate_umap_hyperparameters,
-        hyperparameter_values={
-            "n_components": n_components_values,
-            "n_neighbors": n_neighbors_values,
-            "min_dist": min_dist_values,
-            "min_cluster_size": hdbscan_min_cluster_size_values,
-        },
-        seeds=seeds,
-        repeats_per_seed=repeats_per_seed,
-        build_hdbscan_clusterer=build_hdbscan_clusterer,
-        embedding_matrix=embedding_matrix,
-        n_samples=n_samples,
-    )
-    annotate_dimensionality_notes(all_candidates, embedding_dim)
+    def evaluate_trial(hyperparams: dict) -> dict:
+        """Evaluate one combined UMAP+HDBSCAN hyperparameter combination into a trial-cache-shaped record.
 
-    if best is None:
-        logger.warning(
-            "run: no UMAP configuration produced a usable relative validity index for %r; writing nothing",
-            label,
+        Pulled out of the objective closure so the post-`study.optimize` winner
+        resolution can call it too: a resumed study's `study.best_trial` may be
+        from a *previous* process invocation, never present in this process's
+        own `trial_cache` (Optuna's storage persists only hyperparameters/score,
+        not our fit artifacts) — re-evaluating is the only way to recover its
+        reduced matrix/labels/probabilities, and is safe since both UMAP (given
+        the same `random_state`) and HDBSCAN are fully deterministic.
+        """
+        candidate = reduction_sweep.evaluate_config(
+            fit_reduced,
+            hyperparams,
+            config.reproducibility.seeds,
+            config.reproducibility.repeats_per_seed,
+            validate_umap_hyperparameters,
+            build_hdbscan_clusterer,
+            embedding_matrix,
+            n_samples,
         )
+        if candidate.status == "invalid":
+            return {"status": "invalid", "candidate": candidate, "hyperparams": hyperparams}
+
+        representative = reduction_sweep.representative_repeat(candidate)
+        dr_metrics = optuna_search.compute_dr_metrics(
+            embedding_matrix, representative.reduced_matrix, representative.labels, umap_metric
+        )
+        return {
+            "status": candidate.status,
+            "candidate": candidate,
+            "dr_metrics": dr_metrics,
+            "hyperparams": hyperparams,
+        }
+
+    study_name = f"{slug}_umap_hdbscan"
+    storage_path = config.study_dir / f"{study_name}_study.db"
+    study = optuna_search.build_study(storage_path, study_name, config.sampler_seed)
+
+    trial_cache: dict[int, dict] = {}
+
+    def objective(trial: optuna.Trial) -> float:
+        hyperparams = {
+            **optuna_search.suggest_hyperparams(trial, reducer_space),
+            **optuna_search.suggest_hyperparams(trial, hdbscan_space),
+        }
+        record = evaluate_trial(hyperparams)
+        reduction_sweep.log_config_candidate(trial.number, record["candidate"])
+        trial_cache[trial.number] = record
+        # Persisted to the study's storage (unlike trial_cache, which is this
+        # process's own memory) so count_trial_statuses reflects every trial
+        # across every resumed invocation, not just this one.
+        trial.set_user_attr("status", record["status"])
+
+        if record["status"] == "invalid":
+            return optuna_search.INVALID_TRIAL_SCORE
+
+        representative = reduction_sweep.representative_repeat(record["candidate"])
+        return optuna_search.score_reduction_candidate(
+            representative.metrics_result,
+            representative.relative_validity,
+            representative.labels,
+            hyperparams["min_cluster_size"],
+            config.objective_weights,
+            record["dr_metrics"],
+            bounds,
+        )
+
+    n_remaining = optuna_search.remaining_trials(study, config.n_trials)
+    if n_remaining > 0:
+        logger.info("run: running %d new trial(s) for %r (total budget=%d)", n_remaining, label, config.n_trials)
+        study.optimize(objective, n_trials=n_remaining)
+    else:
+        logger.info("run: study %r already has >= %d trial(s); skipping new trials", study_name, config.n_trials)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    trial_history_path = config.reports_dir / f"{study_name}_optuna_trials_{timestamp}.csv"
+    optuna_search.export_trial_history(study, trial_history_path)
+
+    status_counts = optuna_search.count_trial_statuses(study)
+
+    best_trial = optuna_search.best_trial_or_none(study)
+    if best_trial is None:
+        logger.warning("run: study has no trials for %r; writing nothing", label)
+        return None
+    winner = trial_cache.get(best_trial.number)
+    if winner is None:
+        logger.info(
+            "run: best trial #%d for %r predates this process; re-evaluating its hyperparameters",
+            best_trial.number, label,
+        )
+        winner = evaluate_trial(best_trial.params)
+    if winner["status"] == "invalid":
+        logger.warning("run: no trial ever fit for %r; writing nothing", label)
         return None
 
-    representative = reduction_sweep.representative_repeat(best)
-    clustered_at = datetime.now(timezone.utc)
-    hdbscan_clusterer = build_hdbscan_clusterer(best.hyperparams)
+    candidate: reduction_sweep.ReducerConfigCandidate = winner["candidate"]
+    annotate_dimensionality_note(candidate, embedding_dim)
+    representative = reduction_sweep.representative_repeat(candidate)
+    hdbscan_clusterer = build_hdbscan_clusterer(winner["hyperparams"])
 
+    clustered_at = datetime.now(timezone.utc)
     reduced_rows = build_reduced_embedding_rows(filtered, representative.reduced_matrix, clustered_at)
     clustering_io.write_parquet(reduced_rows, UMAP_REDUCED_EMBEDDING_PARQUET_SCHEMA, reduced_embeddings_output_path)
 
@@ -410,22 +465,37 @@ def run(
         embedding_backend=embedding_backend,
         embedding_model=embedding_model,
         hdbscan_clusterer=hdbscan_clusterer,
-        best=best,
-        all_candidates=all_candidates,
-        seeds=seeds,
-        repeats_per_seed=repeats_per_seed,
+        candidate=candidate,
+        seeds=config.reproducibility.seeds,
+        repeats_per_seed=config.reproducibility.repeats_per_seed,
         umap_metric=umap_metric,
         clustered_at=clustered_at,
     )
+    dr_metrics = winner["dr_metrics"]
+    metrics_dict["dr_metrics"] = asdict(dr_metrics) if dr_metrics is not None else None
+    metrics_dict["optuna_study_summary"] = {
+        "study_name": study_name,
+        "storage_path": clustering_io.relative_to_repo_root(storage_path),
+        "trial_history_path": clustering_io.relative_to_repo_root(trial_history_path),
+        "n_trials_total_in_study": len(study.get_trials(deepcopy=False)),
+        "n_trials_ok": status_counts["ok"],
+        "n_trials_degenerate": status_counts["degenerate"],
+        "n_trials_invalid": status_counts["invalid"],
+        "best_trial_number": best_trial.number,
+        "best_score": best_trial.value,
+    }
+    metrics_dict["objective_weights"] = asdict(config.objective_weights)
     clustering_io.write_json(metrics_dict, metrics_output_path)
 
     logger.info(
-        "run: winning UMAP config %s (seed=%d) clustered %d row(s) into %d cluster(s) for %r -> %s, %s, %s "
-        "(noise=%d/%d (%.1f%%), silhouette=%s, excluded=%d failed-embedding row(s))",
-        best.hyperparams, best.winning_seed.seed, n_samples, representative.metrics_result["n_clusters_actual"],
-        label, reduced_embeddings_output_path, assignments_output_path, metrics_output_path,
-        representative.metrics_result["noise_count"], n_samples, representative.metrics_result["noise_fraction"] * 100,
-        representative.metrics_result["metrics"]["silhouette_score"], n_excluded,
+        "run: best trial #%d UMAP config %s (seed=%d) clustered %d row(s) into %d cluster(s) for %r -> %s, %s, %s "
+        "(noise=%d/%d (%.1f%%), silhouette=%s, excluded=%d failed-embedding row(s), "
+        "trials: %d ok, %d degenerate, %d invalid)",
+        best_trial.number, candidate.hyperparams, candidate.winning_seed.seed, n_samples,
+        representative.metrics_result["n_clusters_actual"], label, reduced_embeddings_output_path,
+        assignments_output_path, metrics_output_path, representative.metrics_result["noise_count"], n_samples,
+        representative.metrics_result["noise_fraction"] * 100, representative.metrics_result["metrics"]["silhouette_score"],
+        n_excluded, status_counts["ok"], status_counts["degenerate"], status_counts["invalid"],
     )
     return reduced_embeddings_output_path, assignments_output_path, metrics_output_path
 
@@ -434,91 +504,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser for this module.
 
     Returns:
-        An ``argparse.ArgumentParser`` accepting UMAP sweep options, fixed
-        HDBSCAN hyperparameter flags, and required input/output path flags.
-        Flag names are agnostic to which algorithm they configure (e.g.
-        ``--n-components``, ``--cluster-selection-method``); the one
-        exception is ``--distance-metric``, used for UMAP's own distance
-        metric since a bare ``--metric`` would be ambiguous with HDBSCAN's
-        (mirrored by `pacmap_hdbscan_clustering.build_arg_parser`, which
-        uses the same ``--distance-metric`` name for PaCMAP's).
+        An ``argparse.ArgumentParser`` accepting required input/output path
+        flags plus a `--config-path` override for the Optuna search config.
     """
     parser = argparse.ArgumentParser(
-        description="Reduce criterion embeddings via UMAP, then cluster via HDBSCAN."
-    )
-    parser.add_argument(
-        "--n-components",
-        type=parse_int_list,
-        default=DEFAULT_N_COMPONENTS,
-        help="Comma-separated list of UMAP n_components values to sweep (default: 2)",
-    )
-    parser.add_argument(
-        "--n-neighbors",
-        type=parse_int_list,
-        default=DEFAULT_N_NEIGHBORS,
-        help="Comma-separated list of UMAP n_neighbors values to sweep (default: 15)",
-    )
-    parser.add_argument(
-        "--min-dist",
-        type=parse_float_list,
-        default=DEFAULT_MIN_DIST,
-        help="Comma-separated list of UMAP min_dist values to sweep (default: 0.1)",
-    )
-    parser.add_argument(
-        "--distance-metric",
-        type=str,
-        default=DEFAULT_METRIC,
-        help="UMAP distance metric, held fixed across the sweep (default: euclidean)",
-    )
-    parser.add_argument(
-        "--seeds",
-        type=parse_int_list,
-        default=DEFAULT_SEEDS,
-        help="Comma-separated list of seeds to sweep for reproducibility (default: 42)",
-    )
-    parser.add_argument(
-        "--repeats-per-seed",
-        type=int,
-        default=DEFAULT_REPEATS_PER_SEED,
-        help="Number of repeated fits per (config, seed) pair, used to measure reproducibility (default: 10)",
-    )
-    parser.add_argument(
-        "--min-cluster-size",
-        type=parse_int_list,
-        default=DEFAULT_HDBSCAN_MIN_CLUSTER_SIZE_VALUES,
-        help="Comma-separated list of HDBSCAN min_cluster_size values to sweep, folded into the "
-        "same config grid as the UMAP hyperparameters above (default: 200)",
-    )
-    parser.add_argument(
-        "--min-samples",
-        type=int,
-        default=HDBSCANClusterer.DEFAULT_MIN_CLUSTER_SIZE,
-        help="Fixed HDBSCAN min_samples, not swept (default: 200)",
-    )
-    parser.add_argument(
-        "--metric",
-        type=str,
-        default=HDBSCANClusterer.DEFAULT_METRIC,
-        help="Fixed HDBSCAN distance metric, not swept (default: euclidean)",
-    )
-    parser.add_argument(
-        "--cluster-selection-epsilon",
-        type=float,
-        default=HDBSCANClusterer.DEFAULT_CLUSTER_SELECTION_EPSILON,
-        help="Fixed HDBSCAN cluster_selection_epsilon, not swept (default: 0.0)",
-    )
-    parser.add_argument(
-        "--cluster-selection-method",
-        type=str,
-        choices=["eom", "leaf"],
-        default=HDBSCANClusterer.DEFAULT_CLUSTER_SELECTION_METHOD,
-        help="Fixed HDBSCAN cluster_selection_method, not swept (default: eom)",
-    )
-    parser.add_argument(
-        "--alpha",
-        type=float,
-        default=HDBSCANClusterer.DEFAULT_ALPHA,
-        help="Fixed HDBSCAN alpha, not swept (default: 1.0)",
+        description="Reduce criterion embeddings via UMAP, then cluster via HDBSCAN, tuned by an Optuna search."
     )
     parser.add_argument(
         "--input-path",
@@ -544,11 +534,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         help="Output metrics JSON path",
     )
+    parser.add_argument(
+        "--config-path",
+        type=Path,
+        default=REPO_ROOT / "config" / "umap_hdbscan_optuna.yaml",
+        help="Optuna search config YAML (combined UMAP + HDBSCAN search space, objective "
+        "weights, trial budget, reproducibility seeds/repeats); default: "
+        "config/umap_hdbscan_optuna.yaml",
+    )
     return parser
 
 
 def main() -> None:
-    """CLI entry point: sweep, cluster, and write reduced embeddings/cluster assignments/metrics."""
+    """CLI entry point: run the Optuna search and write reduced embeddings/cluster assignments/metrics."""
     logging.basicConfig(level=logging.INFO)
 
     args = build_arg_parser().parse_args()
@@ -558,18 +556,7 @@ def main() -> None:
         args.reduced_embeddings_output_path,
         args.assignments_output_path,
         args.metrics_output_path,
-        n_components_values=args.n_components,
-        n_neighbors_values=args.n_neighbors,
-        min_dist_values=args.min_dist,
-        umap_metric=args.distance_metric,
-        seeds=args.seeds,
-        repeats_per_seed=args.repeats_per_seed,
-        hdbscan_min_cluster_size_values=args.min_cluster_size,
-        hdbscan_min_samples=args.min_samples,
-        hdbscan_metric=args.metric,
-        hdbscan_cluster_selection_epsilon=args.cluster_selection_epsilon,
-        hdbscan_cluster_selection_method=args.cluster_selection_method,
-        hdbscan_alpha=args.alpha,
+        args.config_path,
     )
 
 

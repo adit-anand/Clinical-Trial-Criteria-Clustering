@@ -25,23 +25,25 @@ as the next step's input path.
    combination's cluster assignments plus performance metrics.
 4. **`src/clustering/hdbscan_clustering.py`** — reads the same Parquet file
    and clusters the embedding vectors via HDBSCAN (density-based clustering,
-   no fixed cluster count), sweeping the Cartesian product of its
-   hyperparameter value lists (a single value per flag is a sweep of size
-   one) and writing the best-performing combination's cluster assignments
+   no fixed cluster count), tuned by an Optuna hyperparameter search (search
+   space/objective weights/trial budget come from a `--config-path` YAML
+   file, not CLI flags) and writing the winning trial's cluster assignments
    plus performance metrics. Read/validate/write logic shared between the
-   clustering approaches lives in `src/clustering/clustering_io.py`.
+   clustering approaches lives in `src/clustering/clustering_io.py`; the
+   Optuna search engine shared by every HDBSCAN-based step lives in
+   `src/clustering/optuna_search.py`.
 5. **`src/clustering/clustering_report.py`** — reads whichever of the
    clustering steps' metrics JSON paths are passed to it, and writes one
    consolidated Markdown report comparing their performance side by side.
 6. **`src/clustering/hdbscan_sweep.py`** — a backward-compatible alias for
-   step 4's CLI; holds no logic of its own (step 4 always sweeps now, so
-   there's no separate sweep step to have its own module).
+   step 4's CLI; holds no logic of its own.
 7. **`src/clustering/umap_hdbscan_clustering.py`** — reduces embeddings with
-   UMAP (sweeping UMAP's own hyperparameters and a user-supplied seed list
-   for reproducibility) before clustering the reduced vectors with HDBSCAN,
-   writing the reduced embeddings plus cluster assignments and metrics.
+   UMAP before clustering the reduced vectors with HDBSCAN, both tuned
+   jointly by one Optuna search (each trial also runs a configured
+   seeds/repeats-per-seed grid internally to pick the most reproducible
+   seed), writing the reduced embeddings plus cluster assignments and metrics.
 8. **`src/clustering/pacmap_hdbscan_clustering.py`** — the same idea as step
-   7, reducing with PaCMAP instead of UMAP. The config/seed/repeat sweep
+   7, reducing with PaCMAP instead of UMAP. The seed/repeat reproducibility
    mechanics both steps share live in `src/clustering/reduction_sweep.py`.
 9. **`src/clustering/clustering_scatterplot.py`** — reads whichever
    clustering method's output paths are passed to it and writes an
@@ -64,6 +66,10 @@ small bootstrap at the top of each one puts the repo root on `sys.path`
 when it detects direct execution, so both styles behave identically.
 
 ```
+config/
+├── hdbscan_optuna.yaml                   # Optuna search config for step 4
+├── pacmap_hdbscan_optuna.yaml             # Optuna search config for step 8
+└── umap_hdbscan_optuna.yaml               # Optuna search config for step 7
 src/
 ├── paths.py                              # shared REPO_ROOT constant
 ├── preprocessing/
@@ -77,10 +83,11 @@ src/
 └── clustering/
     ├── clustering_io.py                  # shared read/write logic
     ├── kmeans_clustering.py              # step 3
+    ├── optuna_search.py                  # shared Optuna search engine (steps 4, 7-8)
     ├── hdbscan_clustering.py             # step 4
     ├── clustering_report.py              # step 5
     ├── hdbscan_sweep.py                  # step 6 (alias for step 4, no logic)
-    ├── reduction_sweep.py                # shared config/seed/repeat sweep engine (steps 7-8)
+    ├── reduction_sweep.py                # shared seed/repeat reproducibility engine (steps 7-8)
     ├── umap_hdbscan_clustering.py        # step 7
     ├── pacmap_hdbscan_clustering.py      # step 8
     └── clustering_scatterplot.py         # step 9
@@ -95,11 +102,15 @@ so adding another clustering algorithm means adding one new sibling module,
 not touching the shared I/O layer or the other algorithms.
 `clustering_report.py` builds on top of that same layer without modifying
 it; `hdbscan_sweep.py` is a thin alias re-exporting `hdbscan_clustering.py`'s
-CLI and holds no logic of its own. `umap_hdbscan_clustering.py` and
-`pacmap_hdbscan_clustering.py` additionally share `reduction_sweep.py`, which
-holds the reducer-agnostic config/seed/repeat sweep mechanics common to both
-(picking the most reproducible seed per configuration, then the
-best-scoring configuration overall) so neither module re-implements it.
+CLI and holds no logic of its own. The three HDBSCAN-based steps (4, 7, 8)
+share `optuna_search.py` — the Optuna config loader, hyperparameter
+suggestion, composite objective scoring, and study-lifecycle/trial-history
+mechanics common to all three, so none of them re-implements it.
+`umap_hdbscan_clustering.py` and `pacmap_hdbscan_clustering.py` additionally
+share `reduction_sweep.py`, which holds the reducer-agnostic seed/repeat
+reproducibility mechanics each of their Optuna trials runs internally
+(picking the most reproducible seed, then a representative repeat) so
+neither module re-implements it.
 `clustering_scatterplot.py` reads whichever of the four algorithms' output
 already exists (via its own `VISUALIZATION_SPECS` registry, one entry per
 algorithm, following the same "no branching elsewhere" pattern
@@ -279,80 +290,80 @@ offered. `kmeans_params.metric` in the metrics JSON records which was used.
 uv run python -m src.clustering.hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --assignments-output-path data/clustering/hdbscan/breast_cancer_trials_hdbscan_clusters.parquet \
-  --metrics-output-path data/clustering/hdbscan/breast_cancer_trials_hdbscan_cluster_metrics.json \
-  --min-cluster-size 5,10,15 --alpha 0.8,1.0,1.2
+  --metrics-output-path data/clustering/hdbscan/breast_cancer_trials_hdbscan_cluster_metrics.json
 ```
 
 This reads the same embeddings Parquet file format as the k-means step
-(given via `--input-path`), drops rows whose embedding failed, and fits
-HDBSCAN (density-based clustering) once per
-combination in the Cartesian product of the supplied
-`--min-cluster-size`/`--min-samples`/`--cluster-selection-epsilon`/`--alpha`
-value lists (`--metric`/`--cluster-selection-method` are held fixed across
-the whole sweep, not swept). Passing a single value for each — the
-default — is simply a sweep of size one: every invocation goes through the
-same combination-evaluation and winner-selection logic, whether there's one
-candidate or many. Unlike k-means, there is no cluster count to choose for
+(given via `--input-path`), drops rows whose embedding failed, and runs an
+Optuna study that fits HDBSCAN (density-based clustering) once per trial,
+suggesting `min_cluster_size`/`min_samples`/`cluster_selection_epsilon`/
+`cluster_selection_method`/`alpha` from the search space defined in
+`--config-path`'s YAML file (default: `config/hdbscan_optuna.yaml`;
+`metric` stays a fixed scalar in that file, not part of the search space —
+DBCV scores computed under different distance metrics aren't comparable
+within one study). Unlike k-means, there is no cluster count to choose for
 any individual fit — HDBSCAN discovers clusters of varying density directly
 from the data, and explicitly labels points that don't belong to any
 cluster as noise (`cluster_id == -1`).
 
-Each combination's clustering performance metrics are logged as the sweep
-runs; no separate sweep-results file is written. Once every combination has
-been tried, the single best one — by relative validity index (DBCV, higher
-is better), with noise fraction (lower is better) as a tiebreaker — has its
-cluster assignments and metrics written to `--assignments-output-path`/
-`--metrics-output-path`.
+Each trial's composite objective score — DBCV folded with
+noise-fraction/dominant-cluster-share/cluster-count/micro-cluster-fragmentation
+penalties (weights configurable in the YAML file) — is the single ranking
+criterion: it drives Optuna's own trial selection *and* determines which
+trial's result gets written to `--assignments-output-path`/
+`--metrics-output-path`. The study is resumable (SQLite-backed, under the
+YAML file's `study_dir`): re-running the same command against the same
+input continues the same study rather than starting over, and the
+configured `n_trials` (default `50`, capped at `100`) is a *total* budget
+across resumes, not re-added every invocation. A full per-trial history CSV
+is written under the YAML file's `reports_dir`
+(`data/clustering/reports/` by default) on every run.
 
 The Parquet file has one row per successfully-embedded criterion, containing
 `nct_id`, `study_first_posted_date`, `criterion_text`, `criterion_type`,
 `cluster_id` (`-1` for noise), `cluster_probability` (HDBSCAN's cluster
 membership strength, `0.0` for noise points), `embedding_backend`,
 `embedding_model`, and `clustered_at`. The JSON file reports run provenance
-(sample/cluster counts, the winning combination's HDBSCAN parameters,
+(sample/cluster counts, the winning trial's HDBSCAN parameters,
 `noise_count`/`noise_fraction`) plus clustering performance metrics —
 silhouette score, the Davies-Bouldin index, the Calinski-Harabasz index
-(computed only over non-noise points), and `relative_validity_index` (the
-DBCV score that decided the winner). As with the k-means step, the first
+(computed only over non-noise points), `relative_validity_index` (the DBCV
+score), and an `optuna_study_summary` block (trial counts by status, the
+winning trial number/score, and the study/trial-history file paths) plus
+the `objective_weights` actually used. As with the k-means step, the first
 three metrics require between 2 and `n_non_noise - 1` distinct clusters
 among non-noise points to be computable; if a run falls outside that range
 (e.g. an all-noise result), they are reported as `null` with an explanatory
 note and `metrics_valid` is `false`. Independently of computability, a
-combination is also only considered valid if it satisfies three further,
+trial is also only considered fully valid if it satisfies three further,
 business-level constraints: its resulting cluster count falls between
 `HDBSCANClusterer.MIN_N_CLUSTERS` (`10`) and `MAX_N_CLUSTERS` (`100`); no
 single cluster holds more than `MAX_CLUSTER_SHARE` (`20%`) of all points;
-and `noise_fraction` does not exceed `MAX_NOISE_FRACTION` (`20%`). A
-combination that fails any of these still has its metrics computed and
-reported where possible (so it remains inspectable), but is treated as
-invalid/degenerate and is never eligible to win, with its own explanatory
-note per violated constraint.
+and `noise_fraction` does not exceed `MAX_NOISE_FRACTION` (`20%`). A trial
+that fails any of these still has its metrics computed and reported where
+possible (so it remains inspectable), but is treated as degenerate and
+scores lower via the same continuous penalty terms — with its own
+explanatory note per violated constraint.
 
-A combination invalid for the dataset (e.g. `--min-samples` exceeding the
-sample count) is logged as skipped rather than aborting the rest of the
-sweep; a combination that fits but produces a degenerate result (e.g. all
-noise) is logged but never eligible to win. If no combination produces a
-usable relative validity index — including when only the single default
-combination was tried and it's degenerate — nothing is written. The total
-number of combinations (the product of all four swept lists' lengths) is
-capped at 100; exceeding it raises an error before any fitting is attempted.
+A trial whose suggested hyperparameters are invalid for the dataset (e.g.
+`min_samples` exceeding the sample count) is logged and scored with a
+guaranteed-worst sentinel rather than aborting the study. If every trial
+that fit is degenerate, the least-bad trial by the same composite score is
+still written, with `metrics_valid=false` recorded — nothing is written
+only if every trial in the study was invalid (never fit at all).
 
 Re-running this step against the same output paths overwrites both existing
-output files; there is no append/skip-if-exists/merge behavior.
+output files (and the trial-history CSV) wholesale; only the Optuna study's
+own SQLite storage accumulates across runs.
 
 ### Arguments
 
 | Argument                        | Required | Description                                                                 |
 | --------------------------------- | -------- | ---------------------------------------------------------------------------- |
-| `--min-cluster-size`               | no       | Comma-separated list of `min_cluster_size` values to try (default: `200`). |
-| `--min-samples`                    | no       | Comma-separated list of `min_samples` values to try (default: `200`). |
-| `--cluster-selection-epsilon`      | no       | Comma-separated list of `cluster_selection_epsilon` values to try (default: `0.0`). |
-| `--alpha`                          | no       | Comma-separated list of `alpha` values to try (default: `1.0`). |
-| `--metric`                         | no       | Distance metric to use, held fixed across the sweep (default: `euclidean`). |
-| `--cluster-selection-method`       | no       | `eom` (excess of mass) or `leaf`, held fixed across the sweep (default: `eom`). |
 | `--input-path`                     | yes      | Input embeddings Parquet path (as written by `criteria_embedding.py`). |
 | `--assignments-output-path`        | yes      | Output cluster-assignments Parquet path. |
 | `--metrics-output-path`            | yes      | Output metrics JSON path. |
+| `--config-path`                    | no       | Optuna search config YAML (search space, objective weights, trial budget, study/report directories); default: `config/hdbscan_optuna.yaml`. |
 
 ## 5. Clustering performance report
 
@@ -396,24 +407,20 @@ wholesale.
 | `--pacmap-hdbscan-metrics-path` | no | PaCMAP + HDBSCAN metrics JSON path (omit if not yet run). |
 | `--print`        | no       | Also print the generated report to stdout, in addition to writing the file. |
 
-## 6. HDBSCAN hyperparameter sweep (alias)
+## 6. HDBSCAN hyperparameter search (alias)
 
 ```bash
 uv run python -m src.clustering.hdbscan_sweep \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --assignments-output-path data/clustering/hdbscan/breast_cancer_trials_hdbscan_clusters.parquet \
-  --metrics-output-path data/clustering/hdbscan/breast_cancer_trials_hdbscan_cluster_metrics.json \
-  --min-cluster-size 5,10,15 --alpha 0.8,1.0,1.2
+  --metrics-output-path data/clustering/hdbscan/breast_cancer_trials_hdbscan_cluster_metrics.json
 ```
 
-`hdbscan_clustering.py` (step 4) now always sweeps — a single value per flag
-is simply a sweep of size one — so there is no longer a distinct sweep step.
 This module is kept only so existing invocations of
 `uv run python -m src.clustering.hdbscan_sweep ...` keep working: it holds
-no logic of its own and just re-exports step 4's CLI and functions under
-this module's name. The command above is exactly equivalent to running
-step 4's command directly — see step 4 for the full behavior, output
-schema, and arguments.
+no logic of its own and just re-exports step 4's CLI under this module's
+name. The command above is exactly equivalent to running step 4's command
+directly — see step 4 for the full behavior, output schema, and arguments.
 
 ## 7. UMAP + HDBSCAN clustering
 
@@ -422,42 +429,46 @@ uv run python -m src.clustering.umap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --reduced-embeddings-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_reduced_embeddings.parquet \
   --assignments-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_clusters.parquet \
-  --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
-  --n-neighbors 10,15,30 --seeds 1,2,3,4,5
+  --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json
 ```
 
 This reads the same embeddings Parquet file format as the other clustering
 steps (given via `--input-path`), drops rows whose embedding failed, and
-reduces the remaining embedding vectors' dimensionality with UMAP before
-clustering the reduced vectors with HDBSCAN. Three things are swept, nested
-in this order:
+runs an Optuna study whose every trial reduces the remaining embedding
+vectors' dimensionality with UMAP before clustering the reduced vectors
+with HDBSCAN. Each trial suggests a *combined* hyperparameter set — UMAP's
+own (`n_components`/`n_neighbors`/`min_dist`) *and* HDBSCAN's own
+(`min_cluster_size`/`min_samples`/`cluster_selection_epsilon`/
+`cluster_selection_method`/`alpha`) — from the search space defined in
+`--config-path`'s YAML file (default: `config/umap_hdbscan_optuna.yaml`;
+`metric` stays a fixed scalar there, defaulting to `cosine` rather than
+`euclidean` — it's shared by UMAP's own fit, HDBSCAN's own fit, DBCV, and
+the dimensionality-reduction fidelity metrics below).
 
-1. **UMAP configuration** — the Cartesian product of `--n-components`,
-   `--n-neighbors`, and `--min-dist` value lists (`--distance-metric`
-   is held fixed across the whole sweep, not swept).
-2. **Seed** — every value in `--seeds`, UMAP's `random_state` for that
-   configuration.
-3. **Repeat** — `--repeats-per-seed` (default `10`) independent fits of the
-   same (configuration, seed) pair, used to measure how *reproducible* that
-   seed is.
+Within one trial, two things happen nested, exactly as before:
 
-For each configuration, the seed whose repeats are most mutually
-consistent (lowest standard deviation of noise fraction across its repeats)
-is chosen — not the seed with the best score — and one of its repeats (the
-one closest to that seed's own mean noise fraction) becomes that
-configuration's representative result. Across configurations, the one
-whose representative result has the highest relative validity index (DBCV),
-tie-broken by the lowest noise fraction, wins overall — the same
-winner-selection semantics `hdbscan_clustering.py` already uses.
-`--min-cluster-size` is itself swept too — folded into the same
-config grid as the UMAP hyperparameters above, so a "config" here means a
-UMAP hyperparameter combination *and* a `min_cluster_size` value together
-(mind the combinatorial caps below when widening this too). HDBSCAN's other
-hyperparameters are still held fixed across the whole sweep; run
-`hdbscan_clustering.py` separately against this step's own
-reduced-embeddings output (via its own `--input-path`) if you also want to
-sweep those. It writes the reduced embeddings, cluster assignments, and
-metrics to `--reduced-embeddings-output-path`/`--assignments-output-path`/
+1. **Seed** — every value in the YAML file's `reproducibility.seeds` list,
+   UMAP's `random_state` for that trial's hyperparameters.
+2. **Repeat** — `reproducibility.repeats_per_seed` independent fits of the
+   same (trial, seed) pair, used to measure how *reproducible* that seed is.
+
+The seed whose repeats are most mutually consistent (lowest standard
+deviation of noise fraction across its repeats) is chosen — not the seed
+with the best score — and one of its repeats (the one closest to that
+seed's own mean noise fraction) becomes that trial's representative result.
+That representative result's composite objective score — DBCV plus
+trustworthiness/continuity/steadiness/cohesiveness (computed via
+[`zadu`](https://github.com/hj-n/zadu) under cosine distance; stress is
+deliberately excluded), folded with the same noise/dominant-cluster/
+cluster-count/micro-cluster penalties step 4 uses — is the single ranking
+criterion: it drives Optuna's own trial selection *and* determines which
+trial's result gets written. The study is resumable, and a full per-trial
+history CSV is written under the YAML file's `reports_dir` on every run —
+see step 4 for the resumable-budget/degenerate-fallback/nothing-written
+semantics, which are identical here.
+
+It writes the reduced embeddings, cluster assignments, and metrics to
+`--reduced-embeddings-output-path`/`--assignments-output-path`/
 `--metrics-output-path`.
 
 The reduced-embeddings Parquet file has one row per successfully-embedded
@@ -468,45 +479,35 @@ source criteria via `nct_id` without needing the cluster assignments. The
 cluster-assignments Parquet file has the same schema `hdbscan_clustering.py`
 itself writes. The metrics JSON has the same envelope and clustering-quality
 fields as an ordinary HDBSCAN run, plus `winning_umap_config`,
-`winning_seed`, `winning_seed_noise_fraction_std`, and a full
-`umap_config_search` audit trail recording every configuration/seed/repeat
-tried, not just the winner.
+`winning_seed`, `winning_seed_noise_fraction_std`, `dr_metrics`
+(trustworthiness/continuity/steadiness/cohesiveness for the winning trial),
+and the same `optuna_study_summary`/`objective_weights` fields step 4 writes.
 
-A configuration invalid for the dataset (e.g. `--n-neighbors` exceeding
-the sample count) is skipped rather than aborting the rest of the sweep; a
-configuration whose winning seed's representative repeat produces a
-degenerate result — per `HDBSCANClusterer.compute_metrics`'s eligibility
-constraints (cluster count, dominant-cluster share, noise fraction — see
-step 4) — is recorded but never eligible to win. If no configuration
-produces a usable relative validity index, nothing is written. Re-running
-this step against the same output paths overwrites all three existing
-output files wholesale.
+A trial invalid for the dataset (e.g. `n_neighbors` exceeding the sample
+count) is logged and scored with a guaranteed-worst sentinel rather than
+aborting the study; a trial whose winning seed's representative repeat
+produces a degenerate result — per `HDBSCANClusterer.compute_metrics`'s
+eligibility constraints (cluster count, dominant-cluster share, noise
+fraction — see step 4) — is recorded and scores lower via the same
+continuous penalty terms. Re-running this step against the same output
+paths overwrites all three existing output files (and the trial-history
+CSV) wholesale; only the Optuna study's own SQLite storage accumulates
+across runs.
 
-The total planned fit count (`configurations x seeds x repeats_per_seed`) is
-capped at 25000, the configuration grid at 1000 combinations, the seed list
-at 10, and `--repeats-per-seed` at 10; exceeding any of these raises an
-error before any fitting is attempted.
+The YAML config's `n_trials` is capped at 100; `reproducibility.seeds` is
+capped at 10 entries, `repeats_per_seed` at 10, and their product with
+`n_trials` is capped at 25000 total fits — exceeding any of these raises an
+error before any trial runs.
 
 ### Arguments
 
 | Argument                           | Required | Description                                                                 |
 | ----------------------------------- | -------- | ---------------------------------------------------------------------------- |
-| `--n-components`                     | no       | Comma-separated list of UMAP `n_components` values to sweep (default: `2`). |
-| `--n-neighbors`                      | no       | Comma-separated list of UMAP `n_neighbors` values to sweep (default: `15`). |
-| `--min-dist`                         | no       | Comma-separated list of UMAP `min_dist` values to sweep (default: `0.1`). |
-| `--distance-metric`                  | no       | UMAP distance metric, held fixed across the sweep (default: `euclidean`). |
-| `--seeds`                            | no       | Comma-separated list of seeds to sweep for reproducibility (default: `42`). |
-| `--repeats-per-seed`                 | no       | Number of repeated fits per (configuration, seed) pair (default: `10`). |
-| `--min-cluster-size`                 | no       | Comma-separated list of HDBSCAN `min_cluster_size` values to sweep, folded into the same config grid as the UMAP hyperparameters above (default: `200`). |
-| `--min-samples`                      | no       | Fixed HDBSCAN `min_samples`, not swept (default: `200`). |
-| `--metric`                           | no       | Fixed HDBSCAN distance metric, not swept (default: `euclidean`). |
-| `--cluster-selection-epsilon`        | no       | Fixed HDBSCAN `cluster_selection_epsilon`, not swept (default: `0.0`). |
-| `--cluster-selection-method`         | no       | Fixed HDBSCAN `cluster_selection_method`, not swept: `eom` or `leaf` (default: `eom`). |
-| `--alpha`                            | no       | Fixed HDBSCAN `alpha`, not swept (default: `1.0`). |
 | `--input-path`                       | yes      | Input embeddings Parquet path (as written by `criteria_embedding.py`). |
 | `--reduced-embeddings-output-path`   | yes      | Output reduced-embeddings Parquet path. |
 | `--assignments-output-path`          | yes      | Output cluster-assignments Parquet path. |
 | `--metrics-output-path`              | yes      | Output metrics JSON path. |
+| `--config-path`                      | no       | Optuna search config YAML (combined UMAP + HDBSCAN search space, objective weights, trial budget, reproducibility seeds/repeats); default: `config/umap_hdbscan_optuna.yaml`. |
 
 ## 8. PaCMAP + HDBSCAN clustering
 
@@ -515,71 +516,41 @@ uv run python -m src.clustering.pacmap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --reduced-embeddings-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_reduced_embeddings.parquet \
   --assignments-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_clusters.parquet \
-  --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json \
-  --n-neighbors 15,20,25 --min-cluster-size 100,150,200,250 --seeds 1,2
+  --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json
 ```
 
 The same idea as step 7, reducing with [PaCMAP](https://github.com/YingfanWang/PaCMAP)
 instead of UMAP. PaCMAP has no `min_dist` equivalent — its
-neighborhood/distance behavior is instead shaped by `--mn-ratio` and
-`--fp-ratio`, which weight mid-near vs. further point pairs during
-optimization and can be swept the same way `--n-neighbors` is.
+neighborhood/distance behavior is instead shaped by `mn_ratio` and
+`fp_ratio` in the search space (default config: `config/pacmap_hdbscan_optuna.yaml`),
+which weight mid-near vs. further point pairs during optimization.
 
-A large `--n-neighbors` (e.g. 30+) tends to over-smooth PaCMAP's
-projection into one dominant blob — HDBSCAN then reports one giant cluster
-plus a couple of stragglers, which the `MIN_N_CLUSTERS`/`MAX_CLUSTER_SHARE`/
-`MAX_NOISE_FRACTION` guards (see step 4) correctly reject as degenerate
-rather than letting it "win" the sweep, so you'll see every combination at
-that `n_neighbors` logged as `degenerate` and (if nothing else qualifies)
-the whole run write nothing. If you hit this, narrow `--n-neighbors`
-to a lower range and sweep `--min-cluster-size` alongside it
-instead, as the example above does — mind the combinatorial caps described
-below (`MAX_CONFIG_COMBINATIONS=1000`, `MAX_TOTAL_FITS=25000`) when widening
-either dimension; the example above uses 12 configurations (3 `n_neighbors`
-x 4 `min_cluster_size`) with a small `--seeds` list to keep the total fit
-count modest even though it's well under either cap.
-
-To also explore `mn_ratio`/`fp_ratio` instead:
-
-```bash
-uv run python -m src.clustering.pacmap_hdbscan_clustering \
-  --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --reduced-embeddings-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_reduced_embeddings.parquet \
-  --assignments-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_clusters.parquet \
-  --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json \
-  --n-neighbors 20 --mn-ratio 0.3,0.5,0.7 --fp-ratio 1.0,2.0,3.0 --seeds 1,2,3
-```
-
-Everything else — the configuration/seed/repeat sweep,
-winner-selection semantics, sweep caps, and overwrite-on-rerun behavior —
-is identical to step 7. It writes the reduced embeddings, cluster
-assignments, and metrics to `--reduced-embeddings-output-path`/
-`--assignments-output-path`/`--metrics-output-path`, with the
-reduced-embeddings schema, cluster-assignments schema, and metrics JSON
-shape (as `winning_pacmap_config`/`pacmap_config_search` instead of
-`winning_umap_config`/`umap_config_search`) otherwise identical to step 7's.
+A large `n_neighbors` (e.g. 30+) tends to over-smooth PaCMAP's projection
+into one dominant blob — HDBSCAN then reports one giant cluster plus a
+couple of stragglers, which the `MIN_N_CLUSTERS`/`MAX_CLUSTER_SHARE`/
+`MAX_NOISE_FRACTION` guards (see step 4) correctly treat as degenerate via
+the same continuous penalty terms, pushing Optuna's search away from that
+region over successive trials. Everything else — the seed/repeat
+reproducibility mechanics, composite objective (DBCV plus
+trustworthiness/continuity/steadiness/cohesiveness via `zadu` under cosine
+distance, folded with the same degenerate-result penalties), study
+resumability, trial-history export, and overwrite-on-rerun behavior — is
+identical to step 7. It writes the reduced embeddings, cluster assignments,
+and metrics to `--reduced-embeddings-output-path`/`--assignments-output-path`/
+`--metrics-output-path`, with the reduced-embeddings schema,
+cluster-assignments schema, and metrics JSON shape (as
+`winning_pacmap_config` instead of `winning_umap_config`) otherwise
+identical to step 7's.
 
 ### Arguments
 
 | Argument                           | Required | Description                                                                 |
 | ----------------------------------- | -------- | ---------------------------------------------------------------------------- |
-| `--n-components`                     | no       | Comma-separated list of PaCMAP `n_components` values to sweep (default: `2`). |
-| `--n-neighbors`                      | no       | Comma-separated list of PaCMAP `n_neighbors` values to sweep (default: `10`); very large values (30+) risk collapsing into one dominant cluster — pair with a `--min-cluster-size` sweep instead of relying on them alone. |
-| `--mn-ratio`                         | no       | Comma-separated list of PaCMAP `MN_ratio` values to sweep (default: `0.5`). |
-| `--fp-ratio`                         | no       | Comma-separated list of PaCMAP `FP_ratio` values to sweep (default: `2.0`). |
-| `--distance-metric`                  | no       | PaCMAP distance metric, held fixed across the sweep (default: `euclidean`). |
-| `--seeds`                            | no       | Comma-separated list of seeds to sweep for reproducibility (default: `42`). |
-| `--repeats-per-seed`                 | no       | Number of repeated fits per (configuration, seed) pair (default: `10`). |
-| `--min-cluster-size`                 | no       | Comma-separated list of HDBSCAN `min_cluster_size` values to sweep, folded into the same config grid as the PaCMAP hyperparameters above (default: `200`). |
-| `--min-samples`                      | no       | Fixed HDBSCAN `min_samples`, not swept (default: `200`). |
-| `--metric`                           | no       | Fixed HDBSCAN distance metric, not swept (default: `euclidean`). |
-| `--cluster-selection-epsilon`        | no       | Fixed HDBSCAN `cluster_selection_epsilon`, not swept (default: `0.0`). |
-| `--cluster-selection-method`         | no       | Fixed HDBSCAN `cluster_selection_method`, not swept: `eom` or `leaf` (default: `eom`). |
-| `--alpha`                            | no       | Fixed HDBSCAN `alpha`, not swept (default: `1.0`). |
 | `--input-path`                       | yes      | Input embeddings Parquet path (as written by `criteria_embedding.py`). |
 | `--reduced-embeddings-output-path`   | yes      | Output reduced-embeddings Parquet path. |
 | `--assignments-output-path`          | yes      | Output cluster-assignments Parquet path. |
 | `--metrics-output-path`              | yes      | Output metrics JSON path. |
+| `--config-path`                      | no       | Optuna search config YAML (combined PaCMAP + HDBSCAN search space, objective weights, trial budget, reproducibility seeds/repeats); default: `config/pacmap_hdbscan_optuna.yaml`. |
 
 ## 9. Scatterplot visualization
 
@@ -651,22 +622,19 @@ uv run python -m src.clustering.kmeans_clustering \
 uv run python -m src.clustering.hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --assignments-output-path data/clustering/hdbscan/breast_cancer_trials_hdbscan_clusters.parquet \
-  --metrics-output-path data/clustering/hdbscan/breast_cancer_trials_hdbscan_cluster_metrics.json \
-  --min-cluster-size 5,10,15
+  --metrics-output-path data/clustering/hdbscan/breast_cancer_trials_hdbscan_cluster_metrics.json
 
 uv run python -m src.clustering.umap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --reduced-embeddings-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_reduced_embeddings.parquet \
   --assignments-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_clusters.parquet \
-  --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
-  --n-neighbors 10,15,30 --seeds 1,2,3,4,5
+  --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json
 
 uv run python -m src.clustering.pacmap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --reduced-embeddings-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_reduced_embeddings.parquet \
   --assignments-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_clusters.parquet \
-  --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json \
-  --n-neighbors 15,20,25 --min-cluster-size 100,150,200,250 --seeds 1,2
+  --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json
 
 uv run python -m src.clustering.clustering_report \
   --output-path data/clustering/reports/breast_cancer_clustering_report.md \

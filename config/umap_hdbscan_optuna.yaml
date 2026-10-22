@@ -1,0 +1,72 @@
+# Optuna search config for `src/clustering/umap_hdbscan_clustering.py`.
+#
+# search_space entries: {kind: int|float|categorical, low, high, choices, log}.
+# Combines UMAP's own hyperparameters with HDBSCAN's — both are searched
+# jointly. `metric` stays fixed (not swept): it's shared by UMAP's own fit,
+# HDBSCAN's own fit, DBCV, and the dimensionality-reduction fidelity metrics
+# below, and defaults to cosine (not euclidean) for this reason.
+
+search_space:
+  # UMAP's own hyperparameters
+  n_components:
+    kind: int
+    low: 2
+    high: 10
+  n_neighbors:
+    kind: int
+    low: 5
+    high: 50
+  min_dist:
+    kind: float
+    low: 0.0
+    high: 0.99
+  # HDBSCAN's own hyperparameters
+  min_cluster_size:
+    kind: int
+    low: 50
+    high: 300
+  min_samples:
+    kind: int
+    low: 5
+    high: 300
+  cluster_selection_epsilon:
+    kind: float
+    low: 0.0
+    high: 1.0
+  cluster_selection_method:
+    kind: categorical
+    choices: [eom, leaf]
+  alpha:
+    kind: float
+    low: 0.5
+    high: 2.0
+
+fixed:
+  metric: cosine
+
+# Each trial fits this many seeds x repeats-per-seed before being scored,
+# picking the most reproducible seed (see reduction_sweep.py).
+reproducibility:
+  seeds: [1, 2, 3]
+  repeats_per_seed: 5
+
+objective_weights:
+  noise_penalty: 1.0
+  dominant_cluster_penalty: 1.0
+  cluster_count_violation_penalty: 2.0
+  micro_cluster_penalty: 1.0
+  micro_cluster_size_multiplier: 1.5
+  missing_validity_fallback_score: 0.0
+  # Dimensionality-reduction fidelity terms (trustworthiness/continuity/
+  # steadiness/cohesiveness only — stress is deliberately excluded).
+  trustworthiness_weight: 1.0
+  continuity_weight: 1.0
+  steadiness_weight: 1.0
+  cohesiveness_weight: 1.0
+  missing_dr_metrics_fallback_score: 0.0
+
+n_trials: 50
+sampler_seed: 42
+
+study_dir: data/clustering/umap_hdbscan/optuna_studies
+reports_dir: data/clustering/reports

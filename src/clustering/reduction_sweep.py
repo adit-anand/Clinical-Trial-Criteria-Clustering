@@ -1,24 +1,22 @@
-"""Generic config/seed/repeat sweep engine shared by dimensionality-reduction + HDBSCAN steps.
+"""Generic per-trial seed/repeat evaluation engine shared by dimensionality-reduction + HDBSCAN steps.
 
 `umap_hdbscan_clustering.py` and `pacmap_hdbscan_clustering.py` each reduce a
 condition's embeddings with their own reducer (UMAP, PaCMAP) before
-clustering the reduced vectors with HDBSCAN. Both share an identical sweep
-shape that has nothing to do with which reducer is used, so it lives here
-once:
+clustering the reduced vectors with HDBSCAN. Both share an identical
+reproducibility-evaluation shape that has nothing to do with which reducer is
+used, so it lives here once. For one hyperparameter combination (`evaluate_config`,
+called once per Optuna trial by each of those modules — see their own
+Optuna objective closures):
 
-    for each config (a combination of reducer hyperparameters, plus
-    optionally HDBSCAN's own `min_cluster_size` if the caller chooses to
-    sweep it too — see `evaluate_config`'s `build_hdbscan_clusterer`):
-        for each user-supplied seed:
-            fit the reducer + HDBSCAN `repeats_per_seed` times (default 10)
-            pick the seed's most *reproducible* repeat set: the seed with the
-            lowest standard deviation of noise_fraction across its repeats
-            wins, not the seed with the best score — a config's winning seed
-            is the one whose repeated runs most agree with each other.
-        among the per-config winning seeds, pick the config whose
-        representative repeat has the highest relative validity index
-        (DBCV), tie-broken by lowest noise_fraction — identical
-        winner-selection semantics to `hdbscan_clustering.select_best`.
+    for each user-supplied seed:
+        fit the reducer + HDBSCAN `repeats_per_seed` times (default 10)
+        pick the seed's most *reproducible* repeat set: the seed with the
+        lowest standard deviation of noise_fraction across its repeats
+        wins, not the seed with the best score — a trial's winning seed
+        is the one whose repeated runs most agree with each other.
+    the overall winning seed's representative repeat (`representative_repeat`)
+    is what the caller scores via `optuna_search.score_reduction_candidate`
+    and, if it wins the Optuna study, what gets written to disk.
 
 Reproducibility is measured as the standard deviation of `noise_fraction`
 (population stdev, via `statistics.pstdev`, since a seed's repeats are
@@ -29,39 +27,32 @@ invariant across runs, so two equally reproducible *clusterings* could have
 globally different coordinate layouts; penalizing that would conflate
 reduction-output instability with an irrelevant axis flip.
 
-A reducer-internal failure for one (config, seed, repeat) unit of work is
-caught and recorded as `"errored"` rather than aborting the sweep; if every
-repeat for a seed errors, that seed is dropped from seed selection; if every
-seed for a config errors (or the config fails its own precondition check
-before any fit is attempted), the whole config is `"invalid"`. A config whose
-winning seed's representative repeat has degenerate clustering metrics
-(mirroring `HDBSCANClusterer.compute_metrics`'s own guard) is marked
-`"degenerate"` and is never eligible to win, but is still recorded.
+A reducer-internal failure for one (seed, repeat) unit of work is caught and
+recorded as `"errored"` rather than aborting the trial; if every repeat for a
+seed errors, that seed is dropped from seed selection; if every seed errors
+(or the trial's hyperparameters fail their own precondition check before any
+fit is attempted), the whole trial is `"invalid"`. A trial whose winning
+seed's representative repeat has degenerate clustering metrics (mirroring
+`HDBSCANClusterer.compute_metrics`'s own guard) is marked `"degenerate"` and
+is scored accordingly by `optuna_search.score_reduction_candidate`, but is
+still recorded.
+
+This module holds no caps of its own (how many seeds/repeats are allowed, or
+how many total fits a study may demand) — those live in `optuna_search.py`'s
+`load_optuna_config`, which validates a trial's `seeds`/`repeats_per_seed`
+before any study runs.
 """
 
-import itertools
 import logging
-import math
 import statistics
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
 import numpy as np
-from hdbscan import validity
 
-from src.clustering.hdbscan_clustering import HDBSCANClusterer
+from src.clustering.hdbscan_clustering import HDBSCAN_PARAM_NAMES, HDBSCANClusterer, compute_relative_validity_index
 
 logger = logging.getLogger(__name__)
-
-# Unlike `hdbscan_clustering.py`'s own sweep's flat Cartesian product, this sweep's total unit
-# of work is `n_configs * n_seeds * repeats_per_seed` (each unit being a
-# reducer fit plus an HDBSCAN fit, more expensive than a lone HDBSCAN fit),
-# so each dimension gets its own, tighter cap, plus a cap on the product
-# itself.
-MAX_CONFIG_COMBINATIONS = 1000
-MAX_SEEDS = 10
-MAX_REPEATS_PER_SEED = 10
-MAX_TOTAL_FITS = 25000
 
 
 @dataclass(frozen=True)
@@ -99,7 +90,7 @@ class RepeatResult:
 
 @dataclass(frozen=True)
 class SeedResult:
-    """The aggregated outcome of `repeats_per_seed` runs for one seed, for one config.
+    """The aggregated outcome of `repeats_per_seed` runs for one seed, for one trial.
 
     Attributes:
         seed: The reducer's `random_state` used for every repeat in this group.
@@ -129,21 +120,22 @@ class SeedResult:
 
 @dataclass(frozen=True)
 class ReducerConfigCandidate:
-    """The outcome of evaluating one reducer hyperparameter combination across its full seed sweep.
+    """The outcome of evaluating one hyperparameter combination across its full seed sweep.
 
     Attributes:
-        hyperparams: This config's reducer hyperparameter values (e.g.
-            `{"n_components": 2, "n_neighbors": 15, "min_dist": 0.1}`).
+        hyperparams: This trial's reducer + HDBSCAN hyperparameter values
+            (e.g. `{"n_components": 2, "n_neighbors": 15, "min_dist": 0.1,
+            "min_cluster_size": 200, ...}`).
         status: `"ok"` if a winning seed was found with valid clustering
-            metrics; `"invalid"` if this config's own precondition check
+            metrics; `"invalid"` if this trial's own precondition check
             failed before any fit was attempted, or if every seed errored;
             `"degenerate"` if a winning seed was found but its representative
             repeat's clustering metrics are invalid.
         detail: Human-readable explanation, set for `"invalid"`/`"degenerate"`.
-        seed_results: Every `SeedResult` tried for this config (full audit trail).
+        seed_results: Every `SeedResult` tried for this trial (full audit trail).
         winning_seed: The most reproducible `SeedResult`, set whenever status
             is `"ok"` or `"degenerate"`.
-        notes: Non-fatal, informational caveats about this config (e.g.
+        notes: Non-fatal, informational caveats about this trial (e.g.
             `n_components >= embedding_dim`).
     """
 
@@ -156,7 +148,7 @@ class ReducerConfigCandidate:
 
 
 def representative_repeat(candidate: ReducerConfigCandidate) -> RepeatResult:
-    """Return the `RepeatResult` a config's winning seed designated as representative.
+    """Return the `RepeatResult` a trial's winning seed designated as representative.
 
     Args:
         candidate: A candidate with `status` in `{"ok", "degenerate"}` (i.e.
@@ -168,65 +160,6 @@ def representative_repeat(candidate: ReducerConfigCandidate) -> RepeatResult:
     """
     assert candidate.winning_seed is not None and candidate.winning_seed.representative_repeat_index is not None
     return candidate.winning_seed.repeats[candidate.winning_seed.representative_repeat_index]
-
-
-def generate_config_combinations(hyperparameter_values: dict[str, list]) -> list[dict]:
-    """Build the Cartesian product of named reducer hyperparameter value lists.
-
-    Args:
-        hyperparameter_values: Maps each swept hyperparameter's name to its
-            list of candidate values, e.g.
-            `{"n_components": [2], "n_neighbors": [10, 15], "min_dist": [0.0, 0.1]}`.
-
-    Returns:
-        One dict per combination, each mapping every key in
-        `hyperparameter_values` to one chosen value.
-
-    Raises:
-        ValueError: If the product size exceeds `MAX_CONFIG_COMBINATIONS`,
-            naming the actual count and the limit.
-    """
-    keys = list(hyperparameter_values.keys())
-    value_lists = [hyperparameter_values[key] for key in keys]
-    combos = [dict(zip(keys, values)) for values in itertools.product(*value_lists)]
-    if len(combos) > MAX_CONFIG_COMBINATIONS:
-        raise ValueError(
-            f"Requested sweep has {len(combos)} configuration combination(s), exceeding "
-            f"the limit of {MAX_CONFIG_COMBINATIONS}; narrow one or more hyperparameter lists"
-        )
-    return combos
-
-
-def check_sweep_size(n_configs: int, seeds: list[int], repeats_per_seed: int) -> None:
-    """Validate the seed list and repeat count, then the total planned fit count.
-
-    Args:
-        n_configs: Number of reducer configuration combinations to try.
-        seeds: The user-supplied list of seeds.
-        repeats_per_seed: Number of repeated fits per (config, seed) pair.
-
-    Raises:
-        ValueError: If `len(seeds)` exceeds `MAX_SEEDS`, if `repeats_per_seed`
-            exceeds `MAX_REPEATS_PER_SEED`, or if the total planned fit count
-            (`n_configs * len(seeds) * repeats_per_seed`) exceeds
-            `MAX_TOTAL_FITS` — each message names the offending number(s) and
-            the limit.
-    """
-    if len(seeds) > MAX_SEEDS:
-        raise ValueError(f"Requested {len(seeds)} seed(s), exceeding the limit of {MAX_SEEDS}; narrow --seeds")
-    if repeats_per_seed > MAX_REPEATS_PER_SEED:
-        raise ValueError(
-            f"Requested repeats_per_seed={repeats_per_seed}, exceeding the limit of "
-            f"{MAX_REPEATS_PER_SEED}; lower --repeats-per-seed"
-        )
-    total = n_configs * len(seeds) * repeats_per_seed
-    if total > MAX_TOTAL_FITS:
-        raise ValueError(
-            f"Planned sweep requires {total} total fit(s) ({n_configs} config(s) x "
-            f"{len(seeds)} seed(s) x {repeats_per_seed} repeat(s) per seed), exceeding the "
-            f"limit of {MAX_TOTAL_FITS}; narrow the reducer hyperparameter grid, --seeds, or "
-            "--repeats-per-seed"
-        )
 
 
 def evaluate_repeat(
@@ -242,15 +175,15 @@ def evaluate_repeat(
     Args:
         fit_reduced: A reducer-specific callable
             `(embedding_matrix, seed, **reducer_hyperparams) -> reduced_matrix`.
-            Called with every key of `hyperparams` *except* `min_cluster_size`
-            (that key, if present, belongs to HDBSCAN, not the reducer — see
-            `evaluate_config`'s `build_hdbscan_clusterer`).
-        hyperparams: This config's hyperparameter values — the reducer's own
-            plus, optionally, `min_cluster_size` for HDBSCAN.
+            Called with every key of `hyperparams` *except* the HDBSCAN
+            hyperparameter names (those belong to `hdbscan_clusterer`, not
+            the reducer — see each module's own `build_hdbscan_clusterer`).
+        hyperparams: This trial's hyperparameter values — the reducer's own
+            plus HDBSCAN's.
         seed: The reducer's `random_state` for this repeat.
         repeat_index: 0-based index within this seed's repeats.
         hdbscan_clusterer: A single `HDBSCANClusterer` instance already
-            built for this config (see `evaluate_config`); reused across
+            built for this trial (see `evaluate_config`); reused across
             every repeat since it holds no per-fit state.
         embedding_matrix: The original, non-reduced embedding matrix.
 
@@ -258,15 +191,15 @@ def evaluate_repeat(
         A `RepeatResult` reflecting whether fitting errored, produced a
         degenerate clustering, or a usable result.
     """
-    reducer_hyperparams = {key: value for key, value in hyperparams.items() if key != "min_cluster_size"}
+    reducer_hyperparams = {key: value for key, value in hyperparams.items() if key not in HDBSCAN_PARAM_NAMES}
     try:
         reduced_matrix = fit_reduced(embedding_matrix, seed=seed, **reducer_hyperparams)
-    except Exception as exc:  # noqa: BLE001 - a reducer-internal failure shouldn't abort the whole sweep
+    except Exception as exc:  # noqa: BLE001 - a reducer-internal failure shouldn't abort the whole trial
         return RepeatResult(repeat_index=repeat_index, status="errored", detail=f"Reduction failed: {exc}")
 
     try:
         model = hdbscan_clusterer.fit_hdbscan(reduced_matrix)
-    except Exception as exc:  # noqa: BLE001 - an HDBSCAN-internal failure shouldn't abort the whole sweep
+    except Exception as exc:  # noqa: BLE001 - an HDBSCAN-internal failure shouldn't abort the whole trial
         return RepeatResult(repeat_index=repeat_index, status="errored", detail=f"HDBSCAN fit failed: {exc}")
 
     labels = model.labels_
@@ -284,19 +217,7 @@ def evaluate_repeat(
             probabilities=probabilities,
         )
 
-    try:
-        # hdbscan.validity.validity_index requires float64 input (its Cython
-        # core is compiled against double_t); reduced matrices may be
-        # float32, so cast just for this call, exactly as hdbscan_clustering.py does.
-        relative_validity = float(
-            validity.validity_index(
-                reduced_matrix.astype(np.float64), labels, metric=hdbscan_clusterer.metric
-            )
-        )
-        if math.isnan(relative_validity):
-            relative_validity = None
-    except Exception:  # noqa: BLE001 - DBCV computation failure shouldn't abort the sweep
-        relative_validity = None
+    relative_validity = compute_relative_validity_index(reduced_matrix, labels, hdbscan_clusterer.metric)
 
     return RepeatResult(
         repeat_index=repeat_index,
@@ -321,12 +242,11 @@ def evaluate_seed(
 
     Args:
         fit_reduced: As passed to `evaluate_repeat`.
-        hyperparams: This config's hyperparameter values (reducer's own plus,
-            optionally, `min_cluster_size`).
+        hyperparams: This trial's hyperparameter values (reducer's own plus HDBSCAN's).
         seed: The reducer's `random_state` for every repeat in this group.
         repeats_per_seed: Number of repeats to run.
         hdbscan_clusterer: As passed to `evaluate_repeat` — already built for
-            this config by `evaluate_config`.
+            this trial by `evaluate_config`.
         embedding_matrix: The original, non-reduced embedding matrix.
 
     Returns:
@@ -375,9 +295,9 @@ def select_best_seed(seed_results: list[SeedResult]) -> SeedResult | None:
         return None
 
     def sort_key(seed_result: SeedResult) -> tuple[float, float, int]:
-        noise_std = seed_result.noise_fraction_std if seed_result.noise_fraction_std is not None else math.inf
+        noise_std = seed_result.noise_fraction_std if seed_result.noise_fraction_std is not None else float("inf")
         validity_std = (
-            seed_result.relative_validity_std if seed_result.relative_validity_std is not None else math.inf
+            seed_result.relative_validity_std if seed_result.relative_validity_std is not None else float("inf")
         )
         return (noise_std, validity_std, seed_result.seed)
 
@@ -394,29 +314,26 @@ def evaluate_config(
     embedding_matrix: np.ndarray,
     n_samples: int,
 ) -> ReducerConfigCandidate:
-    """Validate, then sweep every seed for one hyperparameter combination.
+    """Validate, then sweep every seed for one hyperparameter combination (one Optuna trial).
 
     Args:
         fit_reduced: As passed to `evaluate_repeat`.
-        hyperparams: This config's hyperparameter values — the reducer's own
-            plus, optionally, `min_cluster_size` for HDBSCAN (if the caller
-            is sweeping it; see `build_hdbscan_clusterer`).
-        seeds: The full user-supplied seed list.
+        hyperparams: This trial's hyperparameter values — the reducer's own
+            plus HDBSCAN's (see `build_hdbscan_clusterer`).
+        seeds: The full configured seed list.
         repeats_per_seed: Number of repeats to run per seed.
         validate_fn: A reducer-specific `(hyperparams, n_samples) -> None`
-            precondition check; raises `ValueError` if this config is
+            precondition check; raises `ValueError` if this trial is
             unusable for the dataset (e.g. `n_neighbors >= n_samples`).
         build_hdbscan_clusterer: `(hyperparams) -> HDBSCANClusterer` —
-            constructs this config's `HDBSCANClusterer` (e.g. reading
-            `hyperparams["min_cluster_size"]` if that's being swept, with
-            every other HDBSCAN hyperparameter held fixed by the closure).
-            Built once per config, then reused across every seed/repeat for
-            that config, since the clusterer holds no per-fit state.
+            constructs this trial's `HDBSCANClusterer` from `hyperparams`.
+            Built once per trial, then reused across every seed/repeat for
+            that trial, since the clusterer holds no per-fit state.
         embedding_matrix: The original, non-reduced embedding matrix.
         n_samples: `embedding_matrix.shape[0]`.
 
     Returns:
-        A `ReducerConfigCandidate` reflecting whether this config was
+        A `ReducerConfigCandidate` reflecting whether this trial was
         invalid, degenerate, or produced a usable result.
     """
     try:
@@ -439,7 +356,7 @@ def evaluate_config(
         return ReducerConfigCandidate(
             hyperparams=hyperparams,
             status="invalid",
-            detail="Every seed errored for this configuration (reduction or HDBSCAN fitting failed for all repeats)",
+            detail="Every seed errored for this trial (reduction or HDBSCAN fitting failed for all repeats)",
             seed_results=seed_results,
         )
 
@@ -461,46 +378,23 @@ def evaluate_config(
     return candidate
 
 
-def select_best_config(candidates: list[ReducerConfigCandidate]) -> ReducerConfigCandidate | None:
-    """Pick the best config: highest relative validity, tie-broken by lowest noise fraction.
-
-    Args:
-        candidates: As produced by `evaluate_config`, one per configuration.
-
-    Returns:
-        The `"ok"` candidate whose representative repeat has the highest
-        `relative_validity` (ties broken by the lowest `noise_fraction`), or
-        `None` if no candidate has a computed relative validity index —
-        identical semantics to `hdbscan_clustering.select_best`.
-    """
-    eligible = [
-        c for c in candidates if c.status == "ok" and representative_repeat(c).relative_validity is not None
-    ]
-    if not eligible:
-        return None
-    return min(
-        eligible,
-        key=lambda c: (-representative_repeat(c).relative_validity, representative_repeat(c).metrics_result["noise_fraction"]),
-    )
-
-
-def log_config_candidate(index: int, total: int, candidate: ReducerConfigCandidate) -> None:
-    """Log one INFO line summarizing a single evaluated configuration."""
+def log_config_candidate(trial_number: int, candidate: ReducerConfigCandidate) -> None:
+    """Log one INFO line summarizing a single evaluated trial's hyperparameter combination."""
     if candidate.status == "invalid":
-        logger.info("evaluate_config: [%d/%d] %s -> invalid (%s)", index, total, candidate.hyperparams, candidate.detail)
+        logger.info("evaluate_config: trial #%d %s -> invalid (%s)", trial_number, candidate.hyperparams, candidate.detail)
         return
     representative = representative_repeat(candidate)
     if candidate.status == "degenerate":
         logger.info(
-            "evaluate_config: [%d/%d] %s -> degenerate, winning_seed=%d, noise=%.1f%% (%s)",
-            index, total, candidate.hyperparams, candidate.winning_seed.seed,
+            "evaluate_config: trial #%d %s -> degenerate, winning_seed=%d, noise=%.1f%% (%s)",
+            trial_number, candidate.hyperparams, candidate.winning_seed.seed,
             representative.metrics_result["noise_fraction"] * 100, candidate.detail,
         )
         return
     logger.info(
-        "evaluate_config: [%d/%d] %s -> ok, winning_seed=%d (noise_fraction_std=%s), clusters=%d, "
+        "evaluate_config: trial #%d %s -> ok, winning_seed=%d (noise_fraction_std=%s), clusters=%d, "
         "noise=%.1f%%, silhouette=%s, relative_validity=%s",
-        index, total, candidate.hyperparams, candidate.winning_seed.seed, candidate.winning_seed.noise_fraction_std,
+        trial_number, candidate.hyperparams, candidate.winning_seed.seed, candidate.winning_seed.noise_fraction_std,
         representative.metrics_result["n_clusters_actual"], representative.metrics_result["noise_fraction"] * 100,
         representative.metrics_result["metrics"]["silhouette_score"], representative.relative_validity,
     )
@@ -511,16 +405,15 @@ def serialize_candidates(candidates: list[ReducerConfigCandidate]) -> list[dict]
 
     Each repeat's record is kept deliberately minimal (status, noise
     fraction, relative validity, cluster count only — not the full
-    `compute_metrics` output) since the total repeat count across a sweep
-    can reach `MAX_TOTAL_FITS`, and the full audit trail is meant for
-    "what happened and why", not full per-repeat metrics replay.
+    `compute_metrics` output).
 
     Args:
-        candidates: As produced by `run_reduction_sweep`'s second return value.
+        candidates: One or more `ReducerConfigCandidate`s to serialize (e.g.
+            every trial cached across an Optuna study, for ad-hoc inspection
+            — the Optuna trial-history CSV is the primary audit trail now).
 
     Returns:
-        One dict per candidate, suitable for embedding in a metrics JSON's
-        `config_search` field.
+        One dict per candidate, suitable for ad-hoc JSON embedding.
     """
     serialized = []
     for candidate in candidates:
@@ -558,61 +451,3 @@ def serialize_candidates(candidates: list[ReducerConfigCandidate]) -> list[dict]
             }
         )
     return serialized
-
-
-def run_reduction_sweep(
-    fit_reduced: Callable[..., np.ndarray],
-    validate_fn: Callable[[dict, int], None],
-    hyperparameter_values: dict[str, list],
-    seeds: list[int],
-    repeats_per_seed: int,
-    build_hdbscan_clusterer: Callable[[dict], HDBSCANClusterer],
-    embedding_matrix: np.ndarray,
-    n_samples: int,
-) -> tuple[ReducerConfigCandidate | None, list[ReducerConfigCandidate]]:
-    """Run the full config x seed x repeat sweep and pick the overall winner.
-
-    Args:
-        fit_reduced: Reducer-specific `(embedding_matrix, seed,
-            **reducer_hyperparams) -> reduced_matrix` callable.
-        validate_fn: Reducer-specific `(hyperparams, n_samples) -> None`
-            precondition check, raising `ValueError` for an unusable config.
-        hyperparameter_values: The swept hyperparameters, as passed to
-            `generate_config_combinations` — the reducer's own, plus
-            optionally `"min_cluster_size"` if the caller wants HDBSCAN's
-            `min_cluster_size` swept alongside them (see
-            `build_hdbscan_clusterer`).
-        seeds: The user-supplied seed list.
-        repeats_per_seed: Number of repeats per (config, seed) pair.
-        build_hdbscan_clusterer: `(hyperparams) -> HDBSCANClusterer`,
-            called once per config (see `evaluate_config`).
-        embedding_matrix: The original, non-reduced embedding matrix.
-        n_samples: `embedding_matrix.shape[0]`.
-
-    Returns:
-        `(best, all_candidates)` — `best` is `None` if no configuration
-        produced a usable result (nothing should be written in that case);
-        `all_candidates` is the full audit trail regardless.
-
-    Raises:
-        ValueError: If the configuration grid, seed list, or repeat count
-            exceed their caps (see `generate_config_combinations`/`check_sweep_size`).
-    """
-    combos = generate_config_combinations(hyperparameter_values)
-    check_sweep_size(len(combos), seeds, repeats_per_seed)
-    logger.info(
-        "run_reduction_sweep: evaluating %d config(s) x %d seed(s) x %d repeat(s) (n_samples=%d)",
-        len(combos), len(seeds), repeats_per_seed, n_samples,
-    )
-
-    candidates = []
-    for index, hyperparams in enumerate(combos, start=1):
-        candidate = evaluate_config(
-            fit_reduced, hyperparams, seeds, repeats_per_seed, validate_fn, build_hdbscan_clusterer,
-            embedding_matrix, n_samples,
-        )
-        log_config_candidate(index, len(combos), candidate)
-        candidates.append(candidate)
-
-    best = select_best_config(candidates)
-    return best, candidates
