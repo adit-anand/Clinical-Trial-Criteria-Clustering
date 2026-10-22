@@ -394,8 +394,14 @@ def score_reduction_candidate(
     return base - _eligibility_penalties(metrics_result, labels, min_cluster_size, weights, bounds)
 
 
-def _l2_normalize_rows(matrix: np.ndarray) -> np.ndarray:
-    """L2-normalize every row of `matrix`, guarding a near-zero-norm row."""
+def l2_normalize_rows(matrix: np.ndarray) -> np.ndarray:
+    """L2-normalize every row of `matrix`, guarding a near-zero-norm row.
+
+    Shared by `compute_dr_metrics` (below) and
+    `pacmap_hdbscan_clustering.make_fit_pacmap_reduced`, which normalizes
+    its input and fits PaCMAP with `distance="euclidean"` instead of
+    PaCMAP's own `"angular"` cosine-equivalent — see that module for why.
+    """
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     return matrix / np.clip(norms, _DR_NORMALIZE_EPSILON, None)
 
@@ -440,8 +446,8 @@ def compute_dr_metrics(
         original = original_matrix.astype(np.float64)
         reduced = reduced_matrix.astype(np.float64)
         if metric == "cosine":
-            original = _l2_normalize_rows(original)
-            reduced = _l2_normalize_rows(reduced)
+            original = l2_normalize_rows(original)
+            reduced = l2_normalize_rows(reduced)
 
         k = min(_DR_METRIC_K, original.shape[0] - 1)
         specs = [make_spec("tnc", k=k), make_spec("snc", k=k, clustering_strategy="dbscan")]

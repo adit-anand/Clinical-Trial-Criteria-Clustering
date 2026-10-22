@@ -78,34 +78,61 @@ PACMAP_REDUCED_EMBEDDING_PARQUET_SCHEMA = pa.schema(
 
 # PaCMAP's own `distance` parameter only accepts {"euclidean", "manhattan",
 # "angular", "dot", "hamming"} — it has no "cosine" spelling of its own,
-# calling the same cosine-like metric "angular" instead (confirmed against
-# the installed pacmap version). This module's `distance` config value
-# stays "cosine" everywhere else (HDBSCAN's own `metric`, DBCV, and
-# `optuna_search.compute_dr_metrics`'s `metric == "cosine"` check all accept
-# that spelling natively) — only the call into `pacmap.PaCMAP` itself needs
-# the translation below.
-_PACMAP_DISTANCE_ALIASES = {"cosine": "angular"}
+# calling the same cosine-like metric "angular" instead. That "angular" path
+# (faiss.IndexHNSWFlat with METRIC_INNER_PRODUCT, inside pacmap's own
+# compute_nearest_neighbors) has a confirmed numerical bug in the installed
+# pacmap version: at n_neighbors >= 30 it reliably raises "RuntimeWarning:
+# overflow encountered in multiply" in its `sqrt(2 * (1 - D))` cosine-
+# distance conversion, and can crash a run outright depending on the data —
+# reproduced directly against this pipeline's own embeddings. Since the
+# embedding backends this pipeline reads from (`bert`/`huggingface`) already
+# emit L2-normalized (unit-norm) vectors, Euclidean distance between them is
+# a monotonic function of cosine distance (`||a-b||^2 = 2*(1-cos_sim(a,b))`)
+# — mathematically equivalent for ranking/reduction purposes, not an
+# approximation. So instead of translating "cosine" to pacmap's "angular",
+# this module normalizes the input itself and fits with "euclidean",
+# sidestepping the buggy "angular" code path entirely. `metric`/`distance`
+# stays "cosine" everywhere else in this module (HDBSCAN's own `metric`,
+# DBCV, and `optuna_search.compute_dr_metrics`'s `metric == "cosine"` check
+# all accept that spelling natively, and have no equivalent bug) — only the
+# call into `pacmap.PaCMAP` itself is affected.
+_PACMAP_NATIVE_DISTANCES = {"euclidean", "manhattan", "angular", "dot", "hamming"}
 
 
 def make_fit_pacmap_reduced(distance: str) -> Callable[..., np.ndarray]:
     """Bind PaCMAP's fixed (non-swept) distance metric into a `reduction_sweep`-compatible callable.
 
     Args:
-        distance: PaCMAP's own distance metric, held fixed across the whole
-            search. `"cosine"` is translated to PaCMAP's own `"angular"`
-            spelling of the same metric (see `_PACMAP_DISTANCE_ALIASES`);
-            every other value is passed through unchanged.
+        distance: The distance metric held fixed across the whole search.
+            `"cosine"` normalizes the input and fits with `"euclidean"`
+            instead of PaCMAP's own buggy `"angular"` (see
+            `_PACMAP_NATIVE_DISTANCES` above); any of PaCMAP's own native
+            distance names is passed through unchanged.
 
     Returns:
         A callable `(embedding_matrix, seed, n_components, n_neighbors,
         mn_ratio, fp_ratio) -> reduced_matrix`, matching the shape
         `reduction_sweep.evaluate_repeat` expects for `fit_reduced`.
+
+    Raises:
+        ValueError: If `distance` is neither `"cosine"` nor one of PaCMAP's
+            own native distance names.
     """
-    pacmap_distance = _PACMAP_DISTANCE_ALIASES.get(distance, distance)
+    if distance == "cosine":
+        normalize_before_fit = True
+        pacmap_distance = "euclidean"
+    elif distance in _PACMAP_NATIVE_DISTANCES:
+        normalize_before_fit = False
+        pacmap_distance = distance
+    else:
+        raise ValueError(
+            f"Unknown PaCMAP distance {distance!r}; expected 'cosine' or one of {sorted(_PACMAP_NATIVE_DISTANCES)}"
+        )
 
     def fit_reduced(
         embedding_matrix: np.ndarray, seed: int, n_components: int, n_neighbors: int, mn_ratio: float, fp_ratio: float
     ) -> np.ndarray:
+        matrix = optuna_search.l2_normalize_rows(embedding_matrix) if normalize_before_fit else embedding_matrix
         reducer = pacmap.PaCMAP(
             n_components=n_components,
             n_neighbors=n_neighbors,
@@ -114,7 +141,7 @@ def make_fit_pacmap_reduced(distance: str) -> Callable[..., np.ndarray]:
             distance=pacmap_distance,
             random_state=seed,
         )
-        return reducer.fit_transform(embedding_matrix)
+        return reducer.fit_transform(matrix)
 
     return fit_reduced
 
