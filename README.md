@@ -66,6 +66,7 @@ config/
 └── umap_hdbscan_optuna.yaml               # Optuna search config for step 5
 src/
 ├── paths.py                              # shared REPO_ROOT constant
+├── logging_utils.py                      # shared console+optional-file logging setup
 ├── preprocessing/
 │   ├── clinicaltrials_client.py          # ClinicalTrials.gov search
 │   ├── ctrp_client.py                    # CTRP API fetch + retry
@@ -160,6 +161,7 @@ inclusion/exclusion criteria, and writes them to `--output-path` with columns
 | ----------- | -------- | ------------------------------------------------------------------- |
 | `condition` | yes      | Condition to search for, e.g. `"breast cancer"`. Passed through to ClinicalTrials.gov's `query.cond` parameter. |
 | `--output-path` | yes  | Output CSV path to write the fetched eligibility criteria to. |
+| `--log-file` | no      | If given, also append logs to this file, in addition to the console. |
 
 ## 2. Embedding criteria
 
@@ -189,6 +191,7 @@ file; there is no append/skip-if-exists/merge behavior.
 | `--input-path`      | yes      | Input criteria CSV path (as written by `criteria_retrieval.py`). |
 | `--output-path`     | yes      | Output Parquet path to write embeddings to. |
 | `--batch-size`      | no       | Number of criteria to embed per backend call (default: `32`). |
+| `--log-file`        | no       | If given, also append logs to this file, in addition to the console. |
 
 ### Backend notes
 
@@ -276,6 +279,7 @@ offered. `kmeans_params.metric` in the metrics JSON records which was used.
 | `--input-path`                 | yes      | Input embeddings Parquet path (as written by `criteria_embedding.py`). |
 | `--assignments-output-path`    | yes      | Output cluster-assignments Parquet path. |
 | `--metrics-output-path`        | yes      | Output metrics JSON path. |
+| `--log-file`                   | no       | If given, also append logs to this file, in addition to the console. |
 
 ## 4. Clustering performance report
 
@@ -318,6 +322,7 @@ wholesale.
 | `--umap-hdbscan-metrics-path`   | no | UMAP + HDBSCAN metrics JSON path (omit if not yet run). |
 | `--pacmap-hdbscan-metrics-path` | no | PaCMAP + HDBSCAN metrics JSON path (omit if not yet run). |
 | `--print`        | no       | Also print the generated report to stdout, in addition to writing the file. |
+| `--log-file`     | no       | If given, also append logs to this file, in addition to the console. |
 
 ## 5. UMAP + HDBSCAN clustering
 
@@ -423,6 +428,7 @@ error before any trial runs.
 | `--assignments-output-path`          | yes      | Output cluster-assignments Parquet path. |
 | `--metrics-output-path`              | yes      | Output metrics JSON path. |
 | `--config-path`                      | no       | Optuna search config YAML (combined UMAP + HDBSCAN search space, objective weights, trial budget, reproducibility seeds/repeats); default: `config/umap_hdbscan_optuna.yaml`. |
+| `--log-file`                         | no       | If given, also append logs to this file, in addition to the console. |
 
 ## 6. PaCMAP + HDBSCAN clustering
 
@@ -466,6 +472,7 @@ identical to step 5's.
 | `--assignments-output-path`          | yes      | Output cluster-assignments Parquet path. |
 | `--metrics-output-path`              | yes      | Output metrics JSON path. |
 | `--config-path`                      | no       | Optuna search config YAML (combined PaCMAP + HDBSCAN search space, objective weights, trial budget, reproducibility seeds/repeats); default: `config/pacmap_hdbscan_optuna.yaml`. |
+| `--log-file`                         | no       | If given, also append logs to this file, in addition to the console. |
 
 ## 7. Scatterplot visualization
 
@@ -513,6 +520,7 @@ HTML file wholesale; there is no append/skip-if-exists/merge behavior.
 | `--seed`            | no       | Override the 2D UMAP projection's seed (default: reuse that method's own optimal-run seed). |
 | `--embeddings-path` | no       | Embeddings Parquet path to read when a fresh 2D projection is needed (every method except `umap_hdbscan` reusing an already-2D persisted projection via `--reduced-embeddings-path`). |
 | `--reduced-embeddings-path` | no | For `--method umap_hdbscan` only: that run's persisted reduced-embeddings Parquet path, reused as-is instead of fitting a fresh projection if its winning config was already 2D. |
+| `--log-file`        | no       | If given, also append logs to this file, in addition to the console. |
 
 ### Example: full pipeline for one condition
 
