@@ -107,7 +107,7 @@ class OptunaSearchConfig:
     n_trials: int
     sampler_seed: int
     study_dir: Path
-    reports_dir: Path
+    results_dir: Path
     reproducibility: ReproducibilityConfig | None = None
 
 
@@ -190,7 +190,7 @@ def load_optuna_config(path: Path, require_reproducibility: bool) -> OptunaSearc
     n_trials = raw.get("n_trials", DEFAULT_N_TRIALS)
     sampler_seed = raw.get("sampler_seed", 42)
     study_dir = REPO_ROOT / raw["study_dir"]
-    reports_dir = REPO_ROOT / raw["reports_dir"]
+    results_dir = REPO_ROOT / raw["results_dir"]
 
     if not (1 <= n_trials <= MAX_N_TRIALS):
         raise ValueError(f"n_trials={n_trials} must be between 1 and {MAX_N_TRIALS}")
@@ -229,7 +229,7 @@ def load_optuna_config(path: Path, require_reproducibility: bool) -> OptunaSearc
         n_trials=n_trials,
         sampler_seed=sampler_seed,
         study_dir=study_dir,
-        reports_dir=reports_dir,
+        results_dir=results_dir,
         reproducibility=reproducibility,
     )
 
