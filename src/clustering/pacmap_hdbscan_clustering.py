@@ -415,7 +415,7 @@ def run(
         }
 
     study_name = f"{slug}_pacmap_hdbscan"
-    study = optuna_search.build_study(study_name, config.sampler_seed)
+    study = optuna_search.build_study(study_name = study_name, sampler_seed = config.sampler_seed)
 
     trial_cache: dict[int, dict] = {}
 
