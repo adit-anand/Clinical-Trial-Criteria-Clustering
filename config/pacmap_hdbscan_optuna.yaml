@@ -33,20 +33,18 @@ search_space:
     kind: int
     low: 5
     high: 300
-  cluster_selection_epsilon:
-    kind: float
-    low: 0.0
-    high: 1.0
   cluster_selection_method:
     kind: categorical
     choices: [eom, leaf]
-  alpha:
-    kind: float
-    low: 0.5
-    high: 2.0
 
 fixed:
   distance: cosine
+  # Low-sensitivity HDBSCAN params, held fixed at their library defaults
+  # rather than swept: `cluster_selection_epsilon` is forced to 0.0 inside
+  # `HDBSCANClusterer` whenever `metric == "cosine"` anyway (see
+  # hdbscan_model.py), so sweeping it here was already a no-op dimension.
+  cluster_selection_epsilon: 0.0
+  alpha: 1.0
 
 # Each trial fits this many seeds x repeats-per-seed before being scored,
 # picking the most reproducible seed (see reduction_sweep.py).

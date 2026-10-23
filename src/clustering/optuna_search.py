@@ -476,6 +476,9 @@ def build_study(storage_path: Path, study_name: str, sampler_seed: int) -> "optu
             are created if missing.
         study_name: The study's name (used as the resume key).
         sampler_seed: Seed for `optuna.samplers.TPESampler`, for reproducible sampling.
+            The sampler is `multivariate=True`, so it models correlated
+            hyperparameters (e.g. `min_cluster_size`/`min_samples`) jointly
+            rather than as independent per-parameter marginals.
 
     Returns:
         The created or resumed `optuna.Study`, with `direction="maximize"`.
@@ -489,7 +492,7 @@ def build_study(storage_path: Path, study_name: str, sampler_seed: int) -> "optu
         study_name=study_name,
         load_if_exists=True,
         direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=sampler_seed),
+        sampler=optuna.samplers.TPESampler(seed=sampler_seed, multivariate=True),
     )
 
 

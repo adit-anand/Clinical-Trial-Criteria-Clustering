@@ -374,9 +374,9 @@ def run(
             min_cluster_size=hyperparams["min_cluster_size"],
             min_samples=hyperparams["min_samples"],
             metric=pacmap_distance,
-            cluster_selection_epsilon=hyperparams["cluster_selection_epsilon"],
+            cluster_selection_epsilon=config.fixed["cluster_selection_epsilon"],
             cluster_selection_method=hyperparams["cluster_selection_method"],
-            alpha=hyperparams["alpha"],
+            alpha=config.fixed["alpha"],
         )
 
     def evaluate_trial(hyperparams: dict) -> dict:
