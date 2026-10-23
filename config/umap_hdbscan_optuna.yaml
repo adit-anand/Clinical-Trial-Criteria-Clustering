@@ -69,4 +69,4 @@ n_trials: 50
 sampler_seed: 42
 
 study_dir: data/clustering/umap_hdbscan/optuna_studies
-reports_dir: data/clustering/reports
+results_dir: data/clustering/umap_hdbscan

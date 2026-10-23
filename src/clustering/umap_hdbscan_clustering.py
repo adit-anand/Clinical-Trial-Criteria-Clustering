@@ -39,7 +39,7 @@ The run writes three output artifacts, at the paths given via
 
 Re-running this step against the same output paths overwrites all three
 existing output files (and the trial-history CSV) wholesale; only the
-Optuna study's own SQLite storage accumulates across runs.
+Optuna study's own file-based storage accumulates across runs.
 """
 
 import argparse
@@ -379,7 +379,7 @@ def run(
         }
 
     study_name = f"{slug}_umap_hdbscan"
-    storage_path = config.study_dir / f"{study_name}_study.csv"
+    storage_path = config.study_dir / f"{study_name}_study.journal"
     study = optuna_search.build_study(storage_path, study_name, config.sampler_seed)
 
     trial_cache: dict[int, dict] = {}
@@ -419,7 +419,7 @@ def run(
         logger.info("run: study %r already has >= %d trial(s); skipping new trials", study_name, config.n_trials)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    trial_history_path = config.reports_dir / f"{study_name}_optuna_trials_{timestamp}.csv"
+    trial_history_path = config.results_dir / f"{study_name}_optuna_trials_{timestamp}.csv"
     optuna_search.export_trial_history(study, trial_history_path)
 
     status_counts = optuna_search.count_trial_statuses(study)

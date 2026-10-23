@@ -12,7 +12,7 @@ never fit at all — returns a value on the same comparable scale, so
 "the best trial never fit" (nothing to write) from every other case.
 
 Deliberate exception to this repo's overwrite-on-rerun convention: the
-Optuna study's SQLite storage (`build_study`) accumulates across runs by
+Optuna study's file-based storage (`build_study`) accumulates across runs by
 design — re-running the same command resumes the same study rather than
 starting over, joining the BERT feature's embedding cache as the second such
 exception in this repo. Every other artifact (assignments Parquet, metrics
@@ -465,10 +465,14 @@ def compute_dr_metrics(
 
 
 def build_study(storage_path: Path, study_name: str, sampler_seed: int) -> "optuna.Study":
-    """Create or resume a SQLite-backed Optuna study.
+    """Create or resume a file-based Optuna study.
+
+    Uses `optuna.storages.JournalStorage` over a `JournalFileBackend`
+    (a plain append-only file) rather than the SQLite/SQLAlchemy storage
+    backend, so resuming a study carries no SQLite dependency.
 
     Args:
-        storage_path: Path to the study's SQLite file. Parent directories
+        storage_path: Path to the study's journal file. Parent directories
             are created if missing.
         study_name: The study's name (used as the resume key).
         sampler_seed: Seed for `optuna.samplers.TPESampler`, for reproducible sampling.
@@ -477,8 +481,11 @@ def build_study(storage_path: Path, study_name: str, sampler_seed: int) -> "optu
         The created or resumed `optuna.Study`, with `direction="maximize"`.
     """
     storage_path.parent.mkdir(parents=True, exist_ok=True)
+    storage = optuna.storages.JournalStorage(
+        optuna.storages.journal.JournalFileBackend(str(storage_path))
+    )
     return optuna.create_study(
-        storage=f"sqlite:///{storage_path}",
+        storage=storage,
         study_name=study_name,
         load_if_exists=True,
         direction="maximize",
@@ -542,7 +549,7 @@ def best_trial_or_none(study: "optuna.Study") -> "optuna.trial.FrozenTrial | Non
     need to re-rank anything.
 
     Note: `study.best_trial` may be a trial from a *previous* process
-    invocation (the study resumed from its SQLite storage). Optuna's storage
+    invocation (the study resumed from its file-based storage). Optuna's storage
     only persists a trial's hyperparameters and score, never the caller's
     own in-memory fit artifacts (fitted labels/probabilities/reduced
     matrices) — a resumed best trial is therefore never present in the

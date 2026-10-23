@@ -365,12 +365,12 @@ deliberately excluded), folded with noise-fraction/dominant-cluster-share/
 cluster-count/micro-cluster-fragmentation penalties (weights configurable
 in the YAML file) — is the single ranking criterion: it drives Optuna's own
 trial selection *and* determines which trial's result gets written. The
-study is resumable (SQLite-backed, under the YAML file's `study_dir`):
+study is resumable (file-backed, under the YAML file's `study_dir`):
 re-running the same command against the same input continues the same
 study rather than starting over, and the configured `n_trials` (default
 `50`, capped at `100`) is a *total* budget across resumes, not re-added
 every invocation. A full per-trial history CSV is written under the YAML
-file's `reports_dir` (`data/clustering/reports/` by default) on every run.
+file's `results_dir` (`data/clustering/reports/` by default) on every run.
 
 It writes the reduced embeddings, cluster assignments, and metrics to
 `--reduced-embeddings-output-path`/`--assignments-output-path`/
@@ -411,7 +411,7 @@ same composite score is still written, with `metrics_valid=false`
 recorded — nothing is written only if every trial in the study was invalid
 (never fit at all). Re-running this step against the same output paths
 overwrites all three existing output files (and the trial-history CSV)
-wholesale; only the Optuna study's own SQLite storage accumulates across
+wholesale; only the Optuna study's own file-based storage accumulates across
 runs.
 
 The YAML config's `n_trials` is capped at 100; `reproducibility.seeds` is
