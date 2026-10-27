@@ -1,9 +1,9 @@
 """Render an interactive 2D UMAP scatterplot of an already-clustered method's output.
 
-Every clustering step (`kmeans_clustering.py`, `umap_hdbscan_clustering.py`,
+Every clustering step (`umap_hdbscan_clustering.py`,
 `pacmap_hdbscan_clustering.py`) writes cluster assignments and metrics, but
 none of them render anything visual. This module reads whichever one of
-those three methods' output the caller points it at via explicit path flags
+those two methods' output the caller points it at via explicit path flags
 (it never re-runs clustering) and writes an interactive HTML scatterplot of
 those criteria in a 2-dimensional UMAP space, colored by cluster assignment,
 with a legend and a hover tooltip showing each point's criterion text.
@@ -11,7 +11,6 @@ with a legend and a hover tooltip showing each point's criterion text.
 The 2-dimensional projection always reuses that method's own "optimal run"
 seed rather than introducing new randomness:
 
-    kmeans          -> `kmeans_params.random_state` (always a concrete value)
     umap_hdbscan    -> `winning_seed`; if that run's winning configuration
                        was already 2-dimensional, its persisted reduced
                        embeddings are reused directly (via
@@ -59,8 +58,7 @@ logger = logging.getLogger(__name__)
 # Used only when a method has no recorded clustering-time seed at all. No
 # currently-registered method lacks one (every `VisualizationSpec` below
 # resolves a concrete seed), but this stays as a safety net for a future
-# method that might not — matches this project's existing seed-default
-# convention (e.g. KMeansClusterer.DEFAULT_RANDOM_STATE).
+# method that might not.
 DEFAULT_FALLBACK_SEED = 42
 
 
@@ -105,12 +103,6 @@ def _no_persisted_projection(metrics: dict, reduced_embeddings_path: Path | None
 
 
 VISUALIZATION_SPECS: dict[str, VisualizationSpec] = {
-    "kmeans": VisualizationSpec(
-        key="kmeans",
-        assignments_suffix="_trials_clusters.parquet",
-        extract_seed_fn=lambda m: (m.get("kmeans_params") or {}).get("random_state"),
-        persisted_projection_fn=_no_persisted_projection,
-    ),
     "umap_hdbscan": VisualizationSpec(
         key="umap_hdbscan",
         assignments_suffix="_trials_umap_hdbscan_clusters.parquet",
@@ -267,8 +259,8 @@ def build_plot_frame(assignments_table: pa.Table, points_2d: np.ndarray) -> dict
         points_2d: As returned by `resolve_points`, row-aligned with `assignments_table`.
 
     Returns:
-        A dict with keys `x`, `y`, `cluster_label` (`"noise"` for `cluster_id
-        == -1`; k-means never produces this), `criterion_text`, `nct_id`.
+        A dict with keys `x`, `y`, `cluster_label` (`"noise"` for
+        `cluster_id == -1`), `criterion_text`, `nct_id`.
     """
     cluster_ids = assignments_table.column("cluster_id").to_pylist()
     cluster_labels = ["noise" if cluster_id == -1 else str(cluster_id) for cluster_id in cluster_ids]

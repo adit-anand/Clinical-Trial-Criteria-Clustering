@@ -1,11 +1,11 @@
 """Shared, algorithm-agnostic I/O for the clustering pipeline stages.
 
-`kmeans_clustering.py`, `pacmap_hdbscan_clustering.py`, and
-`umap_hdbscan_clustering.py` all read the same embeddings Parquet input
-format and write cluster assignments plus a metrics JSON in a similar
-shape. This module holds the logic that is genuinely common to all of them
-— reading/filtering/validating the input embeddings table and writing
-output artifacts — so no algorithm-specific module re-implements it.
+`pacmap_hdbscan_clustering.py` and `umap_hdbscan_clustering.py` both read the
+same embeddings Parquet input format and write cluster assignments plus a
+metrics JSON in a similar shape. This module holds the logic that is
+genuinely common to both of them — reading/filtering/validating the input
+embeddings table and writing output artifacts — so no algorithm-specific
+module re-implements it.
 
 Nothing here branches on "which algorithm am I"; algorithm-specific concerns
 (fitting, per-algorithm metrics, per-algorithm output columns) stay in each
@@ -221,8 +221,8 @@ def build_base_metrics_dict(
     """Build the metrics-JSON envelope fields common to both algorithms.
 
     Each algorithm's own `build_metrics_dict` merges this dict with its own
-    algorithm-specific keys (e.g. `kmeans_params`/`k_selection` for k-means,
-    `hdbscan_params`/`noise_count`/`noise_fraction` for HDBSCAN).
+    algorithm-specific keys (e.g. `hdbscan_params`/`noise_count`/
+    `noise_fraction` for HDBSCAN).
 
     Args:
         label: Human-readable label for this run, derived from `input_path`'s

@@ -1,9 +1,8 @@
 """Generate a consolidated clustering performance report across algorithms.
 
 Reads the existing per-algorithm clustering metrics JSON artifacts already
-written by `kmeans_clustering.py`, `umap_hdbscan_clustering.py`, and
-`pacmap_hdbscan_clustering.py` (whichever of their metrics paths the caller
-passes in) and renders one consolidated,
+written by `umap_hdbscan_clustering.py` and `pacmap_hdbscan_clustering.py`
+(whichever of their metrics paths the caller passes in) and renders one consolidated,
 human-readable Markdown report comparing their clustering performance side
 by side. This module never re-runs clustering — it only reads artifacts
 that already exist on disk.
@@ -68,11 +67,11 @@ class AlgorithmSpec:
 
     Attributes:
         key: Short identifier used to key per-algorithm results (e.g.
-            "kmeans"); also used to derive this algorithm's CLI flag
+            "umap_hdbscan"); also used to derive this algorithm's CLI flag
             (`--{key.replace("_", "-")}-metrics-path`).
-        display_name: Human-readable name shown in the report (e.g. "K-Means").
+        display_name: Human-readable name shown in the report (e.g. "UMAP + HDBSCAN").
         metrics_suffix: This algorithm's metrics JSON filename suffix (e.g.
-            "_trials_cluster_metrics.json") — used only to recover a
+            "_trials_umap_hdbscan_cluster_metrics.json") — used only to recover a
             human-readable label from whichever metrics path the caller gives.
         extra_fields_fn: Extracts this algorithm's non-shared metric fields
             from its parsed metrics dict as a list of (label, formatted value)
@@ -108,37 +107,6 @@ def _format_percent(count: int, total: int) -> str:
     """Format `count` out of `total` as "<count> / <total> (<pct>%)"."""
     pct = (count / total * 100) if total else 0.0
     return f"{count} / {total} ({pct:.1f}%)"
-
-
-def kmeans_extra_fields(data: dict) -> list[tuple[str, str]]:
-    """Extract k-means-only fields (no equivalent in other algorithms).
-
-    Args:
-        data: A parsed k-means metrics dict (as produced by
-            `kmeans_clustering.KMeansClusterer.build_metrics_dict`).
-
-    Returns:
-        Label/formatted-value pairs for inertia, requested/actual cluster
-        counts, and how `k` was selected. Uses `.get(...)` throughout so an
-        unexpected/partial schema degrades to "N/A" fields rather than raising.
-    """
-    metrics = data.get("metrics") or {}
-    inertia = metrics.get("inertia")
-    k_selection = data.get("k_selection") or {}
-    mode = k_selection.get("mode")
-    if mode == "auto":
-        k_range = f"auto (searched k={k_selection.get('k_min')}..{k_selection.get('k_max')})"
-    elif mode == "fixed":
-        k_range = "fixed"
-    else:
-        k_range = "N/A"
-
-    return [
-        ("Inertia", f"{inertia:.4f}" if inertia is not None else "N/A"),
-        ("Clusters requested", str(data.get("n_clusters_requested", "N/A"))),
-        ("Clusters found", str(data.get("n_clusters_actual", "N/A"))),
-        ("k-selection mode", k_range),
-    ]
 
 
 def umap_hdbscan_extra_fields(data: dict) -> list[tuple[str, str]]:
@@ -202,12 +170,6 @@ def pacmap_hdbscan_extra_fields(data: dict) -> list[tuple[str, str]]:
 
 
 ALGORITHM_SPECS: list[AlgorithmSpec] = [
-    AlgorithmSpec(
-        key="kmeans",
-        display_name="K-Means",
-        metrics_suffix="_trials_cluster_metrics.json",
-        extra_fields_fn=kmeans_extra_fields,
-    ),
     AlgorithmSpec(
         key="umap_hdbscan",
         display_name="UMAP + HDBSCAN",

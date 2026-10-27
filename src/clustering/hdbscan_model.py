@@ -175,9 +175,8 @@ class HDBSCANClusterer:
 
         Silhouette score, the Davies-Bouldin index, and the Calinski-Harabasz
         index are computed only over non-noise points (`label >= 0`), guarded
-        the same way the k-means pipeline guards its own metrics (requires
-        2 <= n_clusters_actual <= n_non_noise - 1 among non-noise points);
-        when that guard fails (e.g. an all-noise or single-cluster result),
+        to require 2 <= n_clusters_actual <= n_non_noise - 1 among non-noise
+        points; when that guard fails (e.g. an all-noise or single-cluster result),
         the three metrics are reported as `None` with an explanatory note
         rather than letting sklearn raise. `noise_count`/`noise_fraction` are
         always reported, regardless of whether the metrics could be computed.

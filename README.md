@@ -18,15 +18,10 @@ as the next step's input path.
 2. **`src/embeddings/criteria_embedding.py`** — reads that CSV, embeds each
    criterion's text with a configurable backend, and writes the result to
    the given Parquet path.
-3. **`src/clustering/kmeans_clustering.py`** — reads that Parquet file,
-   clusters the embedding vectors via k-means, sweeping the Cartesian
-   product of its `k_min`/`k_max`/`random_state` value lists (a single
-   value per flag is a sweep of size one) and writing the best-performing
-   combination's cluster assignments plus performance metrics.
-4. **`src/clustering/clustering_report.py`** — reads whichever of the
+3. **`src/clustering/clustering_report.py`** — reads whichever of the
    clustering steps' metrics JSON paths are passed to it, and writes one
    consolidated Markdown report comparing their performance side by side.
-5. **`src/clustering/umap_hdbscan_clustering.py`** — reduces embeddings with
+4. **`src/clustering/umap_hdbscan_clustering.py`** — reduces embeddings with
    UMAP before clustering the reduced vectors with HDBSCAN, both tuned
    jointly by one Optuna search (search space/objective weights/trial
    budget come from a `--config-path` YAML file, not CLI flags; each trial
@@ -37,10 +32,10 @@ as the next step's input path.
    HDBSCAN fitting/metrics code and Optuna search engine shared by both
    reducer-based steps live in `src/clustering/hdbscan_model.py` and
    `src/clustering/optuna_search.py`.
-6. **`src/clustering/pacmap_hdbscan_clustering.py`** — the same idea as step
-   5, reducing with PaCMAP instead of UMAP. The seed/repeat reproducibility
+5. **`src/clustering/pacmap_hdbscan_clustering.py`** — the same idea as step
+   4, reducing with PaCMAP instead of UMAP. The seed/repeat reproducibility
    mechanics both steps share live in `src/clustering/reduction_sweep.py`.
-7. **`src/clustering/clustering_scatterplot.py`** — reads whichever
+6. **`src/clustering/clustering_scatterplot.py`** — reads whichever
    clustering method's output paths are passed to it and writes an
    interactive HTML scatterplot of its criteria in a 2-dimensional UMAP
    space (colored by cluster), reusing that method's own optimal-run seed
@@ -62,8 +57,8 @@ when it detects direct execution, so both styles behave identically.
 
 ```
 config/
-├── pacmap_hdbscan_optuna.yaml             # Optuna search config for step 6
-└── umap_hdbscan_optuna.yaml               # Optuna search config for step 5
+├── pacmap_hdbscan_optuna.yaml             # Optuna search config for step 5
+└── umap_hdbscan_optuna.yaml               # Optuna search config for step 4
 src/
 ├── paths.py                              # shared REPO_ROOT constant
 ├── logging_utils.py                      # shared console+optional-file logging setup
@@ -77,35 +72,33 @@ src/
 │   └── criteria_embedding.py             # orchestration + CLI (step 2)
 └── clustering/
     ├── clustering_io.py                  # shared read/write logic
-    ├── kmeans_clustering.py              # step 3
-    ├── hdbscan_model.py                  # shared HDBSCAN fitting/metrics (steps 5-6)
-    ├── optuna_search.py                  # shared Optuna search engine (steps 5-6)
-    ├── clustering_report.py              # step 4
-    ├── reduction_sweep.py                # shared seed/repeat reproducibility engine (steps 5-6)
-    ├── umap_hdbscan_clustering.py        # step 5
-    ├── pacmap_hdbscan_clustering.py      # step 6
-    └── clustering_scatterplot.py         # step 7
+    ├── hdbscan_model.py                  # shared HDBSCAN fitting/metrics (steps 4-5)
+    ├── optuna_search.py                  # shared Optuna search engine (steps 4-5)
+    ├── clustering_report.py              # step 3
+    ├── reduction_sweep.py                # shared seed/repeat reproducibility engine (steps 4-5)
+    ├── umap_hdbscan_clustering.py        # step 4
+    ├── pacmap_hdbscan_clustering.py      # step 5
+    └── clustering_scatterplot.py         # step 6
 ```
 
 Within `src/clustering/`, `clustering_io.py` holds everything genuinely
 common to every clustering algorithm (reading/validating embeddings,
-writing output); each algorithm module (`kmeans_clustering.py`,
-`umap_hdbscan_clustering.py`, `pacmap_hdbscan_clustering.py`) holds only its
-own fitting and metrics logic, so adding another clustering algorithm means
-adding one new sibling module, not touching the shared I/O layer or the
-other algorithms. `clustering_report.py` builds on top of that same layer
-without modifying it. `umap_hdbscan_clustering.py` and
-`pacmap_hdbscan_clustering.py` share `hdbscan_model.py` (the HDBSCAN
-fitting/metrics class both reduce into, since standalone HDBSCAN clustering
-is not a pipeline in this repo — only these two reducer-based steps use
-it) and `optuna_search.py` — the Optuna config loader, hyperparameter
-suggestion, composite objective scoring, and study-lifecycle/trial-history
-mechanics common to both, so neither re-implements it. They additionally
-share `reduction_sweep.py`, which holds the reducer-agnostic seed/repeat
-reproducibility mechanics each of their Optuna trials runs internally
-(picking the most reproducible seed, then a representative repeat) so
-neither module re-implements it.
-`clustering_scatterplot.py` reads whichever of the three algorithms' output
+writing output); each algorithm module (`umap_hdbscan_clustering.py`,
+`pacmap_hdbscan_clustering.py`) holds only its own fitting and metrics
+logic, so adding another clustering algorithm means adding one new sibling
+module, not touching the shared I/O layer or the other algorithms.
+`clustering_report.py` builds on top of that same layer without modifying
+it. `umap_hdbscan_clustering.py` and `pacmap_hdbscan_clustering.py` share
+`hdbscan_model.py` (the HDBSCAN fitting/metrics class both reduce into,
+since standalone HDBSCAN clustering is not a pipeline in this repo — only
+these two reducer-based steps use it) and `optuna_search.py` — the Optuna
+config loader, hyperparameter suggestion, composite objective scoring, and
+study-lifecycle/trial-history mechanics common to both, so neither
+re-implements it. They additionally share `reduction_sweep.py`, which holds
+the reducer-agnostic seed/repeat reproducibility mechanics each of their
+Optuna trials runs internally (picking the most reproducible seed, then a
+representative repeat) so neither module re-implements it.
+`clustering_scatterplot.py` reads whichever of the two algorithms' output
 already exists (via its own `VISUALIZATION_SPECS` registry, one entry per
 algorithm, following the same "no branching elsewhere" pattern
 `clustering_report.py`'s `ALGORITHM_SPECS` already established) and never
@@ -203,114 +196,15 @@ file; there is no append/skip-if-exists/merge behavior.
   `Qwen/Qwen3-Embedding-8B`), which can be slow/memory-heavy on first run as
   the model downloads.
 
-## 3. Clustering criteria
-
-```bash
-uv run python -m src.clustering.kmeans_clustering \
-  --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --criterion-type inclusion \
-  --assignments-output-path data/clustering/kmeans/breast_cancer_inclusion_trials_clusters.parquet \
-  --metrics-output-path data/clustering/kmeans/breast_cancer_inclusion_trials_cluster_metrics.json \
-  --k-min 10,15 --k-max 50,100 --random-state 1,2,3
-
-uv run python -m src.clustering.kmeans_clustering \
-  --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --criterion-type exclusion \
-  --assignments-output-path data/clustering/kmeans/breast_cancer_exclusion_trials_clusters.parquet \
-  --metrics-output-path data/clustering/kmeans/breast_cancer_exclusion_trials_cluster_metrics.json \
-  --k-min 10,15 --k-max 50,100 --random-state 1,2,3
-```
-
-`--criterion-type` is required and splits every clustering run into two
-independent invocations — `inclusion` and `exclusion` — rather than
-clustering all criteria for a condition together. Rows whose
-`criterion_type` is `"both"` (unstructured eligibility text with no
-inclusion/exclusion headers to split on) are included in *both* runs, since
-they cannot be confidently assigned to only one side. Give each run its own
-output filenames (as shown above) — output paths are always explicit, never
-derived from the input filename, so nothing stops you from accidentally
-overwriting one side's results with the other's if you reuse the same path.
-
-This reads the Parquet file given via `--input-path`, filters it down to the
-selected `--criterion-type` side, drops rows whose embedding failed, and
-clusters the remaining embedding vectors via k-means,
-sweeping the Cartesian product of the supplied `--k-min`/`--k-max`/
-`--random-state` value lists (a single value per flag — the default — is
-simply a sweep of size one). For each `(k_min, k_max, random_state)`
-combination, the number of clusters (`k`) is **auto-selected**: k-means is
-fit once per candidate `k` in `[k_min, k_max]` with that `random_state`, and
-the `k` with the highest silhouette score is kept as that combination's
-result. The single overall winner across every combination is then whichever
-one's chosen `k` has the highest silhouette score of all. Pass `--n-clusters`
-to skip `k`-selection entirely and fix `k` — in that mode, `--k-min`/
-`--k-max` are ignored and only `--random-state` is swept, over that fixed
-`k`. Either way, it writes the winning combination's cluster assignments and
-metrics to `--assignments-output-path`/`--metrics-output-path`.
-
-The Parquet file has one row per successfully-embedded criterion, containing
-`nct_id`, `study_first_posted_date`, `criterion_text`, `criterion_type`,
-`cluster_id`, `embedding_backend`, `embedding_model`, and `clustered_at`. The
-JSON file reports run provenance (sample/cluster counts, k-means parameters)
-plus clustering performance metrics: inertia, silhouette score, the
-Davies-Bouldin index, and the Calinski-Harabasz index. The silhouette,
-Davies-Bouldin, and Calinski-Harabasz scores require between 2 and
-`n_samples - 1` distinct clusters to be computable; if a run falls outside
-that range (e.g. due to empty-cluster collapse), those three metrics are
-reported as `null` with an explanatory note and `metrics_valid` is `false`.
-A `k_selection` object records whether `k` was `"auto"`-selected or `"fixed"`,
-the winning combination's search bounds, and its full per-`k` sweep results;
-a `combination_search` object separately records every `(k_min, k_max,
-random_state)` (or `random_state`-only, in fixed mode) combination tried —
-each with its own chosen `k` and silhouette score — so the choice across the
-whole sweep is auditable rather than a black box. A combination whose
-`[k_min, k_max]` range is invalid for the dataset (e.g. `k_max < k_min`) is
-skipped with a logged reason rather than aborting the rest of the sweep; if
-no combination produces a usable silhouette score, nothing is written. The
-total number of combinations is capped at 100; exceeding it raises an error
-before any fitting is attempted.
-
-Re-running this step against the same output paths overwrites both existing
-output files; there is no append/skip-if-exists/merge behavior.
-
-`--metric` controls the distance metric, held fixed across the sweep.
-sklearn's `KMeans` has no pluggable metric of its own — Lloyd's algorithm's
-centroid-averaging step is only mathematically well-defined under squared
-Euclidean distance (`--metric euclidean`, the default). `--metric cosine` is
-still offered because it has an exact equivalence: embedding vectors are
-L2-normalized to unit length *before* fitting ordinary k-means ("spherical
-k-means") — squared Euclidean distance between unit vectors is a strictly
-monotonic function of their cosine distance, so this gives identical cluster
-assignments to a true cosine-distance k-means, not an approximation. No
-other metric (e.g. manhattan) has an analogous equivalence, so none is
-offered. `kmeans_params.metric` in the metrics JSON records which was used.
-
-### Arguments
-
-| Argument                     | Required | Description                                                                 |
-| ----------------------------- | -------- | ---------------------------------------------------------------------------- |
-| `--n-clusters`                 | no       | Fix the number of k-means clusters and skip automatic selection (`--k-min`/`--k-max` are ignored if set; default: auto-select via a silhouette-score sweep). |
-| `--k-min`                      | no       | Comma-separated list of `k_min` values to sweep when auto-selecting; ignored if `--n-clusters` is set (default: `2`). |
-| `--k-max`                      | no       | Comma-separated list of `k_max` values to sweep when auto-selecting; ignored if `--n-clusters` is set (default: a single auto-computed value, `min(100, floor(sqrt(n_samples / 2)), n_samples - 1)`). |
-| `--random-state`               | no       | Comma-separated list of random seeds to sweep for k-means initialization (default: `42`). |
-| `--n-init`                     | no       | Number of k-means initializations to run per `k`, held fixed across the sweep (default: `10`). |
-| `--max-iter`                   | no       | Maximum k-means iterations per initialization, held fixed across the sweep (default: `300`). |
-| `--metric`                     | no       | Distance metric, held fixed across the sweep: `euclidean` or `cosine` (see above; default: `euclidean`). |
-| `--input-path`                 | yes      | Input embeddings Parquet path (as written by `criteria_embedding.py`). |
-| `--criterion-type`             | yes      | Which side to cluster: `inclusion` or `exclusion`. Rows with `criterion_type="both"` are included on both sides. |
-| `--assignments-output-path`    | yes      | Output cluster-assignments Parquet path. |
-| `--metrics-output-path`        | yes      | Output metrics JSON path. |
-| `--log-file`                   | no       | If given, also append logs to this file, in addition to the console. |
-
-## 4. Clustering performance report
+## 3. Clustering performance report
 
 ```bash
 uv run python -m src.clustering.clustering_report \
   --output-path data/clustering/reports/breast_cancer_clustering_report.md \
-  --kmeans-metrics-path data/clustering/kmeans/breast_cancer_trials_cluster_metrics.json \
   --umap-hdbscan-metrics-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json
 ```
 
-This reads whichever of the k-means/UMAP+HDBSCAN/PaCMAP+HDBSCAN metrics
+This reads whichever of the UMAP+HDBSCAN/PaCMAP+HDBSCAN metrics
 JSON paths are passed to it (one optional flag per algorithm: any omitted
 algorithm is reported as "not yet run") — it never re-runs clustering —
 and writes a single consolidated Markdown report comparing their
@@ -320,12 +214,12 @@ The report includes a summary table of each algorithm's availability, a
 shared-metrics comparison table (silhouette score, Davies-Bouldin index,
 Calinski-Harabasz index — the three metrics computed identically by every
 algorithm), and a detailed section per algorithm covering its own
-algorithm-specific fields (e.g. inertia and `k` selection for k-means; noise
-count/fraction and winning config/seed for the two reducer-based steps)
-plus its `metrics_valid`/`notes` status verbatim. The report also calls out
-which algorithm has the best (highest) silhouette score among those with
-valid metrics, since silhouette score is the only metric comparable across
-every algorithm's schema.
+algorithm-specific fields (e.g. noise count/fraction and winning
+config/seed for the two reducer-based steps) plus its `metrics_valid`/
+`notes` status verbatim. The report also calls out which algorithm has the
+best (highest) silhouette score among those with valid metrics, since
+silhouette score is the only metric comparable across every algorithm's
+schema.
 
 If an algorithm's metrics-path flag was omitted, or the given file is
 missing/unreadable, that algorithm's section clearly states so (naming the
@@ -338,13 +232,12 @@ wholesale.
 | Argument       | Required | Description                                                                 |
 | --------------- | -------- | ---------------------------------------------------------------------------- |
 | `--output-path` | yes      | Output Markdown report path. |
-| `--kmeans-metrics-path`         | no | K-Means metrics JSON path (omit if not yet run). |
 | `--umap-hdbscan-metrics-path`   | no | UMAP + HDBSCAN metrics JSON path (omit if not yet run). |
 | `--pacmap-hdbscan-metrics-path` | no | PaCMAP + HDBSCAN metrics JSON path (omit if not yet run). |
 | `--print`        | no       | Also print the generated report to stdout, in addition to writing the file. |
 | `--log-file`     | no       | If given, also append logs to this file, in addition to the console. |
 
-## 5. UMAP + HDBSCAN clustering
+## 4. UMAP + HDBSCAN clustering
 
 ```bash
 uv run python -m src.clustering.umap_hdbscan_clustering \
@@ -362,7 +255,7 @@ uv run python -m src.clustering.umap_hdbscan_clustering \
   --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_exclusion_trials_umap_hdbscan_cluster_metrics.json
 ```
 
-As with step 3, `--criterion-type` is required (`inclusion` or `exclusion`,
+`--criterion-type` is required (`inclusion` or `exclusion`,
 with `"both"`-typed rows included on both sides) and each side must be run
 separately with its own output filenames. The study name, its resumable
 Optuna storage journal, and its trial-history CSV filename are all derived
@@ -468,7 +361,7 @@ error before any trial runs.
 | `--config-path`                      | no       | Optuna search config YAML (combined UMAP + HDBSCAN search space, objective weights, trial budget, reproducibility seeds/repeats); default: `config/umap_hdbscan_optuna.yaml`. |
 | `--log-file`                         | no       | If given, also append logs to this file, in addition to the console. |
 
-## 6. PaCMAP + HDBSCAN clustering
+## 5. PaCMAP + HDBSCAN clustering
 
 ```bash
 uv run python -m src.clustering.pacmap_hdbscan_clustering \
@@ -487,9 +380,9 @@ uv run python -m src.clustering.pacmap_hdbscan_clustering \
 ```
 
 Same `--criterion-type` requirement and study-name-qualification behavior as
-step 5 (see above).
+step 4 (see above).
 
-The same idea as step 5, reducing with [PaCMAP](https://github.com/YingfanWang/PaCMAP)
+The same idea as step 4, reducing with [PaCMAP](https://github.com/YingfanWang/PaCMAP)
 instead of UMAP. PaCMAP has no `min_dist` equivalent — its
 neighborhood/distance behavior is instead shaped by `mn_ratio` and
 `fp_ratio` in the search space (default config: `config/pacmap_hdbscan_optuna.yaml`),
@@ -498,19 +391,19 @@ which weight mid-near vs. further point pairs during optimization.
 A large `n_neighbors` (e.g. 30+) tends to over-smooth PaCMAP's projection
 into one dominant blob — HDBSCAN then reports one giant cluster plus a
 couple of stragglers, which the `MIN_N_CLUSTERS`/`MAX_CLUSTER_SHARE`/
-`MAX_NOISE_FRACTION` guards (see step 5) correctly treat as degenerate via
+`MAX_NOISE_FRACTION` guards (see step 4) correctly treat as degenerate via
 the same continuous penalty terms, pushing Optuna's search away from that
 region over successive trials. Everything else — the seed/repeat
 reproducibility mechanics, composite objective (DBCV plus
 trustworthiness/continuity/steadiness/cohesiveness via `zadu` under cosine
 distance, folded with the same degenerate-result penalties), study
 resumability, trial-history export, and overwrite-on-rerun behavior — is
-identical to step 5. It writes the reduced embeddings, cluster assignments,
+identical to step 4. It writes the reduced embeddings, cluster assignments,
 and metrics to `--reduced-embeddings-output-path`/`--assignments-output-path`/
 `--metrics-output-path`, with the reduced-embeddings schema,
 cluster-assignments schema, and metrics JSON shape (as
 `winning_pacmap_config` instead of `winning_umap_config`) otherwise
-identical to step 5's.
+identical to step 4's.
 
 ### Arguments
 
@@ -524,7 +417,7 @@ identical to step 5's.
 | `--config-path`                      | no       | Optuna search config YAML (combined PaCMAP + HDBSCAN search space, objective weights, trial budget, reproducibility seeds/repeats); default: `config/pacmap_hdbscan_optuna.yaml`. |
 | `--log-file`                         | no       | If given, also append logs to this file, in addition to the console. |
 
-## 7. Scatterplot visualization
+## 6. Scatterplot visualization
 
 ```bash
 uv run python -m src.clustering.clustering_scatterplot \
@@ -536,7 +429,7 @@ uv run python -m src.clustering.clustering_scatterplot \
 ```
 
 This reads whichever clustering method's output paths are passed to it
-(`--method`, one of `kmeans`/`umap_hdbscan`/`pacmap_hdbscan`, plus
+(`--method`, one of `umap_hdbscan`/`pacmap_hdbscan`, plus
 `--metrics-path`/`--assignments-path`) — it never re-runs clustering — and
 writes an interactive HTML scatterplot of those criteria in a 2-dimensional
 UMAP space to `--output-path`, with points colored by cluster (a distinct
@@ -547,9 +440,8 @@ whenever a fresh 2D projection has to be fit rather than reusing a
 persisted one.
 
 The 2D projection always reuses that method's own "optimal run" seed rather
-than introducing new randomness: k-means's `kmeans_params.random_state`;
-`umap_hdbscan`/`pacmap_hdbscan`'s `winning_seed`. For `umap_hdbscan`
-specifically, if that run's winning configuration was already 2-dimensional
+than introducing new randomness: `umap_hdbscan`/`pacmap_hdbscan`'s
+`winning_seed`. For `umap_hdbscan` specifically, if that run's winning configuration was already 2-dimensional
 and you pass `--reduced-embeddings-path` pointing at its persisted
 reduced-embeddings Parquet, those coordinates are reused directly instead
 of fitting a new UMAP projection; otherwise (and always for
@@ -563,7 +455,7 @@ HTML file wholesale; there is no append/skip-if-exists/merge behavior.
 
 | Argument         | Required | Description                                                                 |
 | ----------------- | -------- | ---------------------------------------------------------------------------- |
-| `--method`          | yes      | Which clustering method's output to visualize: `kmeans`, `umap_hdbscan`, or `pacmap_hdbscan`. |
+| `--method`          | yes      | Which clustering method's output to visualize: `umap_hdbscan` or `pacmap_hdbscan`. |
 | `--metrics-path`    | yes      | That method's metrics JSON path. |
 | `--assignments-path`| yes      | That method's cluster-assignments Parquet path (the file whose rows become the plotted points). |
 | `--output-path`     | yes      | Output HTML path. |
@@ -591,13 +483,6 @@ uv run python -m src.embeddings.criteria_embedding \
 
 # --- inclusion side ---
 
-uv run python -m src.clustering.kmeans_clustering \
-  --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --criterion-type inclusion \
-  --assignments-output-path data/clustering/kmeans/breast_cancer_inclusion_trials_clusters.parquet \
-  --metrics-output-path data/clustering/kmeans/breast_cancer_inclusion_trials_cluster_metrics.json \
-  --k-min 10,15 --k-max 50,100 --random-state 1,2,3
-
 uv run python -m src.clustering.umap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --criterion-type inclusion \
@@ -614,7 +499,6 @@ uv run python -m src.clustering.pacmap_hdbscan_clustering \
 
 uv run python -m src.clustering.clustering_report \
   --output-path data/clustering/reports/breast_cancer_inclusion_clustering_report.md \
-  --kmeans-metrics-path data/clustering/kmeans/breast_cancer_inclusion_trials_cluster_metrics.json \
   --umap-hdbscan-metrics-path data/clustering/umap_hdbscan/breast_cancer_inclusion_trials_umap_hdbscan_cluster_metrics.json \
   --pacmap-hdbscan-metrics-path data/clustering/pacmap_hdbscan/breast_cancer_inclusion_trials_pacmap_hdbscan_cluster_metrics.json
 
@@ -626,13 +510,6 @@ uv run python -m src.clustering.clustering_scatterplot \
   --output-path data/clustering/umap_hdbscan/breast_cancer_inclusion_trials_umap_hdbscan_scatterplot.html
 
 # --- exclusion side (repeat with --criterion-type exclusion and matching paths) ---
-
-uv run python -m src.clustering.kmeans_clustering \
-  --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --criterion-type exclusion \
-  --assignments-output-path data/clustering/kmeans/breast_cancer_exclusion_trials_clusters.parquet \
-  --metrics-output-path data/clustering/kmeans/breast_cancer_exclusion_trials_cluster_metrics.json \
-  --k-min 10,15 --k-max 50,100 --random-state 1,2,3
 
 uv run python -m src.clustering.umap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
@@ -650,7 +527,6 @@ uv run python -m src.clustering.pacmap_hdbscan_clustering \
 
 uv run python -m src.clustering.clustering_report \
   --output-path data/clustering/reports/breast_cancer_exclusion_clustering_report.md \
-  --kmeans-metrics-path data/clustering/kmeans/breast_cancer_exclusion_trials_cluster_metrics.json \
   --umap-hdbscan-metrics-path data/clustering/umap_hdbscan/breast_cancer_exclusion_trials_umap_hdbscan_cluster_metrics.json \
   --pacmap-hdbscan-metrics-path data/clustering/pacmap_hdbscan/breast_cancer_exclusion_trials_pacmap_hdbscan_cluster_metrics.json
 
