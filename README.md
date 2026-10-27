@@ -1,4 +1,4 @@
-# amia_2026
+# Clinical Trial Criteria Clustering
 
 Pipeline for building embeddings of clinical trial eligibility criteria:
 
