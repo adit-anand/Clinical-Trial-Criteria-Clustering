@@ -10,6 +10,7 @@ noise-aware metrics, probability output) and `compute_relative_validity_index`
 
 import math
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pyarrow as pa
@@ -18,6 +19,9 @@ from sklearn.cluster import HDBSCAN
 from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score, silhouette_score
 
 from src.clustering import clustering_io
+
+if TYPE_CHECKING:
+    from src.clustering.bertopic_model import TopicRepresentation
 
 # Shared with pacmap_hdbscan_clustering.py/umap_hdbscan_clustering.py: splits
 # a reducer-pipeline trial's combined search_space dict into HDBSCAN's own
@@ -37,6 +41,8 @@ HDBSCAN_CLUSTER_PARQUET_SCHEMA = pa.schema(
         ("embedding_backend", pa.string()),
         ("embedding_model", pa.string()),
         ("clustered_at", pa.timestamp("us", tz="UTC")),
+        ("topic_keywords", pa.list_(pa.string())),
+        ("topic_label", pa.string()),
     ]
 )
 
@@ -148,6 +154,26 @@ class HDBSCANClusterer:
                 f"({n_samples}); reduce --min-cluster-size/--min-samples or provide more data"
             )
 
+    def build_estimator(self) -> HDBSCAN:
+        """Build an unfit sklearn HDBSCAN estimator from this clusterer's configuration.
+
+        Returns:
+            A fresh, unfit `HDBSCAN` estimator. Separated out of `fit_hdbscan`
+            so a caller that needs to hand an *unfit* estimator to something
+            else that fits it internally (e.g. `bertopic_model.fit_bertopic_topics`,
+            via BERTopic's own `hdbscan_model=`) can get the exact same
+            configuration without fitting it twice.
+        """
+        return HDBSCAN(
+            min_cluster_size=self.min_cluster_size,
+            min_samples=self.min_samples,
+            metric=self.metric,
+            cluster_selection_epsilon=self.cluster_selection_epsilon,
+            cluster_selection_method=self.cluster_selection_method,
+            alpha=self.alpha,
+            copy=True,
+        )
+
     def fit_hdbscan(self, embedding_matrix: np.ndarray) -> HDBSCAN:
         """Fit an HDBSCAN model over an embedding matrix.
 
@@ -158,15 +184,7 @@ class HDBSCANClusterer:
             The fitted `HDBSCAN` estimator (`.labels_` and `.probabilities_`
             are available on it).
         """
-        model = HDBSCAN(
-            min_cluster_size=self.min_cluster_size,
-            min_samples=self.min_samples,
-            metric=self.metric,
-            cluster_selection_epsilon=self.cluster_selection_epsilon,
-            cluster_selection_method=self.cluster_selection_method,
-            alpha=self.alpha,
-            copy=True,
-        )
+        model = self.build_estimator()
         model.fit(embedding_matrix)
         return model
 
@@ -287,9 +305,14 @@ class HDBSCANClusterer:
         }
 
     def build_assignment_rows(
-        self, table: pa.Table, labels: np.ndarray, probabilities: np.ndarray, clustered_at: datetime
+        self,
+        table: pa.Table,
+        labels: np.ndarray,
+        probabilities: np.ndarray,
+        topics: list["TopicRepresentation"],
+        clustered_at: datetime,
     ) -> list[dict]:
-        """Zip each surviving row's traceability columns with its cluster label and probability.
+        """Zip each surviving row's traceability columns with its cluster label, probability, and topic.
 
         Args:
             table: The table `labels`/`probabilities` were produced from (row
@@ -297,6 +320,10 @@ class HDBSCANClusterer:
             labels: One cluster id per row of `table` (`-1` for noise).
             probabilities: One cluster membership probability per row
                 (`0.0` for noise points).
+            topics: One `TopicRepresentation` per distinct cluster id present
+                in `labels` (including `-1`, BERTopic's own outlier topic),
+                as produced by `bertopic_model.fit_bertopic_topics`. Every row
+                sharing a cluster id gets that cluster's own keywords/label.
             clustered_at: Wall-clock time this clustering run completed.
 
         Returns:
@@ -304,9 +331,11 @@ class HDBSCANClusterer:
             `HDBSCAN_CLUSTER_PARQUET_SCHEMA`'s columns.
         """
         columns = clustering_io.extract_traceability_columns(table)
+        topics_by_id = {topic.topic_id: topic for topic in topics}
 
         rows = []
         for i in range(table.num_rows):
+            topic = topics_by_id[int(labels[i])]
             rows.append(
                 {
                     "nct_id": columns["nct_id"][i],
@@ -318,6 +347,8 @@ class HDBSCANClusterer:
                     "embedding_backend": columns["embedding_backend"][i],
                     "embedding_model": columns["embedding_model"][i],
                     "clustered_at": clustered_at,
+                    "topic_keywords": topic.keywords,
+                    "topic_label": topic.label,
                 }
             )
         return rows

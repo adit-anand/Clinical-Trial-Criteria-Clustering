@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "bertopic>=0.17.0",
     "hdbscan>=0.8.44",
     "optuna>=5.0.0",
     "pacmap>=0.9.1",

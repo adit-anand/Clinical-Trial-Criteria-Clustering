@@ -1,16 +1,26 @@
-"""Generic "reduce, then cluster with HDBSCAN, tuned by Optuna" orchestration.
+"""Generic "reduce, then cluster with BERTopic-wrapped HDBSCAN, tuned by Optuna" orchestration.
 
 `umap_hdbscan_clustering.py` and `pacmap_hdbscan_clustering.py` both reduce a
 condition's embeddings with their own reducer before clustering the reduced
-vectors with HDBSCAN, tuning both jointly via one Optuna search. Everything
-about that orchestration — reading/filtering input, building the Optuna
-objective, resolving the winning trial, writing the three output artifacts —
-is identical between them; the only real differences are reducer-specific
+vectors, tuning both jointly via one Optuna search. Everything about that
+orchestration — reading/filtering input, building the Optuna objective,
+resolving the winning trial, writing the three output artifacts — is
+identical between them; the only real differences are reducer-specific
 (hyperparameter names, the fit callable, the fixed-metric config key, and a
 couple of output field names). This module holds that shared orchestration
 once, parametrized by a `ReducerPlugin` describing exactly those differences,
 so each reducer module is a thin shell: its own hyperparameter
 validation/fit function plus a `ReducerPlugin` instance and CLI entry point.
+
+Each Optuna trial's seed/repeat reproducibility sweep (`reduction_sweep.py`)
+is unchanged — it still picks the most reproducible seed and a representative
+repeat via a plain HDBSCAN fit. BERTopic is layered on *after* that
+selection, fit exactly once per trial on the representative repeat's already-
+reduced embeddings, reusing that trial's own HDBSCAN hyperparameters (see
+`bertopic_model.fit_bertopic_topics`). BERTopic's own resulting cluster
+assignments — not the sweep's earlier plain-HDBSCAN fit — are what the
+Optuna objective scores and what gets written for the winning trial, per
+`_specs/bertopic-clustering.md`.
 
 Nothing here branches on which reducer is in use outside of reading from
 `ReducerPlugin` — adding a further reducer means adding one new sibling
@@ -30,10 +40,16 @@ import pyarrow as pa
 
 from src.logging_utils import configure_logging
 from src.paths import label_from_slug, slug_from_filename
+from src.clustering import bertopic_model
 from src.clustering import clustering_io
 from src.clustering import optuna_search
 from src.clustering import reduction_sweep
-from src.clustering.hdbscan_model import HDBSCAN_CLUSTER_PARQUET_SCHEMA, HDBSCAN_PARAM_NAMES, HDBSCANClusterer
+from src.clustering.hdbscan_model import (
+    HDBSCAN_CLUSTER_PARQUET_SCHEMA,
+    HDBSCAN_PARAM_NAMES,
+    HDBSCANClusterer,
+    compute_relative_validity_index,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -138,14 +154,18 @@ def build_metrics_dict(
     embedding_dim: int,
     embedding_backend: str | None,
     embedding_model: str | None,
-    hdbscan_clusterer: HDBSCANClusterer,
     candidate: reduction_sweep.ReducerConfigCandidate,
+    metrics_result: dict,
+    relative_validity: float | None,
+    bertopic_result: bertopic_model.BERTopicFitResult,
+    candidate_labels: list[str],
+    zeroshot_model: str,
     seeds: list[int],
     repeats_per_seed: int,
     fixed_metric: str,
     clustered_at: datetime,
 ) -> dict:
-    """Assemble the full metrics JSON payload for one reducer+HDBSCAN run.
+    """Assemble the full metrics JSON payload for one reducer+BERTopic run.
 
     Args:
         plugin: This reducer's `ReducerPlugin`.
@@ -159,8 +179,15 @@ def build_metrics_dict(
         embedding_dim: Original (non-reduced) embedding dimensionality.
         embedding_backend: Backend recorded on the clustered rows.
         embedding_model: Model recorded on the clustered rows.
-        hdbscan_clusterer: The winning trial's `HDBSCANClusterer`.
-        candidate: The winning trial's `ReducerConfigCandidate`.
+        candidate: The winning trial's `ReducerConfigCandidate` (from the
+            seed/repeat reproducibility sweep — its own `.notes` are
+            provenance about the reducer's chosen seed, independent of BERTopic).
+        metrics_result: `HDBSCANClusterer.compute_metrics`'s return value,
+            computed from `bertopic_result.labels` (not the sweep's own labels).
+        relative_validity: The DBCV score, computed from `bertopic_result.labels`.
+        bertopic_result: The winning trial's `bertopic_model.BERTopicFitResult`.
+        candidate_labels: The `--candidate-labels` this run was configured with.
+        zeroshot_model: The `--zeroshot-model` this run was configured with.
         seeds: The configured reproducibility seed list.
         repeats_per_seed: Number of repeats run per seed.
         fixed_metric: This reducer's fixed distance metric value.
@@ -169,7 +196,6 @@ def build_metrics_dict(
     Returns:
         A JSON-serializable dict.
     """
-    representative = reduction_sweep.representative_repeat(candidate)
     base = clustering_io.build_base_metrics_dict(
         label=label,
         criterion_type=criterion_type,
@@ -180,27 +206,25 @@ def build_metrics_dict(
         embedding_dim=embedding_dim,
         embedding_backend=embedding_backend,
         embedding_model=embedding_model,
-        cluster_sizes=clustering_io.compute_cluster_sizes(representative.labels),
+        cluster_sizes=clustering_io.compute_cluster_sizes(bertopic_result.labels),
         clustered_at=clustered_at,
     )
     return {
         **base,
         "reduced_embeddings_output_path": clustering_io.relative_to_repo_root(reduced_embeddings_output_path),
-        "n_clusters_actual": representative.metrics_result["n_clusters_actual"],
-        "noise_count": representative.metrics_result["noise_count"],
-        "noise_fraction": representative.metrics_result["noise_fraction"],
-        "hdbscan_params": {
-            "min_cluster_size": hdbscan_clusterer.min_cluster_size,
-            "min_samples": hdbscan_clusterer.min_samples,
-            "metric": hdbscan_clusterer.metric,
-            "cluster_selection_epsilon": hdbscan_clusterer.cluster_selection_epsilon,
-            "cluster_selection_method": hdbscan_clusterer.cluster_selection_method,
-            "alpha": hdbscan_clusterer.alpha,
-        },
-        "metrics": representative.metrics_result["metrics"],
-        "metrics_valid": representative.metrics_result["metrics_valid"],
-        "relative_validity_index": representative.relative_validity,
-        "notes": representative.metrics_result["notes"] + candidate.notes,
+        "n_clusters_actual": metrics_result["n_clusters_actual"],
+        "noise_count": metrics_result["noise_count"],
+        "noise_fraction": metrics_result["noise_fraction"],
+        "metrics": metrics_result["metrics"],
+        "metrics_valid": metrics_result["metrics_valid"],
+        "relative_validity_index": relative_validity,
+        "notes": metrics_result["notes"] + candidate.notes,
+        "topics": [
+            {"topic_id": topic.topic_id, "keywords": topic.keywords, "label": topic.label, "count": topic.count}
+            for topic in bertopic_result.topics
+        ],
+        "candidate_labels": candidate_labels,
+        "zeroshot_model": zeroshot_model,
         plugin.winning_config_field: {k: v for k, v in candidate.hyperparams.items() if k not in HDBSCAN_PARAM_NAMES},
         "winning_seed": candidate.winning_seed.seed,
         "winning_seed_noise_fraction_std": candidate.winning_seed.noise_fraction_std,
@@ -218,6 +242,8 @@ def run(
     assignments_output_path: Path,
     metrics_output_path: Path,
     config_path: Path,
+    candidate_labels: list[str],
+    zeroshot_model: str,
 ) -> tuple[Path, Path, Path] | None:
     """Run the full read-filter-search-write pipeline for one reducer.
 
@@ -235,6 +261,10 @@ def run(
         config_path: YAML config (combined reducer + HDBSCAN search space,
             objective weights, trial budget, reproducibility seeds/repeats,
             study/report directories) — see `optuna_search.load_optuna_config`.
+        candidate_labels: Candidate topic labels for BERTopic's zero-shot
+            classification layer (see `bertopic_model.parse_candidate_labels`).
+        zeroshot_model: HuggingFace zero-shot-classification model id for
+            that same layer.
 
     Returns:
         `(reduced_embeddings_output_path, assignments_output_path,
@@ -259,6 +289,7 @@ def run(
 
     embedding_dim = clustering_io.validate_embedding_dimensions(filtered)
     embedding_matrix = clustering_io.extract_embedding_matrix(filtered)
+    criterion_texts = clustering_io.extract_traceability_columns(filtered)["criterion_text"]
 
     config = optuna_search.load_optuna_config(config_path, require_reproducibility=True)
     bounds = optuna_search.EligibilityBounds(
@@ -290,8 +321,15 @@ def run(
         from a *previous* process invocation, never present in this process's
         own `trial_cache` (Optuna's storage persists only hyperparameters/score,
         not our fit artifacts) — re-evaluating is the only way to recover its
-        reduced matrix/labels/probabilities, and is safe since both the reducer
-        (given the same `random_state`) and HDBSCAN are fully deterministic.
+        reduced matrix/labels/probabilities/topics, and is safe since the
+        reducer (given the same `random_state`), HDBSCAN, and BERTopic's own
+        refit are all fully deterministic given the same inputs.
+
+        The seed/repeat reproducibility sweep below still picks a winning
+        seed/representative repeat via a plain HDBSCAN fit, unchanged; once
+        that representative repeat is chosen, BERTopic is fit exactly once
+        on it, and its own cluster assignments (not the sweep's) are what
+        get scored and (for the eventual winning trial) written.
         """
         candidate = reduction_sweep.evaluate_config(
             fit_reduced,
@@ -310,11 +348,42 @@ def run(
         dr_metrics = optuna_search.compute_dr_metrics(
             embedding_matrix, representative.reduced_matrix, representative.labels, fixed_metric
         )
+
+        hdbscan_clusterer = build_hdbscan_clusterer(hyperparams)
+        try:
+            bertopic_result = bertopic_model.fit_bertopic_topics(
+                criterion_texts,
+                representative.reduced_matrix,
+                hdbscan_clusterer.build_estimator(),
+                candidate_labels,
+                zeroshot_model,
+            )
+        except Exception:
+            logger.exception("evaluate_trial: BERTopic fit failed for hyperparams=%s", hyperparams)
+            return {"status": "invalid", "candidate": candidate, "hyperparams": hyperparams}
+
+        if not bertopic_model.same_partition(representative.labels, bertopic_result.labels):
+            logger.warning(
+                "evaluate_trial: BERTopic's own refit clustering disagrees with the seed/repeat sweep's "
+                "plain-HDBSCAN fit for hyperparams=%s (expected a relabeling of the same partition) -- "
+                "scoring and writing use BERTopic's own labels regardless, per design",
+                hyperparams,
+            )
+
+        metrics_result = hdbscan_clusterer.compute_metrics(representative.reduced_matrix, bertopic_result.labels)
+        relative_validity = compute_relative_validity_index(
+            representative.reduced_matrix, bertopic_result.labels, fixed_metric
+        )
+        status = "ok" if metrics_result["metrics_valid"] else "degenerate"
+
         return {
-            "status": candidate.status,
+            "status": status,
             "candidate": candidate,
             "dr_metrics": dr_metrics,
             "hyperparams": hyperparams,
+            "metrics_result": metrics_result,
+            "relative_validity": relative_validity,
+            "bertopic_result": bertopic_result,
         }
 
     study_name = f"{slug}_{plugin.name}_hdbscan"
@@ -339,11 +408,10 @@ def run(
         if record["status"] == "invalid":
             return optuna_search.INVALID_TRIAL_SCORE
 
-        representative = reduction_sweep.representative_repeat(record["candidate"])
         return optuna_search.score_reduction_candidate(
-            representative.metrics_result,
-            representative.relative_validity,
-            representative.labels,
+            record["metrics_result"],
+            record["relative_validity"],
+            record["bertopic_result"].labels,
             hyperparams["min_cluster_size"],
             config.objective_weights,
             record["dr_metrics"],
@@ -381,6 +449,7 @@ def run(
     candidate: reduction_sweep.ReducerConfigCandidate = winner["candidate"]
     annotate_dimensionality_note(candidate, embedding_dim, plugin.display_name)
     representative = reduction_sweep.representative_repeat(candidate)
+    bertopic_result: bertopic_model.BERTopicFitResult = winner["bertopic_result"]
     hdbscan_clusterer = build_hdbscan_clusterer(winner["hyperparams"])
 
     clustered_at = datetime.now(timezone.utc)
@@ -388,7 +457,7 @@ def run(
     clustering_io.write_parquet(reduced_rows, plugin.reduced_embedding_schema, reduced_embeddings_output_path)
 
     assignment_rows = hdbscan_clusterer.build_assignment_rows(
-        filtered, representative.labels, representative.probabilities, clustered_at
+        filtered, bertopic_result.labels, bertopic_result.probabilities, bertopic_result.topics, clustered_at
     )
     clustering_io.write_parquet(assignment_rows, HDBSCAN_CLUSTER_PARQUET_SCHEMA, assignments_output_path)
 
@@ -406,8 +475,12 @@ def run(
         embedding_dim=embedding_dim,
         embedding_backend=embedding_backend,
         embedding_model=embedding_model,
-        hdbscan_clusterer=hdbscan_clusterer,
         candidate=candidate,
+        metrics_result=winner["metrics_result"],
+        relative_validity=winner["relative_validity"],
+        bertopic_result=bertopic_result,
+        candidate_labels=candidate_labels,
+        zeroshot_model=zeroshot_model,
         seeds=config.reproducibility.seeds,
         repeats_per_seed=config.reproducibility.repeats_per_seed,
         fixed_metric=fixed_metric,
@@ -430,13 +503,13 @@ def run(
     clustering_io.write_json(metrics_dict, metrics_output_path)
 
     logger.info(
-        "run: best trial #%d %s config %s (seed=%d) clustered %d row(s) into %d cluster(s) for %r -> %s, %s, %s "
+        "run: best trial #%d %s config %s (seed=%d) clustered %d row(s) into %d topic(s) for %r -> %s, %s, %s "
         "(noise=%d/%d (%.1f%%), silhouette=%s, excluded=%d failed-embedding row(s), "
         "trials: %d ok, %d degenerate, %d invalid)",
         best_trial.number, plugin.display_name, candidate.hyperparams, candidate.winning_seed.seed, n_samples,
-        representative.metrics_result["n_clusters_actual"], label, reduced_embeddings_output_path,
-        assignments_output_path, metrics_output_path, representative.metrics_result["noise_count"], n_samples,
-        representative.metrics_result["noise_fraction"] * 100, representative.metrics_result["metrics"]["silhouette_score"],
+        winner["metrics_result"]["n_clusters_actual"], label, reduced_embeddings_output_path,
+        assignments_output_path, metrics_output_path, winner["metrics_result"]["noise_count"], n_samples,
+        winner["metrics_result"]["noise_fraction"] * 100, winner["metrics_result"]["metrics"]["silhouette_score"],
         n_excluded, status_counts["ok"], status_counts["degenerate"], status_counts["invalid"],
     )
     return reduced_embeddings_output_path, assignments_output_path, metrics_output_path
@@ -451,7 +524,8 @@ def build_arg_parser(description: str, default_config_path: Path) -> argparse.Ar
 
     Returns:
         An ``argparse.ArgumentParser`` accepting required input/output path
-        flags plus a `--config-path` override for the Optuna search config.
+        flags, a `--config-path` override for the Optuna search config, and
+        the BERTopic zero-shot-classification layer's own flags.
     """
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
@@ -496,6 +570,20 @@ def build_arg_parser(description: str, default_config_path: Path) -> argparse.Ar
         help=f"Optuna search config YAML; default: {default_config_path}",
     )
     parser.add_argument(
+        "--candidate-labels",
+        type=str,
+        required=True,
+        help="Comma-separated candidate topic labels for BERTopic's zero-shot classification layer "
+        "(e.g. 'oncology eligibility,treatment history,disease measurement')",
+    )
+    parser.add_argument(
+        "--zeroshot-model",
+        type=str,
+        default=bertopic_model.DEFAULT_ZEROSHOT_MODEL,
+        help="HuggingFace zero-shot-classification model id for BERTopic's topic-labeling layer "
+        f"(default: {bertopic_model.DEFAULT_ZEROSHOT_MODEL})",
+    )
+    parser.add_argument(
         "--log-file",
         type=Path,
         default=None,
@@ -508,6 +596,7 @@ def main(plugin: ReducerPlugin, description: str, default_config_path: Path) -> 
     """Shared CLI entry point: run the Optuna search and write reduced embeddings/cluster assignments/metrics."""
     args = build_arg_parser(description, default_config_path).parse_args()
     configure_logging(args.log_file)
+    candidate_labels = bertopic_model.parse_candidate_labels(args.candidate_labels)
 
     run(
         plugin,
@@ -517,4 +606,6 @@ def main(plugin: ReducerPlugin, description: str, default_config_path: Path) -> 
         args.assignments_output_path,
         args.metrics_output_path,
         args.config_path,
+        candidate_labels,
+        args.zeroshot_model,
     )
