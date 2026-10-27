@@ -390,6 +390,7 @@ class KMeansClusterer:
     def build_metrics_dict(
         self,
         label: str,
+        criterion_type: str,
         input_path: Path,
         assignments_output_path: Path,
         n_samples: int,
@@ -415,6 +416,8 @@ class KMeansClusterer:
         Args:
             label: Human-readable label for this run, derived from
                 `input_path`'s filename.
+            criterion_type: Which side of the inclusion/exclusion split this
+                run covers.
             input_path: The embeddings Parquet path that was read.
             assignments_output_path: Where cluster assignments were written.
             n_samples: Number of successfully-embedded rows clustered.
@@ -444,6 +447,7 @@ class KMeansClusterer:
         """
         base = clustering_io.build_base_metrics_dict(
             label=label,
+            criterion_type=criterion_type,
             input_path=input_path,
             assignments_output_path=assignments_output_path,
             n_samples=n_samples,
@@ -693,6 +697,7 @@ def serialize_candidates(candidates: list[KMeansSweepCandidate]) -> list[dict]:
 
 def run_sweep(
     input_path: Path,
+    criterion_type: str,
     assignments_output_path: Path,
     metrics_output_path: Path,
     n_clusters: int | None = None,
@@ -712,6 +717,9 @@ def run_sweep(
 
     Args:
         input_path: Embeddings Parquet to read.
+        criterion_type: `"inclusion"` or `"exclusion"` — which side of the
+            inclusion/exclusion split to cluster (see
+            `clustering_io.filter_by_criterion_type`).
         assignments_output_path: Where to write the winning combination's
             cluster assignments.
         metrics_output_path: Where to write the winning combination's metrics.
@@ -760,9 +768,11 @@ def run_sweep(
     if metric not in KMeansClusterer.VALID_METRICS:
         raise ValueError(f"Unknown metric {metric!r}; expected one of {KMeansClusterer.VALID_METRICS}")
 
-    label = label_from_slug(slug_from_filename(input_path.name, "_trials_embeddings.parquet"))
+    slug = f"{slug_from_filename(input_path.name, '_trials_embeddings.parquet')}_{criterion_type}"
+    label = label_from_slug(slug)
 
     table = clustering_io.read_embeddings_parquet(input_path)
+    table = clustering_io.filter_by_criterion_type(table, criterion_type)
     total_rows = table.num_rows
     filtered = clustering_io.filter_successful_rows(table)
     n_samples = filtered.num_rows
@@ -837,6 +847,7 @@ def run_sweep(
 
     metrics_dict = winning_clusterer.build_metrics_dict(
         label=label,
+        criterion_type=criterion_type,
         input_path=input_path,
         assignments_output_path=assignments_output_path,
         n_samples=n_samples,
@@ -974,6 +985,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Input embeddings Parquet path (as written by criteria_embedding.py)",
     )
     parser.add_argument(
+        "--criterion-type",
+        type=str,
+        choices=["inclusion", "exclusion"],
+        required=True,
+        help=(
+            "Which side of eligibility criteria to cluster. Rows with criterion_type='both' "
+            "(unstructured eligibility text with no inclusion/exclusion headers to split on) are "
+            "included on both sides. Give each side's outputs distinct paths/filenames."
+        ),
+    )
+    parser.add_argument(
         "--assignments-output-path",
         type=Path,
         required=True,
@@ -1001,6 +1023,7 @@ def main() -> None:
 
     run_sweep(
         args.input_path,
+        args.criterion_type,
         args.assignments_output_path,
         args.metrics_output_path,
         n_clusters=args.n_clusters,

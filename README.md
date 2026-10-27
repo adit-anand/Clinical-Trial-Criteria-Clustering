@@ -208,13 +208,32 @@ file; there is no append/skip-if-exists/merge behavior.
 ```bash
 uv run python -m src.clustering.kmeans_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --assignments-output-path data/clustering/kmeans/breast_cancer_trials_clusters.parquet \
-  --metrics-output-path data/clustering/kmeans/breast_cancer_trials_cluster_metrics.json \
+  --criterion-type inclusion \
+  --assignments-output-path data/clustering/kmeans/breast_cancer_inclusion_trials_clusters.parquet \
+  --metrics-output-path data/clustering/kmeans/breast_cancer_inclusion_trials_cluster_metrics.json \
+  --k-min 10,15 --k-max 50,100 --random-state 1,2,3
+
+uv run python -m src.clustering.kmeans_clustering \
+  --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
+  --criterion-type exclusion \
+  --assignments-output-path data/clustering/kmeans/breast_cancer_exclusion_trials_clusters.parquet \
+  --metrics-output-path data/clustering/kmeans/breast_cancer_exclusion_trials_cluster_metrics.json \
   --k-min 10,15 --k-max 50,100 --random-state 1,2,3
 ```
 
-This reads the Parquet file given via `--input-path`, drops rows whose
-embedding failed, and clusters the remaining embedding vectors via k-means,
+`--criterion-type` is required and splits every clustering run into two
+independent invocations — `inclusion` and `exclusion` — rather than
+clustering all criteria for a condition together. Rows whose
+`criterion_type` is `"both"` (unstructured eligibility text with no
+inclusion/exclusion headers to split on) are included in *both* runs, since
+they cannot be confidently assigned to only one side. Give each run its own
+output filenames (as shown above) — output paths are always explicit, never
+derived from the input filename, so nothing stops you from accidentally
+overwriting one side's results with the other's if you reuse the same path.
+
+This reads the Parquet file given via `--input-path`, filters it down to the
+selected `--criterion-type` side, drops rows whose embedding failed, and
+clusters the remaining embedding vectors via k-means,
 sweeping the Cartesian product of the supplied `--k-min`/`--k-max`/
 `--random-state` value lists (a single value per flag — the default — is
 simply a sweep of size one). For each `(k_min, k_max, random_state)`
@@ -277,6 +296,7 @@ offered. `kmeans_params.metric` in the metrics JSON records which was used.
 | `--max-iter`                   | no       | Maximum k-means iterations per initialization, held fixed across the sweep (default: `300`). |
 | `--metric`                     | no       | Distance metric, held fixed across the sweep: `euclidean` or `cosine` (see above; default: `euclidean`). |
 | `--input-path`                 | yes      | Input embeddings Parquet path (as written by `criteria_embedding.py`). |
+| `--criterion-type`             | yes      | Which side to cluster: `inclusion` or `exclusion`. Rows with `criterion_type="both"` are included on both sides. |
 | `--assignments-output-path`    | yes      | Output cluster-assignments Parquet path. |
 | `--metrics-output-path`        | yes      | Output metrics JSON path. |
 | `--log-file`                   | no       | If given, also append logs to this file, in addition to the console. |
@@ -329,14 +349,31 @@ wholesale.
 ```bash
 uv run python -m src.clustering.umap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --reduced-embeddings-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_reduced_embeddings.parquet \
-  --assignments-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_clusters.parquet \
-  --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json
+  --criterion-type inclusion \
+  --reduced-embeddings-output-path data/clustering/umap_hdbscan/breast_cancer_inclusion_trials_umap_reduced_embeddings.parquet \
+  --assignments-output-path data/clustering/umap_hdbscan/breast_cancer_inclusion_trials_umap_hdbscan_clusters.parquet \
+  --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_inclusion_trials_umap_hdbscan_cluster_metrics.json
+
+uv run python -m src.clustering.umap_hdbscan_clustering \
+  --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
+  --criterion-type exclusion \
+  --reduced-embeddings-output-path data/clustering/umap_hdbscan/breast_cancer_exclusion_trials_umap_reduced_embeddings.parquet \
+  --assignments-output-path data/clustering/umap_hdbscan/breast_cancer_exclusion_trials_umap_hdbscan_clusters.parquet \
+  --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_exclusion_trials_umap_hdbscan_cluster_metrics.json
 ```
 
+As with step 3, `--criterion-type` is required (`inclusion` or `exclusion`,
+with `"both"`-typed rows included on both sides) and each side must be run
+separately with its own output filenames. The study name, its resumable
+Optuna storage journal, and its trial-history CSV filename are all derived
+from the input filename *and* `--criterion-type` together, so the two sides
+always get independent, non-colliding resumable studies even when read from
+the same input Parquet.
+
 This reads the same embeddings Parquet file format as the other clustering
-steps (given via `--input-path`), drops rows whose embedding failed, and
-runs an Optuna study whose every trial reduces the remaining embedding
+steps (given via `--input-path`), filters it down to the selected
+`--criterion-type` side, drops rows whose embedding failed, and runs an
+Optuna study whose every trial reduces the remaining embedding
 vectors' dimensionality with UMAP before clustering the reduced vectors
 with HDBSCAN. Each trial suggests a *combined* hyperparameter set — UMAP's
 own (`n_components`/`n_neighbors`/`min_dist`) *and* HDBSCAN's own
@@ -424,6 +461,7 @@ error before any trial runs.
 | Argument                           | Required | Description                                                                 |
 | ----------------------------------- | -------- | ---------------------------------------------------------------------------- |
 | `--input-path`                       | yes      | Input embeddings Parquet path (as written by `criteria_embedding.py`). |
+| `--criterion-type`                   | yes      | Which side to cluster: `inclusion` or `exclusion`. Rows with `criterion_type="both"` are included on both sides. |
 | `--reduced-embeddings-output-path`   | yes      | Output reduced-embeddings Parquet path. |
 | `--assignments-output-path`          | yes      | Output cluster-assignments Parquet path. |
 | `--metrics-output-path`              | yes      | Output metrics JSON path. |
@@ -435,10 +473,21 @@ error before any trial runs.
 ```bash
 uv run python -m src.clustering.pacmap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --reduced-embeddings-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_reduced_embeddings.parquet \
-  --assignments-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_clusters.parquet \
-  --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json
+  --criterion-type inclusion \
+  --reduced-embeddings-output-path data/clustering/pacmap_hdbscan/breast_cancer_inclusion_trials_pacmap_reduced_embeddings.parquet \
+  --assignments-output-path data/clustering/pacmap_hdbscan/breast_cancer_inclusion_trials_pacmap_hdbscan_clusters.parquet \
+  --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_inclusion_trials_pacmap_hdbscan_cluster_metrics.json
+
+uv run python -m src.clustering.pacmap_hdbscan_clustering \
+  --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
+  --criterion-type exclusion \
+  --reduced-embeddings-output-path data/clustering/pacmap_hdbscan/breast_cancer_exclusion_trials_pacmap_reduced_embeddings.parquet \
+  --assignments-output-path data/clustering/pacmap_hdbscan/breast_cancer_exclusion_trials_pacmap_hdbscan_clusters.parquet \
+  --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_exclusion_trials_pacmap_hdbscan_cluster_metrics.json
 ```
+
+Same `--criterion-type` requirement and study-name-qualification behavior as
+step 5 (see above).
 
 The same idea as step 5, reducing with [PaCMAP](https://github.com/YingfanWang/PaCMAP)
 instead of UMAP. PaCMAP has no `min_dist` equivalent — its
@@ -468,6 +517,7 @@ identical to step 5's.
 | Argument                           | Required | Description                                                                 |
 | ----------------------------------- | -------- | ---------------------------------------------------------------------------- |
 | `--input-path`                       | yes      | Input embeddings Parquet path (as written by `criteria_embedding.py`). |
+| `--criterion-type`                   | yes      | Which side to cluster: `inclusion` or `exclusion`. Rows with `criterion_type="both"` are included on both sides. |
 | `--reduced-embeddings-output-path`   | yes      | Output reduced-embeddings Parquet path. |
 | `--assignments-output-path`          | yes      | Output cluster-assignments Parquet path. |
 | `--metrics-output-path`              | yes      | Output metrics JSON path. |
@@ -524,6 +574,12 @@ HTML file wholesale; there is no append/skip-if-exists/merge behavior.
 
 ### Example: full pipeline for one condition
 
+Retrieval and embedding run once per condition, covering all criteria types.
+Every clustering/report/scatterplot step, however, must be run once per
+`--criterion-type` (`inclusion`, then `exclusion`) — each side gets its own
+output filenames (`_inclusion_`/`_exclusion_` inserted into every path
+below) and its own fully independent results and report.
+
 ```bash
 uv run python -m src.preprocessing.criteria_retrieval "breast cancer" \
   --output-path data/eligibility_criteria/breast_cancer_trials_eligibility.csv
@@ -533,34 +589,75 @@ uv run python -m src.embeddings.criteria_embedding \
   --output-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --backend huggingface
 
+# --- inclusion side ---
+
 uv run python -m src.clustering.kmeans_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --assignments-output-path data/clustering/kmeans/breast_cancer_trials_clusters.parquet \
-  --metrics-output-path data/clustering/kmeans/breast_cancer_trials_cluster_metrics.json \
+  --criterion-type inclusion \
+  --assignments-output-path data/clustering/kmeans/breast_cancer_inclusion_trials_clusters.parquet \
+  --metrics-output-path data/clustering/kmeans/breast_cancer_inclusion_trials_cluster_metrics.json \
   --k-min 10,15 --k-max 50,100 --random-state 1,2,3
 
 uv run python -m src.clustering.umap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --reduced-embeddings-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_reduced_embeddings.parquet \
-  --assignments-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_clusters.parquet \
-  --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json
+  --criterion-type inclusion \
+  --reduced-embeddings-output-path data/clustering/umap_hdbscan/breast_cancer_inclusion_trials_umap_reduced_embeddings.parquet \
+  --assignments-output-path data/clustering/umap_hdbscan/breast_cancer_inclusion_trials_umap_hdbscan_clusters.parquet \
+  --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_inclusion_trials_umap_hdbscan_cluster_metrics.json
 
 uv run python -m src.clustering.pacmap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --reduced-embeddings-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_reduced_embeddings.parquet \
-  --assignments-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_clusters.parquet \
-  --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json
+  --criterion-type inclusion \
+  --reduced-embeddings-output-path data/clustering/pacmap_hdbscan/breast_cancer_inclusion_trials_pacmap_reduced_embeddings.parquet \
+  --assignments-output-path data/clustering/pacmap_hdbscan/breast_cancer_inclusion_trials_pacmap_hdbscan_clusters.parquet \
+  --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_inclusion_trials_pacmap_hdbscan_cluster_metrics.json
 
 uv run python -m src.clustering.clustering_report \
-  --output-path data/clustering/reports/breast_cancer_clustering_report.md \
-  --kmeans-metrics-path data/clustering/kmeans/breast_cancer_trials_cluster_metrics.json \
-  --umap-hdbscan-metrics-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
-  --pacmap-hdbscan-metrics-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json
+  --output-path data/clustering/reports/breast_cancer_inclusion_clustering_report.md \
+  --kmeans-metrics-path data/clustering/kmeans/breast_cancer_inclusion_trials_cluster_metrics.json \
+  --umap-hdbscan-metrics-path data/clustering/umap_hdbscan/breast_cancer_inclusion_trials_umap_hdbscan_cluster_metrics.json \
+  --pacmap-hdbscan-metrics-path data/clustering/pacmap_hdbscan/breast_cancer_inclusion_trials_pacmap_hdbscan_cluster_metrics.json
 
 uv run python -m src.clustering.clustering_scatterplot \
   --method umap_hdbscan \
-  --metrics-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
-  --assignments-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_clusters.parquet \
-  --reduced-embeddings-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_reduced_embeddings.parquet \
-  --output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_scatterplot.html
+  --metrics-path data/clustering/umap_hdbscan/breast_cancer_inclusion_trials_umap_hdbscan_cluster_metrics.json \
+  --assignments-path data/clustering/umap_hdbscan/breast_cancer_inclusion_trials_umap_hdbscan_clusters.parquet \
+  --reduced-embeddings-path data/clustering/umap_hdbscan/breast_cancer_inclusion_trials_umap_reduced_embeddings.parquet \
+  --output-path data/clustering/umap_hdbscan/breast_cancer_inclusion_trials_umap_hdbscan_scatterplot.html
+
+# --- exclusion side (repeat with --criterion-type exclusion and matching paths) ---
+
+uv run python -m src.clustering.kmeans_clustering \
+  --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
+  --criterion-type exclusion \
+  --assignments-output-path data/clustering/kmeans/breast_cancer_exclusion_trials_clusters.parquet \
+  --metrics-output-path data/clustering/kmeans/breast_cancer_exclusion_trials_cluster_metrics.json \
+  --k-min 10,15 --k-max 50,100 --random-state 1,2,3
+
+uv run python -m src.clustering.umap_hdbscan_clustering \
+  --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
+  --criterion-type exclusion \
+  --reduced-embeddings-output-path data/clustering/umap_hdbscan/breast_cancer_exclusion_trials_umap_reduced_embeddings.parquet \
+  --assignments-output-path data/clustering/umap_hdbscan/breast_cancer_exclusion_trials_umap_hdbscan_clusters.parquet \
+  --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_exclusion_trials_umap_hdbscan_cluster_metrics.json
+
+uv run python -m src.clustering.pacmap_hdbscan_clustering \
+  --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
+  --criterion-type exclusion \
+  --reduced-embeddings-output-path data/clustering/pacmap_hdbscan/breast_cancer_exclusion_trials_pacmap_reduced_embeddings.parquet \
+  --assignments-output-path data/clustering/pacmap_hdbscan/breast_cancer_exclusion_trials_pacmap_hdbscan_clusters.parquet \
+  --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_exclusion_trials_pacmap_hdbscan_cluster_metrics.json
+
+uv run python -m src.clustering.clustering_report \
+  --output-path data/clustering/reports/breast_cancer_exclusion_clustering_report.md \
+  --kmeans-metrics-path data/clustering/kmeans/breast_cancer_exclusion_trials_cluster_metrics.json \
+  --umap-hdbscan-metrics-path data/clustering/umap_hdbscan/breast_cancer_exclusion_trials_umap_hdbscan_cluster_metrics.json \
+  --pacmap-hdbscan-metrics-path data/clustering/pacmap_hdbscan/breast_cancer_exclusion_trials_pacmap_hdbscan_cluster_metrics.json
+
+uv run python -m src.clustering.clustering_scatterplot \
+  --method umap_hdbscan \
+  --metrics-path data/clustering/umap_hdbscan/breast_cancer_exclusion_trials_umap_hdbscan_cluster_metrics.json \
+  --assignments-path data/clustering/umap_hdbscan/breast_cancer_exclusion_trials_umap_hdbscan_clusters.parquet \
+  --reduced-embeddings-path data/clustering/umap_hdbscan/breast_cancer_exclusion_trials_umap_reduced_embeddings.parquet \
+  --output-path data/clustering/umap_hdbscan/breast_cancer_exclusion_trials_umap_hdbscan_scatterplot.html
 ```

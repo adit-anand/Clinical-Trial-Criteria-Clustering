@@ -193,6 +193,7 @@ def build_reduced_embedding_rows(table: pa.Table, reduced_matrix: np.ndarray, re
 
 def build_metrics_dict(
     label: str,
+    criterion_type: str,
     input_path: Path,
     reduced_embeddings_output_path: Path,
     assignments_output_path: Path,
@@ -218,6 +219,7 @@ def build_metrics_dict(
 
     Args:
         label: Human-readable label for this run, derived from `input_path`'s filename.
+        criterion_type: Which side of the inclusion/exclusion split this run covers.
         input_path: The embeddings Parquet path that was read.
         reduced_embeddings_output_path: Where the reduced embeddings were written.
         assignments_output_path: Where cluster assignments were written.
@@ -239,6 +241,7 @@ def build_metrics_dict(
     representative = reduction_sweep.representative_repeat(candidate)
     base = clustering_io.build_base_metrics_dict(
         label=label,
+        criterion_type=criterion_type,
         input_path=input_path,
         assignments_output_path=assignments_output_path,
         n_samples=n_samples,
@@ -278,6 +281,7 @@ def build_metrics_dict(
 
 def run(
     input_path: Path,
+    criterion_type: str,
     reduced_embeddings_output_path: Path,
     assignments_output_path: Path,
     metrics_output_path: Path,
@@ -291,6 +295,11 @@ def run(
 
     Args:
         input_path: Embeddings Parquet to read.
+        criterion_type: `"inclusion"` or `"exclusion"` — which side of the
+            inclusion/exclusion split to cluster (see
+            `clustering_io.filter_by_criterion_type`); also folded into this
+            run's slug/label so its Optuna study and trial-history export
+            never collide with the other side's run over the same input file.
         reduced_embeddings_output_path: Where to write reduced embeddings.
         assignments_output_path: Where to write cluster assignments.
         metrics_output_path: Where to write metrics.
@@ -309,10 +318,11 @@ def run(
             if embedding dimensionality is inconsistent, or if `config_path`
             fails validation (see `optuna_search.load_optuna_config`).
     """
-    slug = slug_from_filename(input_path.name, "_trials_embeddings.parquet")
+    slug = f"{slug_from_filename(input_path.name, '_trials_embeddings.parquet')}_{criterion_type}"
     label = label_from_slug(slug)
 
     table = clustering_io.read_embeddings_parquet(input_path)
+    table = clustering_io.filter_by_criterion_type(table, criterion_type)
     total_rows = table.num_rows
     filtered = clustering_io.filter_successful_rows(table)
     n_samples = filtered.num_rows
@@ -457,6 +467,7 @@ def run(
     embedding_model = filtered.column("embedding_model")[0].as_py()
     metrics_dict = build_metrics_dict(
         label=label,
+        criterion_type=criterion_type,
         input_path=input_path,
         reduced_embeddings_output_path=reduced_embeddings_output_path,
         assignments_output_path=assignments_output_path,
@@ -518,6 +529,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Input embeddings Parquet path (as written by criteria_embedding.py)",
     )
     parser.add_argument(
+        "--criterion-type",
+        type=str,
+        choices=["inclusion", "exclusion"],
+        required=True,
+        help=(
+            "Which side of eligibility criteria to cluster. Rows with criterion_type='both' "
+            "(unstructured eligibility text with no inclusion/exclusion headers to split on) are "
+            "included on both sides. Give each side's outputs distinct paths/filenames."
+        ),
+    )
+    parser.add_argument(
         "--reduced-embeddings-output-path",
         type=Path,
         required=True,
@@ -559,6 +581,7 @@ def main() -> None:
 
     run(
         args.input_path,
+        args.criterion_type,
         args.reduced_embeddings_output_path,
         args.assignments_output_path,
         args.metrics_output_path,
