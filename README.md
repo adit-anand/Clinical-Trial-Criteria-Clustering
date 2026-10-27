@@ -22,16 +22,23 @@ as the next step's input path.
    clustering steps' metrics JSON paths are passed to it, and writes one
    consolidated Markdown report comparing their performance side by side.
 4. **`src/clustering/umap_hdbscan_clustering.py`** — reduces embeddings with
-   UMAP before clustering the reduced vectors with HDBSCAN, both tuned
-   jointly by one Optuna search (search space/objective weights/trial
-   budget come from a `--config-path` YAML file, not CLI flags; each trial
-   also runs a configured seeds/repeats-per-seed grid internally to pick
-   the most reproducible seed), writing the reduced embeddings plus cluster
-   assignments and metrics. Read/validate/write logic shared between the
-   clustering approaches lives in `src/clustering/clustering_io.py`; the
-   HDBSCAN fitting/metrics code and Optuna search engine shared by both
-   reducer-based steps live in `src/clustering/hdbscan_model.py` and
-   `src/clustering/optuna_search.py`.
+   UMAP, tuned jointly with HDBSCAN by one Optuna search (search
+   space/objective weights/trial budget come from a `--config-path` YAML
+   file, not CLI flags; each trial also runs a configured
+   seeds/repeats-per-seed grid internally to pick the most reproducible
+   seed). Once a trial's representative repeat is chosen, BERTopic re-fits
+   that same HDBSCAN configuration once more (skipping its own internal
+   UMAP step) to additionally compute per-cluster topic keywords plus a
+   zero-shot-classification label against a caller-supplied candidate label
+   set — BERTopic's own cluster assignments, not the earlier HDBSCAN fit,
+   are what the Optuna objective scores and what gets written. Writes the
+   reduced embeddings plus cluster assignments and metrics.
+   Read/validate/write logic shared between the clustering approaches lives
+   in `src/clustering/clustering_io.py`; the HDBSCAN fitting/metrics code,
+   Optuna search engine, and BERTopic topic-representation layer shared by
+   both reducer-based steps live in `src/clustering/hdbscan_model.py`,
+   `src/clustering/optuna_search.py`, and `src/clustering/bertopic_model.py`
+   respectively, orchestrated by `src/clustering/reduction_hdbscan_pipeline.py`.
 5. **`src/clustering/pacmap_hdbscan_clustering.py`** — the same idea as step
    4, reducing with PaCMAP instead of UMAP. The seed/repeat reproducibility
    mechanics both steps share live in `src/clustering/reduction_sweep.py`.
@@ -75,7 +82,8 @@ src/
     ├── hdbscan_model.py                  # shared HDBSCAN fitting/metrics (steps 4-5)
     ├── optuna_search.py                  # shared Optuna search engine (steps 4-5)
     ├── reduction_sweep.py                # shared seed/repeat reproducibility engine (steps 4-5)
-    ├── reduction_hdbscan_pipeline.py      # shared reduce+HDBSCAN+Optuna orchestration (steps 4-5)
+    ├── bertopic_model.py                # shared BERTopic topic-representation layer (steps 4-5)
+    ├── reduction_hdbscan_pipeline.py      # shared reduce+BERTopic/HDBSCAN+Optuna orchestration (steps 4-5)
     ├── clustering_report.py              # step 3
     ├── umap_hdbscan_clustering.py        # step 4
     ├── pacmap_hdbscan_clustering.py      # step 5
@@ -102,7 +110,13 @@ study-lifecycle/trial-history mechanics, so neither reducer module
 re-implements any of it. It additionally uses `reduction_sweep.py`, which
 holds the reducer-agnostic seed/repeat reproducibility mechanics each Optuna
 trial runs internally (picking the most reproducible seed, then a
-representative repeat).
+representative repeat). Once that representative repeat is chosen,
+`reduction_hdbscan_pipeline.run` fits `bertopic_model.py`'s
+`fit_bertopic_topics` exactly once per trial, reusing that trial's own
+HDBSCAN hyperparameters (skipping BERTopic's own internal UMAP step) —
+BERTopic's own cluster assignments, not the sweep's earlier plain-HDBSCAN
+fit, are what the Optuna objective scores and what the winning trial's
+output reports.
 `clustering_scatterplot.py` reads whichever of the two algorithms' output
 already exists (via its own `VISUALIZATION_SPECS` registry, one entry per
 algorithm, following the same "no branching elsewhere" pattern
@@ -242,7 +256,7 @@ wholesale.
 | `--print`        | no       | Also print the generated report to stdout, in addition to writing the file. |
 | `--log-file`     | no       | If given, also append logs to this file, in addition to the console. |
 
-## 4. UMAP + HDBSCAN clustering
+## 4. UMAP + HDBSCAN + BERTopic clustering
 
 ```bash
 uv run python -m src.clustering.umap_hdbscan_clustering \
@@ -250,14 +264,16 @@ uv run python -m src.clustering.umap_hdbscan_clustering \
   --criterion-type inclusion \
   --reduced-embeddings-output-path data/clustering/umap_hdbscan/breast_cancer_inclusion_trials_umap_reduced_embeddings.parquet \
   --assignments-output-path data/clustering/umap_hdbscan/breast_cancer_inclusion_trials_umap_hdbscan_clusters.parquet \
-  --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_inclusion_trials_umap_hdbscan_cluster_metrics.json
+  --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_inclusion_trials_umap_hdbscan_cluster_metrics.json \
+  --candidate-labels "oncology eligibility,treatment history,disease measurement"
 
 uv run python -m src.clustering.umap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --criterion-type exclusion \
   --reduced-embeddings-output-path data/clustering/umap_hdbscan/breast_cancer_exclusion_trials_umap_reduced_embeddings.parquet \
   --assignments-output-path data/clustering/umap_hdbscan/breast_cancer_exclusion_trials_umap_hdbscan_clusters.parquet \
-  --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_exclusion_trials_umap_hdbscan_cluster_metrics.json
+  --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_exclusion_trials_umap_hdbscan_cluster_metrics.json \
+  --candidate-labels "oncology eligibility,treatment history,disease measurement"
 ```
 
 `--criterion-type` is required (`inclusion` or `exclusion`,
@@ -282,6 +298,18 @@ own (`n_components`/`n_neighbors`/`min_dist`) *and* HDBSCAN's own
 `euclidean` — it's shared by UMAP's own fit, HDBSCAN's own fit, DBCV, and
 the dimensionality-reduction fidelity metrics below).
 
+Once each trial's most reproducible seed and representative repeat are
+chosen (see below), BERTopic re-fits that exact HDBSCAN configuration once
+more over the same already-reduced embeddings — skipping BERTopic's own
+internal UMAP step entirely — to additionally compute, per cluster, its
+representative keywords and a label assigned by scoring those keywords
+against `--candidate-labels` via a zero-shot-classification pipeline
+(`--zeroshot-model`; a topic falls back to its raw keywords if no candidate
+label scores confidently enough). BERTopic's own resulting cluster
+assignments for that trial — not the earlier plain-HDBSCAN fit — are what
+every trial's quality metrics and Optuna objective score are computed from,
+and what the winning trial's output reports.
+
 Within one trial, two things happen nested:
 
 1. **Seed** — every value in the YAML file's `reproducibility.seeds` list,
@@ -293,7 +321,8 @@ The seed whose repeats are most mutually consistent (lowest standard
 deviation of noise fraction across its repeats) is chosen — not the seed
 with the best score — and one of its repeats (the one closest to that
 seed's own mean noise fraction) becomes that trial's representative result.
-That representative result's composite objective score — DBCV plus
+That representative result's reduced embeddings, re-clustered by BERTopic
+(see above), feed its composite objective score — DBCV plus
 trustworthiness/continuity/steadiness/cohesiveness (computed via
 [`zadu`](https://github.com/hj-n/zadu) under cosine distance; stress is
 deliberately excluded), folded with noise-fraction/dominant-cluster-share/
@@ -318,16 +347,23 @@ criterion, containing `nct_id`, `study_first_posted_date`, `criterion_text`,
 source criteria via `nct_id` without needing the cluster assignments. The
 cluster-assignments Parquet file contains `nct_id`,
 `study_first_posted_date`, `criterion_text`, `criterion_type`, `cluster_id`
-(`-1` for noise), `cluster_probability` (`0.0` for noise points),
-`embedding_backend`, `embedding_model`, and `clustered_at`. The metrics
-JSON reports run provenance (sample/cluster counts, the winning trial's
-HDBSCAN parameters, `noise_count`/`noise_fraction`) plus clustering
-performance metrics — silhouette score, the Davies-Bouldin index, the
+(`-1` for BERTopic's own outlier/noise topic), `cluster_probability` (`0.0`
+for noise points), `embedding_backend`, `embedding_model`, `clustered_at`,
+`topic_keywords` (BERTopic's own per-topic keywords), and `topic_label`
+(the zero-shot-assigned candidate label, or a keyword-derived fallback) —
+every row sharing a `cluster_id` carries that cluster's own topic
+representation, including noise rows. The metrics JSON reports run
+provenance (sample/cluster counts, `noise_count`/`noise_fraction`) plus
+clustering performance metrics computed from BERTopic's own cluster
+assignments — silhouette score, the Davies-Bouldin index, the
 Calinski-Harabasz index (computed only over non-noise points),
 `relative_validity_index` (DBCV), `winning_umap_config`, `winning_seed`,
 `winning_seed_noise_fraction_std`, `dr_metrics`
-(trustworthiness/continuity/steadiness/cohesiveness for the winning trial),
-and `optuna_study_summary`/`objective_weights` (trial counts by status, the
+(trustworthiness/continuity/steadiness/cohesiveness for the winning trial's
+UMAP output), `topics` (one entry per cluster/topic id, each with its
+keywords, assigned label, and member count), `candidate_labels`/
+`zeroshot_model` (what the zero-shot layer was configured with), and
+`optuna_study_summary`/`objective_weights` (trial counts by status, the
 winning trial number/score, the study/trial-history file paths, and the
 weights actually used).
 
@@ -364,9 +400,11 @@ error before any trial runs.
 | `--assignments-output-path`          | yes      | Output cluster-assignments Parquet path. |
 | `--metrics-output-path`              | yes      | Output metrics JSON path. |
 | `--config-path`                      | no       | Optuna search config YAML (combined UMAP + HDBSCAN search space, objective weights, trial budget, reproducibility seeds/repeats); default: `config/umap_hdbscan_optuna.yaml`. |
+| `--candidate-labels`                 | yes      | Comma-separated candidate topic labels for BERTopic's zero-shot classification layer, e.g. `"oncology eligibility,treatment history,disease measurement"`. |
+| `--zeroshot-model`                   | no       | HuggingFace zero-shot-classification model id for that same layer (default: `facebook/bart-large-mnli`). |
 | `--log-file`                         | no       | If given, also append logs to this file, in addition to the console. |
 
-## 5. PaCMAP + HDBSCAN clustering
+## 5. PaCMAP + HDBSCAN + BERTopic clustering
 
 ```bash
 uv run python -m src.clustering.pacmap_hdbscan_clustering \
@@ -374,14 +412,16 @@ uv run python -m src.clustering.pacmap_hdbscan_clustering \
   --criterion-type inclusion \
   --reduced-embeddings-output-path data/clustering/pacmap_hdbscan/breast_cancer_inclusion_trials_pacmap_reduced_embeddings.parquet \
   --assignments-output-path data/clustering/pacmap_hdbscan/breast_cancer_inclusion_trials_pacmap_hdbscan_clusters.parquet \
-  --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_inclusion_trials_pacmap_hdbscan_cluster_metrics.json
+  --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_inclusion_trials_pacmap_hdbscan_cluster_metrics.json \
+  --candidate-labels "oncology eligibility,treatment history,disease measurement"
 
 uv run python -m src.clustering.pacmap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --criterion-type exclusion \
   --reduced-embeddings-output-path data/clustering/pacmap_hdbscan/breast_cancer_exclusion_trials_pacmap_reduced_embeddings.parquet \
   --assignments-output-path data/clustering/pacmap_hdbscan/breast_cancer_exclusion_trials_pacmap_hdbscan_clusters.parquet \
-  --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_exclusion_trials_pacmap_hdbscan_cluster_metrics.json
+  --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_exclusion_trials_pacmap_hdbscan_cluster_metrics.json \
+  --candidate-labels "oncology eligibility,treatment history,disease measurement"
 ```
 
 Same `--criterion-type` requirement and study-name-qualification behavior as
@@ -399,11 +439,12 @@ couple of stragglers, which the `MIN_N_CLUSTERS`/`MAX_CLUSTER_SHARE`/
 `MAX_NOISE_FRACTION` guards (see step 4) correctly treat as degenerate via
 the same continuous penalty terms, pushing Optuna's search away from that
 region over successive trials. Everything else — the seed/repeat
-reproducibility mechanics, composite objective (DBCV plus
-trustworthiness/continuity/steadiness/cohesiveness via `zadu` under cosine
-distance, folded with the same degenerate-result penalties), study
-resumability, trial-history export, and overwrite-on-rerun behavior — is
-identical to step 4. It writes the reduced embeddings, cluster assignments,
+reproducibility mechanics, the BERTopic topic-representation layer, the
+composite objective (DBCV plus trustworthiness/continuity/steadiness/
+cohesiveness via `zadu` under cosine distance, folded with the same
+degenerate-result penalties), study resumability, trial-history export, and
+overwrite-on-rerun behavior — is identical to step 4. It writes the reduced
+embeddings, cluster assignments,
 and metrics to `--reduced-embeddings-output-path`/`--assignments-output-path`/
 `--metrics-output-path`, with the reduced-embeddings schema,
 cluster-assignments schema, and metrics JSON shape (as
@@ -420,6 +461,8 @@ identical to step 4's.
 | `--assignments-output-path`          | yes      | Output cluster-assignments Parquet path. |
 | `--metrics-output-path`              | yes      | Output metrics JSON path. |
 | `--config-path`                      | no       | Optuna search config YAML (combined PaCMAP + HDBSCAN search space, objective weights, trial budget, reproducibility seeds/repeats); default: `config/pacmap_hdbscan_optuna.yaml`. |
+| `--candidate-labels`                 | yes      | Comma-separated candidate topic labels for BERTopic's zero-shot classification layer, e.g. `"oncology eligibility,treatment history,disease measurement"`. |
+| `--zeroshot-model`                   | no       | HuggingFace zero-shot-classification model id for that same layer (default: `facebook/bart-large-mnli`). |
 | `--log-file`                         | no       | If given, also append logs to this file, in addition to the console. |
 
 ## 6. Scatterplot visualization
@@ -493,14 +536,16 @@ uv run python -m src.clustering.umap_hdbscan_clustering \
   --criterion-type inclusion \
   --reduced-embeddings-output-path data/clustering/umap_hdbscan/breast_cancer_inclusion_trials_umap_reduced_embeddings.parquet \
   --assignments-output-path data/clustering/umap_hdbscan/breast_cancer_inclusion_trials_umap_hdbscan_clusters.parquet \
-  --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_inclusion_trials_umap_hdbscan_cluster_metrics.json
+  --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_inclusion_trials_umap_hdbscan_cluster_metrics.json \
+  --candidate-labels "oncology eligibility,treatment history,disease measurement"
 
 uv run python -m src.clustering.pacmap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --criterion-type inclusion \
   --reduced-embeddings-output-path data/clustering/pacmap_hdbscan/breast_cancer_inclusion_trials_pacmap_reduced_embeddings.parquet \
   --assignments-output-path data/clustering/pacmap_hdbscan/breast_cancer_inclusion_trials_pacmap_hdbscan_clusters.parquet \
-  --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_inclusion_trials_pacmap_hdbscan_cluster_metrics.json
+  --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_inclusion_trials_pacmap_hdbscan_cluster_metrics.json \
+  --candidate-labels "oncology eligibility,treatment history,disease measurement"
 
 uv run python -m src.clustering.clustering_report \
   --output-path data/clustering/reports/breast_cancer_inclusion_clustering_report.md \
@@ -521,14 +566,16 @@ uv run python -m src.clustering.umap_hdbscan_clustering \
   --criterion-type exclusion \
   --reduced-embeddings-output-path data/clustering/umap_hdbscan/breast_cancer_exclusion_trials_umap_reduced_embeddings.parquet \
   --assignments-output-path data/clustering/umap_hdbscan/breast_cancer_exclusion_trials_umap_hdbscan_clusters.parquet \
-  --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_exclusion_trials_umap_hdbscan_cluster_metrics.json
+  --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_exclusion_trials_umap_hdbscan_cluster_metrics.json \
+  --candidate-labels "oncology eligibility,treatment history,disease measurement"
 
 uv run python -m src.clustering.pacmap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --criterion-type exclusion \
   --reduced-embeddings-output-path data/clustering/pacmap_hdbscan/breast_cancer_exclusion_trials_pacmap_reduced_embeddings.parquet \
   --assignments-output-path data/clustering/pacmap_hdbscan/breast_cancer_exclusion_trials_pacmap_hdbscan_clusters.parquet \
-  --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_exclusion_trials_pacmap_hdbscan_cluster_metrics.json
+  --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_exclusion_trials_pacmap_hdbscan_cluster_metrics.json \
+  --candidate-labels "oncology eligibility,treatment history,disease measurement"
 
 uv run python -m src.clustering.clustering_report \
   --output-path data/clustering/reports/breast_cancer_exclusion_clustering_report.md \
