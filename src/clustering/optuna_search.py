@@ -1,15 +1,15 @@
 """Shared Optuna-driven hyperparameter search engine for HDBSCAN-based clustering steps.
 
-Used by `hdbscan_clustering.py` (plain HDBSCAN) and `pacmap_hdbscan_clustering.py`/
-`umap_hdbscan_clustering.py` (reducer + HDBSCAN) in place of the grid search
-those modules used to run. Each module loads its own YAML config via
+Used by `reduction_hdbscan_pipeline.run` (shared by `pacmap_hdbscan_clustering.py`
+and `umap_hdbscan_clustering.py`) in place of the grid search those modules
+used to run. `reduction_hdbscan_pipeline.run` loads its config via
 `load_optuna_config`, builds/resumes a study via `build_study`, and runs an
-Optuna objective closure (defined in that module) that scores each trial via
-`score_candidate` (plain HDBSCAN) or `score_reduction_candidate` (reducer
-pipelines). Every trial — whether it fit cleanly, fit but was degenerate, or
-never fit at all — returns a value on the same comparable scale, so
-`study.best_trial` is itself the winner; `resolve_winner` just distinguishes
-"the best trial never fit" (nothing to write) from every other case.
+Optuna objective closure that scores each trial via `score_reduction_candidate`.
+Every trial — whether it fit cleanly, fit but was degenerate, or never fit at
+all — returns a value on the same comparable scale, so `study.best_trial` is
+itself the winner; `best_trial_or_none` just distinguishes "the study has no
+trials at all" from every other case (callers handle "the best trial never
+fit" themselves via the trial's own cached/re-evaluated status).
 
 Deliberate exception to this repo's overwrite-on-rerun convention: the
 Optuna study's file-based storage (`build_study`) accumulates across runs by
@@ -72,8 +72,7 @@ class ObjectiveWeights:
 
     `trustworthiness_weight`/`continuity_weight`/`steadiness_weight`/
     `cohesiveness_weight`/`missing_dr_metrics_fallback_score` are only read
-    by `score_reduction_candidate` — `score_candidate` (plain HDBSCAN) never
-    reads them.
+    by `score_reduction_candidate`.
     """
 
     noise_penalty: float = 1.0
@@ -302,7 +301,7 @@ def _eligibility_penalties(
     weights: ObjectiveWeights,
     bounds: EligibilityBounds,
 ) -> float:
-    """Shared continuous penalty terms behind both `score_candidate` and `score_reduction_candidate`.
+    """Shared continuous penalty terms behind `score_reduction_candidate`.
 
     Mirrors `HDBSCANClusterer.compute_metrics`'s binary eligibility gate
     (cluster count, dominant-cluster share, noise fraction) as continuous
@@ -326,31 +325,6 @@ def _eligibility_penalties(
     )
 
 
-def score_candidate(
-    metrics_result: dict,
-    relative_validity: float | None,
-    labels: np.ndarray,
-    min_cluster_size: int,
-    weights: ObjectiveWeights,
-    bounds: EligibilityBounds,
-) -> float:
-    """Composite objective score for a plain-HDBSCAN trial (maximize).
-
-    Args:
-        metrics_result: `HDBSCANClusterer.compute_metrics`'s return value.
-        relative_validity: The DBCV score, or `None` if not computable.
-        labels: This trial's fitted cluster labels.
-        min_cluster_size: This trial's `min_cluster_size` hyperparameter.
-        weights: The configured objective weights.
-        bounds: The eligibility bounds to penalize against.
-
-    Returns:
-        A single float; higher is better.
-    """
-    base = relative_validity if relative_validity is not None else weights.missing_validity_fallback_score
-    return base - _eligibility_penalties(metrics_result, labels, min_cluster_size, weights, bounds)
-
-
 def score_reduction_candidate(
     metrics_result: dict,
     relative_validity: float | None,
@@ -362,7 +336,8 @@ def score_reduction_candidate(
 ) -> float:
     """Composite objective score for a reducer-pipeline trial (maximize).
 
-    Extends `score_candidate` with the dimensionality-reduction fidelity
+    Folds relative validity (DBCV) and the shared eligibility penalties
+    (`_eligibility_penalties`) with the dimensionality-reduction fidelity
     terms: trustworthiness/continuity/steadiness/cohesiveness are each
     conventionally normalized to `[0, 1]` with higher being better, so each
     is added as a reward.

@@ -10,7 +10,6 @@ noise-aware metrics, probability output) and `compute_relative_validity_index`
 
 import math
 from datetime import datetime
-from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
@@ -46,7 +45,8 @@ class HDBSCANClusterer:
     """Fits and scores a single HDBSCAN hyperparameter combination.
 
     Each reducer pipeline's Optuna objective constructs one instance per
-    trial (see `pacmap_hdbscan_clustering.py`/`umap_hdbscan_clustering.py`).
+    trial (see `reduction_hdbscan_pipeline.run`, shared by
+    `pacmap_hdbscan_clustering.py`/`umap_hdbscan_clustering.py`).
 
     Typical usage:
         clusterer = HDBSCANClusterer()
@@ -321,71 +321,6 @@ class HDBSCANClusterer:
                 }
             )
         return rows
-
-    def build_metrics_dict(
-        self,
-        label: str,
-        input_path: Path,
-        assignments_output_path: Path,
-        n_samples: int,
-        n_samples_excluded: int,
-        embedding_dim: int,
-        embedding_backend: str | None,
-        embedding_model: str | None,
-        metrics_result: dict,
-        labels: np.ndarray,
-        clustered_at: datetime,
-    ) -> dict:
-        """Assemble the full metrics JSON payload for one clustering run.
-
-        Args:
-            label: Human-readable label for this run, derived from
-                `input_path`'s filename.
-            input_path: The embeddings Parquet path that was read.
-            assignments_output_path: Where cluster assignments were written.
-            n_samples: Number of successfully-embedded rows clustered.
-            n_samples_excluded: Number of input rows dropped for having
-                failed embeddings.
-            embedding_dim: Common embedding dimensionality.
-            embedding_backend: Backend recorded on the clustered rows.
-            embedding_model: Model recorded on the clustered rows.
-            metrics_result: The dict returned by `compute_metrics`.
-            labels: `model.labels_`, used to compute per-cluster sizes
-                (including a `-1` entry for noise, if any).
-            clustered_at: Wall-clock time this clustering run completed.
-
-        Returns:
-            A JSON-serializable dict matching the documented metrics schema.
-        """
-        base = clustering_io.build_base_metrics_dict(
-            label=label,
-            input_path=input_path,
-            assignments_output_path=assignments_output_path,
-            n_samples=n_samples,
-            n_samples_excluded=n_samples_excluded,
-            embedding_dim=embedding_dim,
-            embedding_backend=embedding_backend,
-            embedding_model=embedding_model,
-            cluster_sizes=clustering_io.compute_cluster_sizes(labels),
-            clustered_at=clustered_at,
-        )
-        return {
-            **base,
-            "n_clusters_actual": metrics_result["n_clusters_actual"],
-            "noise_count": metrics_result["noise_count"],
-            "noise_fraction": metrics_result["noise_fraction"],
-            "hdbscan_params": {
-                "min_cluster_size": self.min_cluster_size,
-                "min_samples": self.min_samples,
-                "metric": self.metric,
-                "cluster_selection_epsilon": self.cluster_selection_epsilon,
-                "cluster_selection_method": self.cluster_selection_method,
-                "alpha": self.alpha,
-            },
-            "metrics": metrics_result["metrics"],
-            "metrics_valid": metrics_result["metrics_valid"],
-            "notes": metrics_result["notes"],
-        }
 
 
 def compute_relative_validity_index(embedding_matrix: np.ndarray, labels: np.ndarray, metric: str) -> float | None:

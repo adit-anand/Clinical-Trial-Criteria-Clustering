@@ -114,7 +114,7 @@ def umap_hdbscan_extra_fields(data: dict) -> list[tuple[str, str]]:
 
     Args:
         data: A parsed UMAP+HDBSCAN metrics dict (as produced by
-            `umap_hdbscan_clustering.build_metrics_dict`).
+            `reduction_hdbscan_pipeline.build_metrics_dict` via `umap_hdbscan_clustering.py`'s plugin).
 
     Returns:
         Label/formatted-value pairs for cluster/noise statistics plus the
@@ -144,7 +144,7 @@ def pacmap_hdbscan_extra_fields(data: dict) -> list[tuple[str, str]]:
 
     Args:
         data: A parsed PaCMAP+HDBSCAN metrics dict (as produced by
-            `pacmap_hdbscan_clustering.build_metrics_dict`).
+            `reduction_hdbscan_pipeline.build_metrics_dict` via `pacmap_hdbscan_clustering.py`'s plugin).
 
     Returns:
         Label/formatted-value pairs for cluster/noise statistics plus the

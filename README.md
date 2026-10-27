@@ -74,8 +74,9 @@ src/
     ├── clustering_io.py                  # shared read/write logic
     ├── hdbscan_model.py                  # shared HDBSCAN fitting/metrics (steps 4-5)
     ├── optuna_search.py                  # shared Optuna search engine (steps 4-5)
-    ├── clustering_report.py              # step 3
     ├── reduction_sweep.py                # shared seed/repeat reproducibility engine (steps 4-5)
+    ├── reduction_hdbscan_pipeline.py      # shared reduce+HDBSCAN+Optuna orchestration (steps 4-5)
+    ├── clustering_report.py              # step 3
     ├── umap_hdbscan_clustering.py        # step 4
     ├── pacmap_hdbscan_clustering.py      # step 5
     └── clustering_scatterplot.py         # step 6
@@ -83,21 +84,25 @@ src/
 
 Within `src/clustering/`, `clustering_io.py` holds everything genuinely
 common to every clustering algorithm (reading/validating embeddings,
-writing output); each algorithm module (`umap_hdbscan_clustering.py`,
-`pacmap_hdbscan_clustering.py`) holds only its own fitting and metrics
-logic, so adding another clustering algorithm means adding one new sibling
-module, not touching the shared I/O layer or the other algorithms.
-`clustering_report.py` builds on top of that same layer without modifying
-it. `umap_hdbscan_clustering.py` and `pacmap_hdbscan_clustering.py` share
-`hdbscan_model.py` (the HDBSCAN fitting/metrics class both reduce into,
-since standalone HDBSCAN clustering is not a pipeline in this repo — only
-these two reducer-based steps use it) and `optuna_search.py` — the Optuna
-config loader, hyperparameter suggestion, composite objective scoring, and
-study-lifecycle/trial-history mechanics common to both, so neither
-re-implements it. They additionally share `reduction_sweep.py`, which holds
-the reducer-agnostic seed/repeat reproducibility mechanics each of their
-Optuna trials runs internally (picking the most reproducible seed, then a
-representative repeat) so neither module re-implements it.
+writing output). `umap_hdbscan_clustering.py` and
+`pacmap_hdbscan_clustering.py` are thin shells: each supplies only its own
+reducer-specific hyperparameter validation/fit function plus a
+`ReducerPlugin` describing the handful of ways it differs from the other
+(output schema, hyperparameter names, a couple of metrics-JSON field names),
+and delegates the entire read-filter-search-write orchestration to
+`reduction_hdbscan_pipeline.run` — so adding another reducer means adding one
+new sibling module with its own plugin, not duplicating the orchestration
+again. `clustering_report.py` builds on top of the same `clustering_io.py`
+layer without modifying it. `reduction_hdbscan_pipeline.py` itself shares
+`hdbscan_model.py` (the HDBSCAN fitting/metrics class, since standalone
+HDBSCAN clustering is not a pipeline in this repo — only these two
+reducer-based steps use it) and `optuna_search.py` — the Optuna config
+loader, hyperparameter suggestion, composite objective scoring, and
+study-lifecycle/trial-history mechanics, so neither reducer module
+re-implements any of it. It additionally uses `reduction_sweep.py`, which
+holds the reducer-agnostic seed/repeat reproducibility mechanics each Optuna
+trial runs internally (picking the most reproducible seed, then a
+representative repeat).
 `clustering_scatterplot.py` reads whichever of the two algorithms' output
 already exists (via its own `VISUALIZATION_SPECS` registry, one entry per
 algorithm, following the same "no branching elsewhere" pattern
