@@ -24,9 +24,11 @@ JSON, trial-history CSV) is still wholesale-overwritten on every run.
 """
 
 import logging
+import math
 from dataclasses import dataclass
+from itertools import combinations
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import optuna
@@ -34,6 +36,11 @@ import yaml
 
 from src.clustering import clustering_io
 from src.paths import REPO_ROOT
+
+if TYPE_CHECKING:
+    from scipy.sparse import csc_matrix
+
+    from src.clustering.bertopic_model import BERTopicFitResult, TopicRepresentation
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +79,14 @@ DEGENERATE_TRIAL_PENALTY = 1000.0
 _DR_METRIC_K = 20
 _DR_NORMALIZE_EPSILON = 1e-12
 
+# Standard floor for NPMI (normalized pointwise mutual information) when a
+# keyword pair never co-occurs in any document (Lau et al. 2014; also
+# gensim's own NPMI coherence uses this same convention) — NPMI's own range
+# is otherwise [-1, 1], so -1.0 ("maximally anti-correlated") is already the
+# mathematically correct limit as co-occurrence probability -> 0, not an
+# arbitrary clamp.
+_NPMI_FLOOR = -1.0
+
 
 @dataclass(frozen=True)
 class HyperparamSpec:
@@ -102,8 +117,11 @@ class ObjectiveWeights:
     """Weights for every term folded into a trial's composite objective score.
 
     `trustworthiness_weight`/`continuity_weight`/`steadiness_weight`/
-    `cohesiveness_weight`/`missing_dr_metrics_fallback_score` are only read
-    by `score_reduction_candidate`.
+    `cohesiveness_weight`/`missing_dr_metrics_fallback_score` and
+    `topic_diversity_weight`/`inter_topic_redundancy_penalty`/
+    `topic_coherence_npmi_weight`/`zeroshot_label_confidence_weight`/
+    `topic_size_entropy_weight`/`missing_bertopic_quality_fallback_score`
+    are only read by `score_reduction_candidate`.
     """
 
     noise_penalty: float = 1.0
@@ -117,6 +135,13 @@ class ObjectiveWeights:
     steadiness_weight: float = 1.0
     cohesiveness_weight: float = 1.0
     missing_dr_metrics_fallback_score: float = 0.0
+    # BERTopic topic-representation quality terms (see `BERTopicQualityMetrics`).
+    topic_diversity_weight: float = 1.0
+    inter_topic_redundancy_penalty: float = 1.0
+    topic_coherence_npmi_weight: float = 1.0
+    zeroshot_label_confidence_weight: float = 1.0
+    topic_size_entropy_weight: float = 1.0
+    missing_bertopic_quality_fallback_score: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -170,6 +195,38 @@ class DRMetrics:
     continuity: float
     steadiness: float
     cohesiveness: float
+
+
+@dataclass(frozen=True)
+class BERTopicQualityMetrics:
+    """BERTopic topic-representation quality scores for one reducer-pipeline trial.
+
+    All five metrics exclude the noise/outlier topic (`topic_id == -1`) —
+    noise is already penalized elsewhere via `noise_fraction`/`noise_penalty`.
+    See `compute_bertopic_quality_metrics` for exact definitions/edge cases.
+    """
+
+    topic_diversity: float
+    inter_topic_redundancy: float
+    topic_coherence_npmi: float
+    zeroshot_label_confidence_rate: float
+    topic_size_entropy: float
+
+
+@dataclass(frozen=True)
+class DocumentTermIndex:
+    """A binary (0/1) document-occurrence index over a fixed corpus.
+
+    Built once per `run()` call via `build_document_term_index` and reused
+    across every trial in a study — `criterion_texts` never changes between
+    trials, so rebuilding this per trial (a naive per-call
+    `CountVectorizer().fit_transform(criterion_texts)`) would rebuild the
+    identical vocabulary/matrix up to `n_trials` times for no benefit.
+    """
+
+    vocabulary: dict[str, int]
+    doc_term_matrix: "csc_matrix"
+    n_docs: int
 
 
 def _parse_hyperparam_spec(name: str, raw: dict) -> HyperparamSpec:
@@ -373,6 +430,21 @@ def _eligibility_penalties(
     )
 
 
+def _bertopic_quality_reward(bertopic_quality: BERTopicQualityMetrics, weights: ObjectiveWeights) -> float:
+    """The 4 BERTopic reward terms (diversity/coherence/zero-shot-confidence/size-entropy), summed.
+
+    `inter_topic_redundancy` is deliberately excluded here — it's a
+    penalty, subtracted in `score_reduction_candidate` alongside
+    `DEGENERATE_TRIAL_PENALTY` rather than folded into this reward sum.
+    """
+    return (
+        weights.topic_diversity_weight * bertopic_quality.topic_diversity
+        + weights.topic_coherence_npmi_weight * bertopic_quality.topic_coherence_npmi
+        + weights.zeroshot_label_confidence_weight * bertopic_quality.zeroshot_label_confidence_rate
+        + weights.topic_size_entropy_weight * bertopic_quality.topic_size_entropy
+    )
+
+
 def score_reduction_candidate(
     metrics_result: dict,
     relative_validity: float | None,
@@ -380,6 +452,7 @@ def score_reduction_candidate(
     min_cluster_size: int,
     weights: ObjectiveWeights,
     dr_metrics: DRMetrics | None,
+    bertopic_quality: BERTopicQualityMetrics | None,
     bounds: EligibilityBounds,
 ) -> float:
     """Composite objective score for a reducer-pipeline trial (maximize).
@@ -388,12 +461,16 @@ def score_reduction_candidate(
     (`_eligibility_penalties`) with the dimensionality-reduction fidelity
     terms: trustworthiness/continuity/steadiness/cohesiveness are each
     conventionally normalized to `[0, 1]` with higher being better, so each
-    is added as a reward. Whenever `metrics_result["metrics_valid"]` is
-    `False` (this trial's representative repeat is degenerate), an
-    additional `DEGENERATE_TRIAL_PENALTY` is subtracted on top of
+    is added as a reward. Also folds in the 5 BERTopic topic-quality terms
+    (`_bertopic_quality_reward`'s 4 rewards, plus `inter_topic_redundancy`
+    subtracted as its own penalty) — these look at the *semantic content*
+    BERTopic produced for this trial, which nothing else in this score does.
+    Whenever `metrics_result["metrics_valid"]` is `False` (this trial's
+    representative repeat is degenerate), an additional
+    `DEGENERATE_TRIAL_PENALTY` is subtracted on top of
     `_eligibility_penalties`'s continuous terms, so a degenerate trial can
-    never outscore an eligible one regardless of how favorable its DBCV/DR
-    reward terms happen to be.
+    never outscore an eligible one regardless of how favorable its DBCV/DR/
+    BERTopic reward terms happen to be.
 
     Args:
         metrics_result: `HDBSCANClusterer.compute_metrics`'s return value for
@@ -404,6 +481,8 @@ def score_reduction_candidate(
         min_cluster_size: This trial's `min_cluster_size` hyperparameter.
         weights: The configured objective weights.
         dr_metrics: This trial's `DRMetrics`, or `None` if they couldn't be computed.
+        bertopic_quality: This trial's `BERTopicQualityMetrics`, or `None` if
+            they couldn't be computed.
         bounds: The eligibility bounds to penalize against.
 
     Returns:
@@ -419,7 +498,13 @@ def score_reduction_candidate(
         )
     else:
         base += weights.missing_dr_metrics_fallback_score
+    if bertopic_quality is not None:
+        base += _bertopic_quality_reward(bertopic_quality, weights)
+    else:
+        base += weights.missing_bertopic_quality_fallback_score
     score = base - _eligibility_penalties(metrics_result, labels, min_cluster_size, weights, bounds)
+    if bertopic_quality is not None:
+        score -= weights.inter_topic_redundancy_penalty * bertopic_quality.inter_topic_redundancy
     if not metrics_result["metrics_valid"]:
         score -= DEGENERATE_TRIAL_PENALTY
     return score
@@ -492,6 +577,216 @@ def compute_dr_metrics(
         )
     except Exception:
         logger.exception("compute_dr_metrics: failed to compute dimensionality-reduction fidelity metrics")
+        return None
+
+
+def build_document_term_index(criterion_texts: list[str]) -> DocumentTermIndex | None:
+    """Build a binary document-occurrence index over `criterion_texts`, once per `run()` call.
+
+    Uses `CountVectorizer`'s own default tokenizer/preprocessing (lowercasing
+    plus its default token pattern) — there's no existing tokenization
+    utility in this repo to reuse, and matching BERTopic's own c-TF-IDF
+    tokenization exactly is not attempted (see `_topic_keyword_npmi`'s
+    vocabulary-mismatch handling for the consequence of that).
+
+    Args:
+        criterion_texts: One document string per surviving row (loop-
+            invariant across an entire Optuna study — callers should build
+            this once in `run()`, not once per trial).
+
+    Returns:
+        A `DocumentTermIndex`, or `None` if `CountVectorizer` raises (e.g.
+        every document is empty after tokenization, which raises
+        `ValueError: empty vocabulary`) — fail-soft, mirroring
+        `compute_dr_metrics`'s contract.
+    """
+    from sklearn.feature_extraction.text import CountVectorizer
+
+    try:
+        vectorizer = CountVectorizer(binary=True)
+        doc_term_matrix = vectorizer.fit_transform(criterion_texts)
+        return DocumentTermIndex(
+            vocabulary=vectorizer.vocabulary_,
+            doc_term_matrix=doc_term_matrix.tocsc(),
+            n_docs=doc_term_matrix.shape[0],
+        )
+    except Exception:
+        logger.exception("build_document_term_index: failed to build the document-term index")
+        return None
+
+
+def _compute_topic_diversity(non_noise: list["TopicRepresentation"]) -> float:
+    """Fraction of unique keywords among all non-noise topics' keyword lists.
+
+    Returns `0.0` if there are no non-noise topics or no keywords at all —
+    a neutral, non-rewarding value rather than an error.
+    """
+    all_keywords = [keyword for topic in non_noise for keyword in topic.keywords]
+    if not all_keywords:
+        return 0.0
+    return len(set(all_keywords)) / len(all_keywords)
+
+
+def _compute_inter_topic_redundancy(
+    non_noise: list["TopicRepresentation"], topic_embeddings: dict[int, np.ndarray]
+) -> float:
+    """Max pairwise cosine similarity between any two non-noise topics' centroid embeddings.
+
+    Returns `0.0` if fewer than 2 non-noise topics (no pair exists to be
+    redundant) or if fewer than 2 of them have an entry in `topic_embeddings`
+    (defensive; `fit_bertopic_topics`'s own shape-mismatch guard should make
+    a missing id unreachable in practice).
+    """
+    vectors = [topic_embeddings[topic.topic_id] for topic in non_noise if topic.topic_id in topic_embeddings]
+    if len(vectors) < 2:
+        return 0.0
+    matrix = l2_normalize_rows(np.asarray(vectors, dtype=np.float64))
+    similarities = matrix @ matrix.T
+    np.fill_diagonal(similarities, -np.inf)  # exclude self-similarity (always 1.0)
+    return float(np.max(similarities))
+
+
+def _compute_zeroshot_label_confidence_rate(non_noise: list["TopicRepresentation"]) -> float:
+    """Fraction of non-noise topics with exactly one keyword (a confident zero-shot match).
+
+    See `TopicRepresentation.keywords`'s own docstring for why `len(keywords)
+    == 1` is the established signal for this, with no extra BERTopic
+    plumbing needed. Returns `0.0` if there are no non-noise topics.
+    """
+    if not non_noise:
+        return 0.0
+    confident = sum(1 for topic in non_noise if len(topic.keywords) == 1)
+    return confident / len(non_noise)
+
+
+def _compute_topic_size_entropy(non_noise: list["TopicRepresentation"]) -> float:
+    """Normalized Shannon entropy of non-noise topics' member counts.
+
+    Returns `1.0` when there are 0 or 1 non-noise topics (trivially
+    "nothing to unbalance") or when their total count is 0 (defensive;
+    BERTopic shouldn't emit a zero-count topic row, but this still guards
+    the division).
+    """
+    if len(non_noise) <= 1:
+        return 1.0
+    total = sum(topic.count for topic in non_noise)
+    if total == 0:
+        return 1.0
+    shares = np.array([topic.count / total for topic in non_noise], dtype=np.float64)
+    shares = shares[shares > 0]  # 0 * log(0) convention -> drop; contributes 0 to entropy either way
+    entropy = -float(np.sum(shares * np.log(shares)))
+    return entropy / math.log(len(non_noise))
+
+
+def _topic_keyword_npmi(word_a: str, word_b: str, document_term_index: DocumentTermIndex) -> float | None:
+    """Pairwise NPMI between two keywords, from `document_term_index`'s binary document co-occurrence.
+
+    Returns `None` (not a score) if either word is missing from the
+    vectorizer's vocabulary — BERTopic's own c-TF-IDF tokenization and
+    `CountVectorizer`'s default tokenizer can disagree on a word's exact
+    surface form (e.g. punctuation-adjacent tokens or single characters
+    below `CountVectorizer`'s default minimum token length). Callers must
+    skip (not zero-fill) any such pair, since `0.0` would misleadingly mean
+    "co-occurs no more than chance" rather than "unmeasurable".
+    """
+    vocabulary = document_term_index.vocabulary
+    column_a = vocabulary.get(word_a.lower())
+    column_b = vocabulary.get(word_b.lower())
+    if column_a is None or column_b is None:
+        return None
+
+    matrix = document_term_index.doc_term_matrix
+    n_docs = document_term_index.n_docs
+    doc_count_a = int(matrix[:, column_a].sum())
+    doc_count_b = int(matrix[:, column_b].sum())
+    if doc_count_a == 0 or doc_count_b == 0:
+        return None  # a vocabulary word with zero document frequency shouldn't occur, but guard anyway
+
+    co_doc_count = int(matrix[:, column_a].multiply(matrix[:, column_b]).sum())
+    if co_doc_count == 0:
+        return _NPMI_FLOOR
+
+    p_a = doc_count_a / n_docs
+    p_b = doc_count_b / n_docs
+    p_ab = co_doc_count / n_docs
+    return math.log(p_ab / (p_a * p_b)) / -math.log(p_ab)
+
+
+def _compute_topic_coherence_npmi(
+    non_noise: list["TopicRepresentation"], document_term_index: DocumentTermIndex
+) -> float:
+    """Mean pairwise-keyword NPMI per topic, averaged across non-noise topics.
+
+    A topic with fewer than 2 keywords (including the `len == 1` confident
+    zero-shot-match case) contributes no pairs and is skipped entirely, not
+    scored as `0.0` — it has no keyword pair to measure coherence between,
+    and forcing it to `0.0` would wrongly fight against
+    `zeroshot_label_confidence_rate` rewarding exactly that topic. A pair
+    where either keyword is out of `document_term_index`'s vocabulary is
+    likewise skipped (see `_topic_keyword_npmi`).
+
+    Returns `0.0` if no topic contributes any scorable pair at all (a
+    neutral default, not an error).
+    """
+    per_topic_scores = []
+    for topic in non_noise:
+        if len(topic.keywords) < 2:
+            continue
+        pair_scores = [
+            score
+            for word_a, word_b in combinations(topic.keywords, 2)
+            if (score := _topic_keyword_npmi(word_a, word_b, document_term_index)) is not None
+        ]
+        if pair_scores:
+            per_topic_scores.append(sum(pair_scores) / len(pair_scores))
+
+    if not per_topic_scores:
+        return 0.0
+    return sum(per_topic_scores) / len(per_topic_scores)
+
+
+def compute_bertopic_quality_metrics(
+    bertopic_result: "BERTopicFitResult", document_term_index: DocumentTermIndex | None
+) -> BERTopicQualityMetrics | None:
+    """Compute the 5 non-noise BERTopic topic-quality metrics for one trial.
+
+    All 5 metrics exclude `topic_id == -1` (noise is penalized elsewhere via
+    `noise_fraction`/`noise_penalty`). Mirrors `compute_dr_metrics`'s
+    fail-soft `try/except -> None` contract: any unexpected failure anywhere
+    in this computation degrades to `None` (-> `missing_bertopic_quality_fallback_score`
+    in `score_reduction_candidate`) rather than failing the whole trial.
+
+    Args:
+        bertopic_result: This trial's `BERTopicFitResult` (already fit on
+            the representative repeat).
+        document_term_index: The corpus-wide binary document-occurrence
+            index built once per `run()` call via `build_document_term_index`,
+            or `None` if that one-time build itself failed — in which case
+            `topic_coherence_npmi` alone is set to `0.0` (a neutral score)
+            while the other 4 metrics (which don't depend on it) are still
+            computed normally.
+
+    Returns:
+        A `BERTopicQualityMetrics`, or `None` if computation fails
+        unexpectedly.
+    """
+    try:
+        non_noise = [topic for topic in bertopic_result.topics if topic.topic_id != -1]
+
+        topic_coherence_npmi = (
+            _compute_topic_coherence_npmi(non_noise, document_term_index)
+            if document_term_index is not None
+            else 0.0
+        )
+        return BERTopicQualityMetrics(
+            topic_diversity=_compute_topic_diversity(non_noise),
+            inter_topic_redundancy=_compute_inter_topic_redundancy(non_noise, bertopic_result.topic_embeddings),
+            topic_coherence_npmi=topic_coherence_npmi,
+            zeroshot_label_confidence_rate=_compute_zeroshot_label_confidence_rate(non_noise),
+            topic_size_entropy=_compute_topic_size_entropy(non_noise),
+        )
+    except Exception:
+        logger.exception("compute_bertopic_quality_metrics: failed to compute BERTopic topic-quality metrics")
         return None
 
 

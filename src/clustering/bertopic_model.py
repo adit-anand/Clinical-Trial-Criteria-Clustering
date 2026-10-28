@@ -87,11 +87,22 @@ class BERTopicFitResult:
         probabilities: One cluster-membership probability per document.
         topics: One `TopicRepresentation` per distinct id present in `labels`
             (including `-1`).
+        topic_embeddings: Each topic's centroid embedding, keyed by
+            `topic_id` (including `-1`) rather than stored as a bare
+            position-ordered array. BERTopic's own `topic_embeddings_`
+            *is* a bare array, row-ordered by an internal sort that happens
+            to agree with `get_topic_info()`'s own row order today (both
+            ultimately sort the same topic-id universe ascending) but isn't
+            a documented public contract between the two — keying this dict
+            explicitly by id (see `fit_bertopic_topics`) means a consumer
+            can never silently misattribute one topic's embedding to
+            another if that coincidence ever stops holding.
     """
 
     labels: np.ndarray
     probabilities: np.ndarray
     topics: list[TopicRepresentation]
+    topic_embeddings: dict[int, np.ndarray]
 
 
 def same_partition(expected: np.ndarray, actual: np.ndarray) -> bool:
@@ -182,4 +193,21 @@ def fit_bertopic_topics(
             TopicRepresentation(topic_id=int(row.Topic), keywords=keywords, label=label, count=int(row.Count))
         )
 
-    return BERTopicFitResult(labels=labels, probabilities=probabilities, topics=topic_representations)
+    # `topic_embeddings_`'s row order is never trusted positionally (see
+    # `BERTopicFitResult.topic_embeddings`'s docstring) -- reconstruct the
+    # id-to-row correspondence from `topic_sizes_`, the same topic-id
+    # universe `topic_embeddings_` was itself built from (both ultimately
+    # derive from the same fitted `documents` frame's `Topic` column), and
+    # fail loudly rather than silently misalign if the two ever disagree.
+    topic_ids_in_order = sorted(topic_model.topic_sizes_.keys())
+    raw_topic_embeddings = np.asarray(topic_model.topic_embeddings_)
+    if raw_topic_embeddings.shape[0] != len(topic_ids_in_order):
+        raise RuntimeError(
+            f"fit_bertopic_topics: topic_embeddings_ has {raw_topic_embeddings.shape[0]} row(s) but "
+            f"{len(topic_ids_in_order)} topic id(s) are present in topic_sizes_; cannot safely align"
+        )
+    topic_embeddings = {tid: raw_topic_embeddings[i] for i, tid in enumerate(topic_ids_in_order)}
+
+    return BERTopicFitResult(
+        labels=labels, probabilities=probabilities, topics=topic_representations, topic_embeddings=topic_embeddings
+    )

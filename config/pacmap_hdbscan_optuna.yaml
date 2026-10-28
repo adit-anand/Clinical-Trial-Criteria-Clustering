@@ -75,6 +75,19 @@ objective_weights:
   steadiness_weight: 1.0
   cohesiveness_weight: 1.0
   missing_dr_metrics_fallback_score: 0.0
+  # BERTopic topic-representation quality terms (all 5 exclude the noise/
+  # outlier topic -- noise is already penalized above via noise_penalty).
+  # topic_diversity/topic_coherence_npmi/zeroshot_label_confidence/
+  # topic_size_entropy are rewards (higher is better, each roughly in
+  # [0, 1], except topic_coherence_npmi which is in [-1, 1]);
+  # inter_topic_redundancy is a penalty (max pairwise cosine similarity
+  # between topic centroids -- high means two topics are near-duplicates).
+  topic_diversity_weight: 1.0
+  inter_topic_redundancy_penalty: 1.0
+  topic_coherence_npmi_weight: 1.0
+  zeroshot_label_confidence_weight: 1.0
+  topic_size_entropy_weight: 1.0
+  missing_bertopic_quality_fallback_score: 0.0
 
 n_trials: 50
 sampler_seed: 42

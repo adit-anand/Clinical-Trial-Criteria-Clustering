@@ -290,6 +290,11 @@ def run(
     embedding_dim = clustering_io.validate_embedding_dimensions(filtered)
     embedding_matrix = clustering_io.extract_embedding_matrix(filtered)
     criterion_texts = clustering_io.extract_traceability_columns(filtered)["criterion_text"]
+    # Built once per run (not once per trial): criterion_texts never changes
+    # between trials, so this is `evaluate_trial`'s shared, loop-invariant
+    # input to the BERTopic topic-coherence term (see
+    # optuna_search.compute_bertopic_quality_metrics).
+    document_term_index = optuna_search.build_document_term_index(criterion_texts)
 
     config = optuna_search.load_optuna_config(config_path, require_reproducibility=True)
     bounds = optuna_search.EligibilityBounds(
@@ -321,9 +326,10 @@ def run(
         from a *previous* process invocation, never present in this process's
         own `trial_cache` (Optuna's storage persists only hyperparameters/score,
         not our fit artifacts) — re-evaluating is the only way to recover its
-        reduced matrix/labels/probabilities/topics, and is safe since the
-        reducer (given the same `random_state`), HDBSCAN, and BERTopic's own
-        refit are all fully deterministic given the same inputs.
+        reduced matrix/labels/probabilities/topics/dr_metrics/bertopic_quality,
+        and is safe since the reducer (given the same `random_state`),
+        HDBSCAN, and BERTopic's own refit are all fully deterministic given
+        the same inputs.
 
         The seed/repeat reproducibility sweep below still picks a winning
         seed/representative repeat via a plain HDBSCAN fit, unchanged; once
@@ -370,6 +376,8 @@ def run(
                 hyperparams,
             )
 
+        bertopic_quality = optuna_search.compute_bertopic_quality_metrics(bertopic_result, document_term_index)
+
         metrics_result = hdbscan_clusterer.compute_metrics(representative.reduced_matrix, bertopic_result.labels)
         relative_validity = compute_relative_validity_index(
             representative.reduced_matrix, bertopic_result.labels, fixed_metric
@@ -380,6 +388,7 @@ def run(
             "status": status,
             "candidate": candidate,
             "dr_metrics": dr_metrics,
+            "bertopic_quality": bertopic_quality,
             "hyperparams": hyperparams,
             "metrics_result": metrics_result,
             "relative_validity": relative_validity,
@@ -415,6 +424,7 @@ def run(
             hyperparams["min_cluster_size"],
             config.objective_weights,
             record["dr_metrics"],
+            record["bertopic_quality"],
             bounds,
         )
 
@@ -507,6 +517,8 @@ def run(
     )
     dr_metrics = winner["dr_metrics"]
     metrics_dict["dr_metrics"] = asdict(dr_metrics) if dr_metrics is not None else None
+    bertopic_quality = winner["bertopic_quality"]
+    metrics_dict["bertopic_quality_metrics"] = asdict(bertopic_quality) if bertopic_quality is not None else None
     metrics_dict["optuna_study_summary"] = {
         "study_name": study_name,
         "storage_path": clustering_io.relative_to_repo_root(storage_path),
