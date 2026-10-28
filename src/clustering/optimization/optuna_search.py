@@ -40,7 +40,7 @@ from src.paths import REPO_ROOT
 if TYPE_CHECKING:
     from scipy.sparse import csc_matrix
 
-    from src.clustering.bertopic_model import BERTopicFitResult, TopicRepresentation
+    from src.clustering.algorithms.bertopic_model import BERTopicFitResult, TopicRepresentation
 
 logger = logging.getLogger(__name__)
 

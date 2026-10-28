@@ -34,14 +34,17 @@ as the next step's input path.
    are what the Optuna objective scores and what gets written. Writes the
    reduced embeddings plus cluster assignments and metrics.
    Read/validate/write logic shared between the clustering approaches lives
-   in `src/clustering/clustering_io.py`; the HDBSCAN fitting/metrics code,
-   Optuna search engine, and BERTopic topic-representation layer shared by
-   both reducer-based steps live in `src/clustering/hdbscan_model.py`,
-   `src/clustering/optuna_search.py`, and `src/clustering/bertopic_model.py`
-   respectively, orchestrated by `src/clustering/reduction_hdbscan_pipeline.py`.
+   in `src/clustering/clustering_io.py`; the HDBSCAN fitting/metrics code
+   and BERTopic topic-representation layer shared by both reducer-based
+   steps live in `src/clustering/algorithms/hdbscan_model.py` and
+   `src/clustering/algorithms/bertopic_model.py` respectively, the Optuna
+   search engine lives in `src/clustering/optimization/optuna_search.py`,
+   and all of it is orchestrated by
+   `src/clustering/reduction_hdbscan_pipeline.py`.
 5. **`src/clustering/pacmap_hdbscan_clustering.py`** — the same idea as step
    4, reducing with PaCMAP instead of UMAP. The seed/repeat reproducibility
-   mechanics both steps share live in `src/clustering/reduction_sweep.py`.
+   mechanics both steps share live in
+   `src/clustering/optimization/reduction_sweep.py`.
 6. **`src/clustering/clustering_scatterplot.py`** — reads whichever
    clustering method's output paths are passed to it and writes an
    interactive HTML scatterplot of its criteria in a 2-dimensional UMAP
@@ -79,49 +82,98 @@ src/
 │   └── criteria_embedding.py             # orchestration + CLI (step 2)
 └── clustering/
     ├── clustering_io.py                  # shared read/write logic
-    ├── hdbscan_model.py                  # shared HDBSCAN fitting/metrics (steps 4-5)
-    ├── optuna_search.py                  # shared Optuna search engine (steps 4-5)
-    ├── reduction_sweep.py                # shared seed/repeat reproducibility engine (steps 4-5)
-    ├── bertopic_model.py                # shared BERTopic topic-representation layer (steps 4-5)
     ├── reduction_hdbscan_pipeline.py      # shared reduce+BERTopic/HDBSCAN+Optuna orchestration (steps 4-5)
     ├── clustering_report.py              # step 3
     ├── umap_hdbscan_clustering.py        # step 4
     ├── pacmap_hdbscan_clustering.py      # step 5
-    └── clustering_scatterplot.py         # step 6
+    ├── clustering_scatterplot.py         # step 6
+    ├── optimization/                     # reducer-and-algorithm-agnostic Optuna search engine
+    │   ├── optuna_search.py              #   config/search-space parsing, composite scoring, study lifecycle
+    │   └── reduction_sweep.py            #   seed/repeat reproducibility engine
+    └── algorithms/                       # "how do I fit *this* algorithm, and is its output any good" modules
+        ├── hdbscan_model.py              #   HDBSCAN fitting + eligibility-gate metrics
+        └── bertopic_model.py             #   BERTopic topic-representation layer
 ```
 
-Within `src/clustering/`, `clustering_io.py` holds everything genuinely
-common to every clustering algorithm (reading/validating embeddings,
-writing output). `umap_hdbscan_clustering.py` and
-`pacmap_hdbscan_clustering.py` are thin shells: each supplies only its own
-reducer-specific hyperparameter validation/fit function plus a
-`ReducerPlugin` describing the handful of ways it differs from the other
-(output schema, hyperparameter names, a couple of metrics-JSON field names),
-and delegates the entire read-filter-search-write orchestration to
-`reduction_hdbscan_pipeline.run` — so adding another reducer means adding one
-new sibling module with its own plugin, not duplicating the orchestration
-again. `clustering_report.py` builds on top of the same `clustering_io.py`
-layer without modifying it. `reduction_hdbscan_pipeline.py` itself shares
-`hdbscan_model.py` (the HDBSCAN fitting/metrics class, since standalone
-HDBSCAN clustering is not a pipeline in this repo — only these two
-reducer-based steps use it) and `optuna_search.py` — the Optuna config
-loader, hyperparameter suggestion, composite objective scoring, and
-study-lifecycle/trial-history mechanics, so neither reducer module
-re-implements any of it. It additionally uses `reduction_sweep.py`, which
-holds the reducer-agnostic seed/repeat reproducibility mechanics each Optuna
-trial runs internally (picking the most reproducible seed, then a
-representative repeat). Once that representative repeat is chosen,
-`reduction_hdbscan_pipeline.run` fits `bertopic_model.py`'s
-`fit_bertopic_topics` exactly once per trial, reusing that trial's own
-HDBSCAN hyperparameters (skipping BERTopic's own internal UMAP step) —
-BERTopic's own cluster assignments, not the sweep's earlier plain-HDBSCAN
-fit, are what the Optuna objective scores and what the winning trial's
-output reports.
-`clustering_scatterplot.py` reads whichever of the two algorithms' output
-already exists (via its own `VISUALIZATION_SPECS` registry, one entry per
-algorithm, following the same "no branching elsewhere" pattern
-`clustering_report.py`'s `ALGORITHM_SPECS` already established) and never
-re-runs or modifies any of them.
+`src/clustering/` splits three ways, each with a distinct job:
+
+- **Orchestration, at the package root**: `clustering_io.py` holds
+  everything genuinely common to every clustering algorithm (reading/
+  validating embeddings, writing output). `umap_hdbscan_clustering.py` and
+  `pacmap_hdbscan_clustering.py` are thin shells: each supplies only its own
+  reducer-specific hyperparameter validation/fit function plus a
+  `ReducerPlugin` describing the handful of ways it differs from the other
+  (output schema, hyperparameter names, a couple of metrics-JSON field
+  names), and delegates the entire read-filter-search-write orchestration to
+  `reduction_hdbscan_pipeline.run` — so adding another reducer means adding
+  one new sibling module with its own plugin, not duplicating the
+  orchestration again. `clustering_report.py` builds on top of the same
+  `clustering_io.py` layer without modifying it, and `clustering_scatterplot.py`
+  reads whichever of the two algorithms' output already exists (via its own
+  `VISUALIZATION_SPECS` registry, one entry per algorithm, following the
+  same "no branching elsewhere" pattern `clustering_report.py`'s
+  `ALGORITHM_SPECS` already established) — neither re-runs or modifies
+  anything. `reduction_hdbscan_pipeline.py` itself is the integration layer
+  that composes the two subpackages below; it isn't itself "optimization" or
+  "an algorithm," so it stays at the root rather than living inside either.
+- **`optimization/`**: the Optuna machinery that has no idea which reducer
+  or which clustering algorithm it's scoring. `optuna_search.py` is the
+  config loader, hyperparameter suggestion (including dependent `int_ratio`
+  parameters, e.g. keeping `min_samples` bounded relative to
+  `min_cluster_size`), composite objective scoring, and study-lifecycle/
+  trial-history mechanics; `reduction_sweep.py` holds the reducer-agnostic
+  seed/repeat reproducibility mechanics each Optuna trial runs internally
+  (picking the most reproducible seed, then a representative repeat). Both
+  take generic callables/an already-configured `HDBSCANClusterer` as
+  arguments — neither module imports a specific reducer.
+- **`algorithms/`**: the modules that know how to fit one specific
+  algorithm and judge its own output. `hdbscan_model.py` is the shared
+  HDBSCAN fitting/metrics class (standalone HDBSCAN clustering is not a
+  pipeline in this repo — only the two reducer-based steps use it).
+  `bertopic_model.py` is the BERTopic topic-representation layer: once
+  `reduction_hdbscan_pipeline.run` picks a trial's representative repeat, it
+  fits `bertopic_model.fit_bertopic_topics` exactly once per trial, reusing
+  that trial's own HDBSCAN hyperparameters (skipping BERTopic's own internal
+  UMAP step) — BERTopic's own cluster assignments, not the sweep's earlier
+  plain-HDBSCAN fit, are what the Optuna objective scores and what the
+  winning trial's output reports.
+
+None of this changes how any step is invoked — every CLI command in this
+README still runs exactly as `uv run python -m src.clustering.<module>
+"..."`; only the internal module layout moved.
+
+### Extending the pipeline
+
+Three extension points already exist in this codebase; adding to any of
+them doesn't require touching the others.
+
+**A new reducer** (alongside UMAP/PaCMAP): add one new sibling module at
+`src/clustering/` top level, matching the shape of
+`umap_hdbscan_clustering.py`/`pacmap_hdbscan_clustering.py` — its own
+hyperparameter-validation/fit function plus a `ReducerPlugin` instance — and
+point it at the existing `reduction_hdbscan_pipeline.run`. No changes needed
+to the orchestration, the Optuna engine, or either algorithm module.
+
+**A new objective-score term** (alongside DBCV, the dimensionality-reduction
+fidelity terms, and the BERTopic topic-quality terms): add a new frozen
+dataclass next to `DRMetrics`/`BERTopicQualityMetrics` in
+`optimization/optuna_search.py`, a `compute_*` function that returns it (or
+`None` on failure — every metric here is fail-soft, never aborting a
+trial), new `ObjectiveWeights` fields following the existing naming
+convention (`<metric>_weight` for rewards, `<type>_penalty` for penalties,
+`missing_<context>_fallback_score` for the whole-computation-failed case),
+fold it into `score_reduction_candidate`, and add the matching
+`objective_weights:` keys to both `config/pacmap_hdbscan_optuna.yaml` and
+`config/umap_hdbscan_optuna.yaml`.
+
+**A new clustering algorithm** (alongside HDBSCAN): add a new module under
+`src/clustering/algorithms/` shaped like `hdbscan_model.py` — a fitter
+class/function plus a `compute_metrics`-style eligibility gate that reports
+`metrics_valid` (cluster count, dominant-cluster share, noise fraction, or
+whatever bounds make sense for that algorithm) — so
+`reduction_hdbscan_pipeline.py`'s generic orchestration, and
+`optimization/reduction_sweep.py`'s generic reproducibility sweep, can drive
+it the same way they drive HDBSCAN today.
 
 ## Setup
 

@@ -40,7 +40,7 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.paths import REPO_ROOT
-from src.clustering import optuna_search
+from src.clustering.optimization import optuna_search
 from src.clustering.reduction_hdbscan_pipeline import ReducerPlugin
 from src.clustering import reduction_hdbscan_pipeline
 

@@ -50,7 +50,7 @@ from typing import Callable, Literal
 
 import numpy as np
 
-from src.clustering.hdbscan_model import HDBSCAN_PARAM_NAMES, HDBSCANClusterer, compute_relative_validity_index
+from src.clustering.algorithms.hdbscan_model import HDBSCAN_PARAM_NAMES, HDBSCANClusterer, compute_relative_validity_index
 
 logger = logging.getLogger(__name__)
 

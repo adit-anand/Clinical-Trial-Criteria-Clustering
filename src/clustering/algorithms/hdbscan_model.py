@@ -21,7 +21,7 @@ from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score, silho
 from src.clustering import clustering_io
 
 if TYPE_CHECKING:
-    from src.clustering.bertopic_model import TopicRepresentation
+    from src.clustering.algorithms.bertopic_model import TopicRepresentation
 
 # Shared with pacmap_hdbscan_clustering.py/umap_hdbscan_clustering.py: splits
 # a reducer-pipeline trial's combined search_space dict into HDBSCAN's own

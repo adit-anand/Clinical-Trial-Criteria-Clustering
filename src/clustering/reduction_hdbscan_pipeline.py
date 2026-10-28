@@ -40,11 +40,11 @@ import pyarrow as pa
 
 from src.logging_utils import configure_logging
 from src.paths import label_from_slug, slug_from_filename
-from src.clustering import bertopic_model
+from src.clustering.algorithms import bertopic_model
 from src.clustering import clustering_io
-from src.clustering import optuna_search
-from src.clustering import reduction_sweep
-from src.clustering.hdbscan_model import (
+from src.clustering.optimization import optuna_search
+from src.clustering.optimization import reduction_sweep
+from src.clustering.algorithms.hdbscan_model import (
     HDBSCAN_CLUSTER_PARQUET_SCHEMA,
     HDBSCAN_PARAM_NAMES,
     HDBSCANClusterer,
