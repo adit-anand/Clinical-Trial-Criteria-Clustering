@@ -431,9 +431,21 @@ def run(
 
     status_counts = optuna_search.count_trial_statuses(study)
 
-    best_trial = optuna_search.best_trial_or_none(study)
+    # `best_ok_trial_or_none` (not `best_trial_or_none`) deliberately: a
+    # degenerate trial (dominant cluster / excess noise / cluster-count out
+    # of range) must never be written out as this run's result just because
+    # it out-scored every eligible trial -- see that function's docstring.
+    best_trial = optuna_search.best_ok_trial_or_none(study)
     if best_trial is None:
-        logger.warning("run: study has no trials for %r; writing nothing", label)
+        if not study.get_trials(deepcopy=False):
+            logger.warning("run: study has no trials for %r; writing nothing", label)
+        else:
+            logger.warning(
+                "run: no trial produced a valid (non-degenerate) clustering for %r (%d trial(s) attempted: "
+                "%d ok, %d degenerate, %d invalid); writing nothing",
+                label, len(study.get_trials(deepcopy=False)),
+                status_counts["ok"], status_counts["degenerate"], status_counts["invalid"],
+            )
         return None
     winner = trial_cache.get(best_trial.number)
     if winner is None:
@@ -442,8 +454,15 @@ def run(
             best_trial.number, label,
         )
         winner = evaluate_trial(best_trial.params)
-    if winner["status"] == "invalid":
-        logger.warning("run: no trial ever fit for %r; writing nothing", label)
+    if winner["status"] != "ok":
+        # Defensive only: `evaluate_trial` is deterministic given the same
+        # hyperparameters, so a trial persisted with status "ok" should
+        # always re-evaluate to "ok" too. Guards against ever writing a
+        # degenerate/invalid result if that assumption is ever violated.
+        logger.warning(
+            "run: best 'ok' trial #%d for %r re-evaluated to status=%r instead; writing nothing",
+            best_trial.number, label, winner["status"],
+        )
         return None
 
     candidate: reduction_sweep.ReducerConfigCandidate = winner["candidate"]

@@ -6,10 +6,14 @@ used to run. `reduction_hdbscan_pipeline.run` loads its config via
 `load_optuna_config`, builds/resumes a study via `build_study`, and runs an
 Optuna objective closure that scores each trial via `score_reduction_candidate`.
 Every trial — whether it fit cleanly, fit but was degenerate, or never fit at
-all — returns a value on the same comparable scale, so `study.best_trial` is
-itself the winner; `best_trial_or_none` just distinguishes "the study has no
-trials at all" from every other case (callers handle "the best trial never
-fit" themselves via the trial's own cached/re-evaluated status).
+all — returns a value on the same comparable scale, but `study.best_trial`
+is *not* necessarily a trial callers should write to disk: `score_reduction_candidate`
+only discourages degenerate trials via `DEGENERATE_TRIAL_PENALTY`, it doesn't
+exclude them, so the single best-scoring trial overall can still be
+degenerate. `best_ok_trial_or_none` is what callers should use to pick the
+trial they actually write out — it only considers trials whose own `status`
+user-attribute is `"ok"`. `best_trial_or_none` just distinguishes "the study
+has no trials at all" from every other case, regardless of status.
 
 Deliberate exception to this repo's overwrite-on-rerun convention: the
 Optuna study's file-based storage (`build_study`) accumulates across runs by
@@ -49,6 +53,20 @@ MAX_TOTAL_FITS_PER_STUDY = 25000
 # scores are roughly in [-5, 1]).
 INVALID_TRIAL_SCORE = -1e6
 
+# A trial that fit but whose representative repeat failed
+# `HDBSCANClusterer.compute_metrics`'s own eligibility gate (dominant
+# cluster, excess noise, or cluster-count out of range) is "degenerate", not
+# "invalid" -- it still fit and still has real metrics, so it isn't scored
+# with INVALID_TRIAL_SCORE. But `_eligibility_penalties`'s continuous terms
+# alone are small relative to the DBCV + dimensionality-reduction-fidelity
+# reward terms (realistic rewards are roughly in [-1, 5]), so without a
+# decisive penalty a degenerate trial can legitimately outscore an eligible
+# one -- which both lets a degenerate trial become the study's reported
+# winner and biases the TPE sampler toward resampling the degenerate region.
+# Subtracting this constant whenever `metrics_valid` is False guarantees
+# `INVALID_TRIAL_SCORE < any degenerate score < any ok score`.
+DEGENERATE_TRIAL_PENALTY = 1000.0
+
 # Neighborhood size used for the dimensionality-reduction fidelity metrics
 # (subfeature 6) — mirrors zadu's own ZADU.DEFAULT_K.
 _DR_METRIC_K = 20
@@ -57,13 +75,26 @@ _DR_NORMALIZE_EPSILON = 1e-12
 
 @dataclass(frozen=True)
 class HyperparamSpec:
-    """One hyperparameter's Optuna search-space definition, as parsed from YAML."""
+    """One hyperparameter's Optuna search-space definition, as parsed from YAML.
 
-    kind: Literal["int", "float", "categorical"]
+    `kind: "int_ratio"` is a dependent hyperparameter: instead of sampling
+    `low`/`high` directly, it samples a float ratio in that range and
+    resolves to `max(1, round(ratio * <relative_to's already-suggested
+    value>))` — see `suggest_hyperparams`. Used to keep e.g. `min_samples`
+    bounded relative to `min_cluster_size` rather than swept independently of
+    it (an independent sweep lets `min_samples` land far above
+    `min_cluster_size`, which HDBSCAN tends to resolve into a degenerate
+    dominant-cluster-or-all-noise result). `relative_to` must name another
+    key in the same `search_space` block that's suggested earlier (YAML/dict
+    key order; `suggest_hyperparams` raises if it isn't).
+    """
+
+    kind: Literal["int", "float", "categorical", "int_ratio"]
     low: float | int | None = None
     high: float | int | None = None
     choices: list | None = None
     log: bool = False
+    relative_to: str | None = None
 
 
 @dataclass(frozen=True)
@@ -150,6 +181,7 @@ def _parse_hyperparam_spec(name: str, raw: dict) -> HyperparamSpec:
             high=raw.get("high"),
             choices=raw.get("choices"),
             log=raw.get("log", False),
+            relative_to=raw.get("relative_to"),
         )
     except KeyError as exc:
         raise ValueError(f"search_space entry {name!r} is missing required key {exc}") from exc
@@ -239,12 +271,20 @@ def suggest_hyperparams(trial: "optuna.Trial", search_space: dict[str, Hyperpara
     Args:
         trial: The current Optuna trial.
         search_space: Maps each hyperparameter name to its `HyperparamSpec`.
+            For an `"int_ratio"` entry, its `relative_to` key must already be
+            present in `search_space` *and* ordered before it (dict/YAML key
+            order) — this function suggests values in iteration order and
+            resolves each `"int_ratio"` against whatever has already been
+            suggested.
 
     Returns:
         One suggested value per key in `search_space`.
 
     Raises:
-        ValueError: If a `HyperparamSpec.kind` isn't `"int"`/`"float"`/`"categorical"`.
+        ValueError: If a `HyperparamSpec.kind` isn't
+            `"int"`/`"float"`/`"categorical"`/`"int_ratio"`, or if an
+            `"int_ratio"` entry's `relative_to` doesn't name an
+            already-suggested hyperparameter.
     """
     hyperparams = {}
     for name, spec in search_space.items():
@@ -254,6 +294,14 @@ def suggest_hyperparams(trial: "optuna.Trial", search_space: dict[str, Hyperpara
             hyperparams[name] = trial.suggest_float(name, float(spec.low), float(spec.high), log=spec.log)
         elif spec.kind == "categorical":
             hyperparams[name] = trial.suggest_categorical(name, spec.choices)
+        elif spec.kind == "int_ratio":
+            if spec.relative_to not in hyperparams:
+                raise ValueError(
+                    f"search_space entry {name!r} has kind='int_ratio' with relative_to={spec.relative_to!r}, "
+                    "which must name another search_space key already suggested earlier (dict/YAML key order)"
+                )
+            ratio = trial.suggest_float(name, float(spec.low), float(spec.high), log=spec.log)
+            hyperparams[name] = max(1, round(ratio * hyperparams[spec.relative_to]))
         else:
             raise ValueError(f"Unknown hyperparameter kind {spec.kind!r} for {name!r}")
     return hyperparams
@@ -340,7 +388,12 @@ def score_reduction_candidate(
     (`_eligibility_penalties`) with the dimensionality-reduction fidelity
     terms: trustworthiness/continuity/steadiness/cohesiveness are each
     conventionally normalized to `[0, 1]` with higher being better, so each
-    is added as a reward.
+    is added as a reward. Whenever `metrics_result["metrics_valid"]` is
+    `False` (this trial's representative repeat is degenerate), an
+    additional `DEGENERATE_TRIAL_PENALTY` is subtracted on top of
+    `_eligibility_penalties`'s continuous terms, so a degenerate trial can
+    never outscore an eligible one regardless of how favorable its DBCV/DR
+    reward terms happen to be.
 
     Args:
         metrics_result: `HDBSCANClusterer.compute_metrics`'s return value for
@@ -366,7 +419,10 @@ def score_reduction_candidate(
         )
     else:
         base += weights.missing_dr_metrics_fallback_score
-    return base - _eligibility_penalties(metrics_result, labels, min_cluster_size, weights, bounds)
+    score = base - _eligibility_penalties(metrics_result, labels, min_cluster_size, weights, bounds)
+    if not metrics_result["metrics_valid"]:
+        score -= DEGENERATE_TRIAL_PENALTY
+    return score
 
 
 def l2_normalize_rows(matrix: np.ndarray) -> np.ndarray:
@@ -546,3 +602,33 @@ def best_trial_or_none(study: "optuna.Study") -> "optuna.trial.FrozenTrial | Non
     if not study.get_trials(deepcopy=False):
         return None
     return study.best_trial
+
+
+def best_ok_trial_or_none(study: "optuna.Study") -> "optuna.trial.FrozenTrial | None":
+    """Return the highest-scoring trial whose own `status` user-attribute is `"ok"`.
+
+    Unlike `best_trial_or_none` (which returns `study.best_trial` regardless
+    of status), a `"degenerate"` trial is never eligible here — `score_reduction_candidate`'s
+    `DEGENERATE_TRIAL_PENALTY` makes a degenerate trial unlikely to outscore
+    an eligible one, but doesn't make it impossible (e.g. if every trial in a
+    study happened to be degenerate), and callers that write a trial's result
+    to disk (`reduction_hdbscan_pipeline.run`) must never do so for a
+    degenerate clustering just because it was the best-scoring trial
+    available.
+
+    Args:
+        study: The study whose trials were just run (or already existed, resumed).
+
+    Returns:
+        The `"ok"` trial with the highest `.value`, or `None` if the study
+        has no trial with `status == "ok"` (including if it has no trials at
+        all).
+    """
+    ok_trials = [
+        trial
+        for trial in study.get_trials(deepcopy=False)
+        if trial.user_attrs.get("status") == "ok" and trial.value is not None
+    ]
+    if not ok_trials:
+        return None
+    return max(ok_trials, key=lambda trial: trial.value)

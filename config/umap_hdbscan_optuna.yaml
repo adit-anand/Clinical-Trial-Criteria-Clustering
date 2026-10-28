@@ -1,10 +1,13 @@
 # Optuna search config for `src/clustering/umap_hdbscan_clustering.py`.
 #
-# search_space entries: {kind: int|float|categorical, low, high, choices, log}.
-# Combines UMAP's own hyperparameters with HDBSCAN's — both are searched
-# jointly. `metric` stays fixed (not swept): it's shared by UMAP's own fit,
-# HDBSCAN's own fit, DBCV, and the dimensionality-reduction fidelity metrics
-# below, and defaults to cosine (not euclidean) for this reason.
+# search_space entries: {kind: int|float|categorical|int_ratio, low, high,
+# choices, log, relative_to}. `int_ratio` suggests a float ratio in
+# [low, high] and resolves to max(1, round(ratio * <relative_to's value>)) —
+# see min_samples below. Combines UMAP's own hyperparameters with HDBSCAN's —
+# both are searched jointly. `metric` stays fixed (not swept): it's shared by
+# UMAP's own fit, HDBSCAN's own fit, DBCV, and the dimensionality-reduction
+# fidelity metrics below, and defaults to cosine (not euclidean) for this
+# reason.
 
 search_space:
   # UMAP's own hyperparameters
@@ -25,10 +28,16 @@ search_space:
     kind: int
     low: 50
     high: 300
+  # Swept as a ratio of min_cluster_size (not independently 5-300): letting
+  # min_samples land far above min_cluster_size is what HDBSCAN tends to
+  # resolve into a degenerate dominant-cluster-or-all-noise result. Note
+  # this means the Optuna trial-history CSV records this ratio (0.1-1.0),
+  # not the resolved integer min_samples.
   min_samples:
-    kind: int
-    low: 5
-    high: 300
+    kind: int_ratio
+    low: 0.1
+    high: 1.0
+    relative_to: min_cluster_size
   cluster_selection_method:
     kind: categorical
     choices: [eom, leaf]
