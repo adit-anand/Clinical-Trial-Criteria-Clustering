@@ -45,14 +45,24 @@ from src.paths import label_from_slug, slug_from_filename
 
 logger = logging.getLogger(__name__)
 
-# The three clustering-quality metrics every algorithm's own `build_metrics_dict`
-# reports under the identical `metrics_valid`-guarded key names, letting the
-# comparison table below iterate this list generically rather than branching
-# per algorithm. `direction` records which way is "better", for display only.
-SHARED_METRICS: list[tuple[str, str, Literal["higher", "lower"]]] = [
-    ("silhouette_score", "Silhouette score", "higher"),
-    ("davies_bouldin_index", "Davies-Bouldin index", "lower"),
-    ("calinski_harabasz_index", "Calinski-Harabasz index", "higher"),
+# The clustering-quality metrics every algorithm's own `build_metrics_dict`
+# reports under an identical key path (whether nested under `metrics` or
+# elsewhere in the dict), letting the comparison table below iterate this
+# list generically rather than branching per algorithm. Each entry's getter
+# extracts that metric's value from a parsed metrics dict (returning `None`
+# if absent, never raising), so one `value_fn` per entry is enough to cover
+# both metrics nested under `"metrics"` and ones that aren't (e.g. the
+# composite objective score, under `"optuna_study_summary"."best_score"`).
+# `direction` records which way is "better", for display only.
+SHARED_METRICS: list[tuple[Callable[[dict], float | None], str, Literal["higher", "lower"]]] = [
+    (lambda data: (data.get("metrics") or {}).get("silhouette_score"), "Silhouette score", "higher"),
+    (lambda data: (data.get("metrics") or {}).get("davies_bouldin_index"), "Davies-Bouldin index", "lower"),
+    (lambda data: (data.get("metrics") or {}).get("calinski_harabasz_index"), "Calinski-Harabasz index", "higher"),
+    (
+        lambda data: (data.get("optuna_study_summary") or {}).get("best_score"),
+        "Composite score",
+        "higher",
+    ),
 ]
 
 # Keys every algorithm's metrics JSON is expected to have, regardless of
@@ -362,11 +372,11 @@ def render_shared_metrics_table(loaded: dict[str, LoadResult]) -> str:
     header = ["Metric", "Direction"] + [spec.display_name for spec in ok_specs]
     lines.append("| " + " | ".join(header) + " |")
     lines.append("| " + " | ".join("---" for _ in header) + " |")
-    for metric_key, label, direction in SHARED_METRICS:
+    for value_fn, label, direction in SHARED_METRICS:
         direction_label = "higher is better" if direction == "higher" else "lower is better"
         row = [label, direction_label]
         for spec in ok_specs:
-            value = (loaded[spec.key].data.get("metrics") or {}).get(metric_key)
+            value = value_fn(loaded[spec.key].data)
             row.append(f"{value:.4f}" if value is not None else "N/A")
         lines.append("| " + " | ".join(row) + " |")
     return "\n".join(lines)
