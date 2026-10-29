@@ -34,13 +34,13 @@ import numpy as np
 import optuna
 import yaml
 
-from src.clustering import clustering_io
-from src.paths import REPO_ROOT
+from amia_2026.clustering import clustering_io
+from amia_2026.paths import REPO_ROOT
 
 if TYPE_CHECKING:
     from scipy.sparse import csc_matrix
 
-    from src.clustering.algorithms.bertopic_model import BERTopicFitResult, TopicRepresentation
+    from amia_2026.clustering.algorithms.bertopic_model import BERTopicFitResult, TopicRepresentation
 
 logger = logging.getLogger(__name__)
 

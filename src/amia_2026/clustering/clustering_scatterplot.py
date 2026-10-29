@@ -28,7 +28,6 @@ step against the same output path overwrites the existing file wholesale.
 import argparse
 import json
 import logging
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -40,18 +39,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import umap
 
-# Allow running this file directly (e.g. `uv run src/clustering/clustering_scatterplot.py`)
-# as well as via `-m` (e.g. `uv run python -m src.clustering.clustering_scatterplot`).
-# Direct execution leaves __package__ unset and never puts the repo root on
-# sys.path, so the src.* imports below would otherwise fail with
-# "ModuleNotFoundError: No module named 'src'"; -m already sets both up
-# correctly, so this is a no-op in that case.
-if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-from src.logging_utils import configure_logging
-from src.paths import label_from_slug, slug_from_filename
-from src.clustering import clustering_io
+from amia_2026.logging_utils import configure_logging
+from amia_2026.paths import label_from_slug, slug_from_filename
+from amia_2026.clustering import clustering_io
 
 logger = logging.getLogger(__name__)
 

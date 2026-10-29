@@ -12,20 +12,20 @@ gets an `inclusion/`/`exclusion/` subdirectory inserted before the
 filename, derived from `--criterion-type`, so the two sides' artifacts for
 the same method never collide on disk (see step 4).
 
-1. **`src/preprocessing/criteria_retrieval.py`** — fetches NCI-affiliated
+1. **`amia_2026/preprocessing/criteria_retrieval.py`** — fetches NCI-affiliated
    clinical trials for a condition from ClinicalTrials.gov, retrieves their
    eligibility criteria from the NCI CTRP API, parses them into atomic
    inclusion/exclusion criteria, and writes them to the given CSV path. Each
    concern lives in its own module (`clinicaltrials_client.py`,
    `ctrp_client.py`, `criteria_parser.py`); `criteria_retrieval.py` composes
    them and exposes the CLI.
-2. **`src/embeddings/criteria_embedding.py`** — reads that CSV, embeds each
+2. **`amia_2026/embeddings/criteria_embedding.py`** — reads that CSV, embeds each
    criterion's text with a configurable backend, and writes the result to
    the given Parquet path.
-3. **`src/clustering/clustering_report.py`** — reads whichever of the
+3. **`amia_2026/clustering/clustering_report.py`** — reads whichever of the
    clustering steps' metrics JSON paths are passed to it, and writes one
    consolidated Markdown report comparing their performance side by side.
-4. **`src/clustering/umap_hdbscan_clustering.py`** — reduces embeddings with
+4. **`amia_2026/clustering/umap_hdbscan_clustering.py`** — reduces embeddings with
    UMAP, tuned jointly with HDBSCAN by one Optuna search (search
    space/objective weights/trial budget come from a `--config-path` YAML
    file, not CLI flags; each trial also runs a configured
@@ -38,23 +38,23 @@ the same method never collide on disk (see step 4).
    are what the Optuna objective scores and what gets written. Writes the
    reduced embeddings plus cluster assignments and metrics.
    Read/validate/write logic shared between the clustering approaches lives
-   in `src/clustering/clustering_io.py`; the HDBSCAN fitting/metrics code
+   in `amia_2026/clustering/clustering_io.py`; the HDBSCAN fitting/metrics code
    and BERTopic topic-representation layer shared by both reducer-based
-   steps live in `src/clustering/algorithms/hdbscan_model.py` and
-   `src/clustering/algorithms/bertopic_model.py` respectively, the Optuna
-   search engine lives in `src/clustering/optimization/optuna_search.py`,
+   steps live in `amia_2026/clustering/algorithms/hdbscan_model.py` and
+   `amia_2026/clustering/algorithms/bertopic_model.py` respectively, the Optuna
+   search engine lives in `amia_2026/clustering/optimization/optuna_search.py`,
    and all of it is orchestrated by
-   `src/clustering/reduction_hdbscan_pipeline.py`.
-5. **`src/clustering/pacmap_hdbscan_clustering.py`** — the same idea as step
+   `amia_2026/clustering/reduction_hdbscan_pipeline.py`.
+5. **`amia_2026/clustering/pacmap_hdbscan_clustering.py`** — the same idea as step
    4, reducing with PaCMAP instead of UMAP. The seed/repeat reproducibility
    mechanics both steps share live in
-   `src/clustering/optimization/reduction_sweep.py`.
-6. **`src/clustering/clustering_scatterplot.py`** — reads whichever
+   `amia_2026/clustering/optimization/reduction_sweep.py`.
+6. **`amia_2026/clustering/clustering_scatterplot.py`** — reads whichever
    clustering method's output paths are passed to it and writes an
    interactive HTML scatterplot of its criteria in a 2-dimensional UMAP
    space (colored by cluster), reusing that method's own optimal-run seed
    for the projection.
-7. **`src/clustering/clustering_review.py`** — a combined step that runs
+7. **`amia_2026/clustering/clustering_review.py`** — a combined step that runs
    step 3's report, then automatically runs step 6's scatterplot for
    whichever methodology has the higher composite objective score (ties
    favor PaCMAP+HDBSCAN), resolving every path the scatterplot step needs
@@ -64,50 +64,52 @@ the same method never collide on disk (see step 4).
 
 ## Project structure
 
-`src/preprocessing/`, `src/embeddings/`, and `src/clustering/` are real
-Python packages (each has an `__init__.py`), so every pipeline module
-imports its siblings as ordinary absolute package imports (e.g. `from
-src.preprocessing.criteria_retrieval import EligibilityCriteriaFetcher`,
-`from src.clustering import clustering_io`). The one constant every module
-needs — the repo root — is centralized in `src/paths.py` rather than
-re-derived in each file. Every entry-point script can be run either as a
-module (`uv run python -m src.<package>.<module> "..."`, used throughout
-this README) or directly (`uv run src/<package>/<module>.py "..."`) — a
-small bootstrap at the top of each one puts the repo root on `sys.path`
-when it detects direct execution, so both styles behave identically.
+`amia_2026` is a real installable package rooted at `src/amia_2026/`
+(declared in `pyproject.toml`, built by `uv_build`); `preprocessing/`,
+`embeddings/`, and `clustering/` are its subpackages (each has an
+`__init__.py`), so every pipeline module imports its siblings as ordinary
+absolute package imports (e.g. `from amia_2026.preprocessing.criteria_retrieval
+import EligibilityCriteriaFetcher`, `from amia_2026.clustering import
+clustering_io`) — no `sys.path` manipulation anywhere. The one constant
+every module needs — the repo root — is centralized in `amia_2026/paths.py`
+rather than re-derived in each file. Every entry-point script is run as a
+module: `uv run python -m amia_2026.<package>.<module> "..."` (used
+throughout this README); `uv sync`/`uv run` makes the package importable
+regardless of the current working directory.
 
 ```
 config/
 ├── pacmap_hdbscan_optuna.yaml             # Optuna search config for step 5
 └── umap_hdbscan_optuna.yaml               # Optuna search config for step 4
 src/
-├── paths.py                              # shared REPO_ROOT constant
-├── logging_utils.py                      # shared console+optional-file logging setup
-├── preprocessing/
-│   ├── clinicaltrials_client.py          # ClinicalTrials.gov search
-│   ├── ctrp_client.py                    # CTRP API fetch + retry
-│   ├── criteria_parser.py                # unstructured-text -> atomic criteria
-│   └── criteria_retrieval.py             # orchestration + CLI (step 1)
-├── embeddings/
-│   ├── embedding_model.py                # EmbeddingModel interface + backends
-│   └── criteria_embedding.py             # orchestration + CLI (step 2)
-└── clustering/
-    ├── clustering_io.py                  # shared read/write logic
-    ├── reduction_hdbscan_pipeline.py      # shared reduce+BERTopic/HDBSCAN+Optuna orchestration (steps 4-5)
-    ├── clustering_report.py              # step 3
-    ├── umap_hdbscan_clustering.py        # step 4
-    ├── pacmap_hdbscan_clustering.py      # step 5
-    ├── clustering_scatterplot.py         # step 6
-    ├── clustering_review.py              # step 7 (combines steps 3 and 6)
-    ├── optimization/                     # reducer-and-algorithm-agnostic Optuna search engine
-    │   ├── optuna_search.py              #   config/search-space parsing, composite scoring, study lifecycle
-    │   └── reduction_sweep.py            #   seed/repeat reproducibility engine
-    └── algorithms/                       # "how do I fit *this* algorithm, and is its output any good" modules
-        ├── hdbscan_model.py              #   HDBSCAN fitting + eligibility-gate metrics
-        └── bertopic_model.py             #   BERTopic topic-representation layer
+└── amia_2026/
+    ├── paths.py                              # shared REPO_ROOT constant
+    ├── logging_utils.py                      # shared console+optional-file logging setup
+    ├── preprocessing/
+    │   ├── clinicaltrials_client.py          # ClinicalTrials.gov search
+    │   ├── ctrp_client.py                    # CTRP API fetch + retry
+    │   ├── criteria_parser.py                # unstructured-text -> atomic criteria
+    │   └── criteria_retrieval.py             # orchestration + CLI (step 1)
+    ├── embeddings/
+    │   ├── embedding_model.py                # EmbeddingModel interface + backends
+    │   └── criteria_embedding.py             # orchestration + CLI (step 2)
+    └── clustering/
+        ├── clustering_io.py                  # shared read/write logic
+        ├── reduction_hdbscan_pipeline.py      # shared reduce+BERTopic/HDBSCAN+Optuna orchestration (steps 4-5)
+        ├── clustering_report.py              # step 3
+        ├── umap_hdbscan_clustering.py        # step 4
+        ├── pacmap_hdbscan_clustering.py      # step 5
+        ├── clustering_scatterplot.py         # step 6
+        ├── clustering_review.py              # step 7 (combines steps 3 and 6)
+        ├── optimization/                     # reducer-and-algorithm-agnostic Optuna search engine
+        │   ├── optuna_search.py              #   config/search-space parsing, composite scoring, study lifecycle
+        │   └── reduction_sweep.py            #   seed/repeat reproducibility engine
+        └── algorithms/                       # "how do I fit *this* algorithm, and is its output any good" modules
+            ├── hdbscan_model.py              #   HDBSCAN fitting + eligibility-gate metrics
+            └── bertopic_model.py             #   BERTopic topic-representation layer
 ```
 
-`src/clustering/` splits three ways, each with a distinct job:
+`amia_2026/clustering/` splits three ways, each with a distinct job:
 
 - **Orchestration, at the package root**: `clustering_io.py` holds
   everything genuinely common to every clustering algorithm (reading/
@@ -151,7 +153,7 @@ src/
   winning trial's output reports.
 
 None of this changes how any step is invoked — every CLI command in this
-README still runs exactly as `uv run python -m src.clustering.<module>
+README still runs exactly as `uv run python -m amia_2026.clustering.<module>
 "..."`; only the internal module layout moved.
 
 ### Extending the pipeline
@@ -160,7 +162,7 @@ Three extension points already exist in this codebase; adding to any of
 them doesn't require touching the others.
 
 **A new reducer** (alongside UMAP/PaCMAP): add one new sibling module at
-`src/clustering/` top level, matching the shape of
+`amia_2026/clustering/` top level, matching the shape of
 `umap_hdbscan_clustering.py`/`pacmap_hdbscan_clustering.py` — its own
 hyperparameter-validation/fit function plus a `ReducerPlugin` instance — and
 point it at the existing `reduction_hdbscan_pipeline.run`. No changes needed
@@ -179,7 +181,7 @@ fold it into `score_reduction_candidate`, and add the matching
 `config/umap_hdbscan_optuna.yaml`.
 
 **A new clustering algorithm** (alongside HDBSCAN): add a new module under
-`src/clustering/algorithms/` shaped like `hdbscan_model.py` — a fitter
+`amia_2026/clustering/algorithms/` shaped like `hdbscan_model.py` — a fitter
 class/function plus a `compute_metrics`-style eligibility gate that reports
 `metrics_valid` (cluster count, dominant-cluster share, noise fraction, or
 whatever bounds make sense for that algorithm) — so
@@ -220,7 +222,7 @@ HF_TOKEN=your-token-here
 ## 1. Fetching eligibility criteria
 
 ```bash
-uv run python -m src.preprocessing.criteria_retrieval "breast cancer" \
+uv run python -m amia_2026.preprocessing.criteria_retrieval "breast cancer" \
   --output-path data/eligibility_criteria/breast_cancer_trials_eligibility.csv
 ```
 
@@ -242,7 +244,7 @@ inclusion/exclusion criteria, and writes them to `--output-path` with columns
 ## 2. Embedding criteria
 
 ```bash
-uv run python -m src.embeddings.criteria_embedding \
+uv run python -m amia_2026.embeddings.criteria_embedding \
   --input-path data/eligibility_criteria/breast_cancer_trials_eligibility.csv \
   --output-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --backend huggingface
@@ -282,7 +284,7 @@ file; there is no append/skip-if-exists/merge behavior.
 ## 3. Clustering performance report
 
 ```bash
-uv run python -m src.clustering.clustering_report \
+uv run python -m amia_2026.clustering.clustering_report \
   --output-path data/clustering/reports/breast_cancer_clustering_report.md \
   --umap-hdbscan-metrics-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json
 ```
@@ -323,7 +325,7 @@ wholesale.
 ## 4. UMAP + HDBSCAN + BERTopic clustering
 
 ```bash
-uv run python -m src.clustering.umap_hdbscan_clustering \
+uv run python -m amia_2026.clustering.umap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --criterion-type inclusion \
   --reduced-embeddings-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_reduced_embeddings.parquet \
@@ -331,7 +333,7 @@ uv run python -m src.clustering.umap_hdbscan_clustering \
   --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
   --candidate-labels "oncology eligibility,treatment history,disease measurement"
 
-uv run python -m src.clustering.umap_hdbscan_clustering \
+uv run python -m amia_2026.clustering.umap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --criterion-type exclusion \
   --reduced-embeddings-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_reduced_embeddings.parquet \
@@ -478,7 +480,7 @@ error before any trial runs.
 ## 5. PaCMAP + HDBSCAN + BERTopic clustering
 
 ```bash
-uv run python -m src.clustering.pacmap_hdbscan_clustering \
+uv run python -m amia_2026.clustering.pacmap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --criterion-type inclusion \
   --reduced-embeddings-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_reduced_embeddings.parquet \
@@ -486,7 +488,7 @@ uv run python -m src.clustering.pacmap_hdbscan_clustering \
   --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json \
   --candidate-labels "oncology eligibility,treatment history,disease measurement"
 
-uv run python -m src.clustering.pacmap_hdbscan_clustering \
+uv run python -m amia_2026.clustering.pacmap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --criterion-type exclusion \
   --reduced-embeddings-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_reduced_embeddings.parquet \
@@ -540,7 +542,7 @@ identical to step 4's.
 ## 6. Scatterplot visualization
 
 ```bash
-uv run python -m src.clustering.clustering_scatterplot \
+uv run python -m amia_2026.clustering.clustering_scatterplot \
   --method umap_hdbscan \
   --metrics-path data/clustering/umap_hdbscan/inclusion/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
   --assignments-path data/clustering/umap_hdbscan/inclusion/breast_cancer_trials_umap_hdbscan_clusters.parquet \
@@ -592,7 +594,7 @@ HTML file wholesale; there is no append/skip-if-exists/merge behavior.
 ## 7. Combined report + scatterplot
 
 ```bash
-uv run python -m src.clustering.clustering_review \
+uv run python -m amia_2026.clustering.clustering_review \
   --umap-hdbscan-metrics-path data/clustering/umap_hdbscan/inclusion/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
   --pacmap-hdbscan-metrics-path data/clustering/pacmap_hdbscan/inclusion/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json \
   --report-path data/clustering/reports/breast_cancer_inclusion_clustering_report.md \
@@ -638,17 +640,17 @@ their own) gets its own output filenames below (`_inclusion_`/
 `_exclusion_` inserted) and its own fully independent results and report.
 
 ```bash
-uv run python -m src.preprocessing.criteria_retrieval "breast cancer" \
+uv run python -m amia_2026.preprocessing.criteria_retrieval "breast cancer" \
   --output-path data/eligibility_criteria/breast_cancer_trials_eligibility.csv
 
-uv run python -m src.embeddings.criteria_embedding \
+uv run python -m amia_2026.embeddings.criteria_embedding \
   --input-path data/eligibility_criteria/breast_cancer_trials_eligibility.csv \
   --output-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --backend huggingface
 
 # --- inclusion side ---
 
-uv run python -m src.clustering.umap_hdbscan_clustering \
+uv run python -m amia_2026.clustering.umap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --criterion-type inclusion \
   --reduced-embeddings-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_reduced_embeddings.parquet \
@@ -657,7 +659,7 @@ uv run python -m src.clustering.umap_hdbscan_clustering \
   --candidate-labels "oncology eligibility,treatment history,disease measurement"
 # writes under data/clustering/umap_hdbscan/inclusion/ (--criterion-type inserted automatically)
 
-uv run python -m src.clustering.pacmap_hdbscan_clustering \
+uv run python -m amia_2026.clustering.pacmap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --criterion-type inclusion \
   --reduced-embeddings-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_reduced_embeddings.parquet \
@@ -666,12 +668,12 @@ uv run python -m src.clustering.pacmap_hdbscan_clustering \
   --candidate-labels "oncology eligibility,treatment history,disease measurement"
 # writes under data/clustering/pacmap_hdbscan/inclusion/ (--criterion-type inserted automatically)
 
-uv run python -m src.clustering.clustering_report \
+uv run python -m amia_2026.clustering.clustering_report \
   --output-path data/clustering/reports/breast_cancer_inclusion_clustering_report.md \
   --umap-hdbscan-metrics-path data/clustering/umap_hdbscan/inclusion/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
   --pacmap-hdbscan-metrics-path data/clustering/pacmap_hdbscan/inclusion/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json
 
-uv run python -m src.clustering.clustering_scatterplot \
+uv run python -m amia_2026.clustering.clustering_scatterplot \
   --method umap_hdbscan \
   --metrics-path data/clustering/umap_hdbscan/inclusion/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
   --assignments-path data/clustering/umap_hdbscan/inclusion/breast_cancer_trials_umap_hdbscan_clusters.parquet \
@@ -681,7 +683,7 @@ uv run python -m src.clustering.clustering_scatterplot \
 # --- exclusion side (repeat with --criterion-type exclusion; same output-path flags, since
 #     --criterion-type alone is what separates the two sides' files on disk for steps 4-5) ---
 
-uv run python -m src.clustering.umap_hdbscan_clustering \
+uv run python -m amia_2026.clustering.umap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --criterion-type exclusion \
   --reduced-embeddings-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_reduced_embeddings.parquet \
@@ -690,7 +692,7 @@ uv run python -m src.clustering.umap_hdbscan_clustering \
   --candidate-labels "oncology eligibility,treatment history,disease measurement"
 # writes under data/clustering/umap_hdbscan/exclusion/ (--criterion-type inserted automatically)
 
-uv run python -m src.clustering.pacmap_hdbscan_clustering \
+uv run python -m amia_2026.clustering.pacmap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --criterion-type exclusion \
   --reduced-embeddings-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_reduced_embeddings.parquet \
@@ -699,12 +701,12 @@ uv run python -m src.clustering.pacmap_hdbscan_clustering \
   --candidate-labels "oncology eligibility,treatment history,disease measurement"
 # writes under data/clustering/pacmap_hdbscan/exclusion/ (--criterion-type inserted automatically)
 
-uv run python -m src.clustering.clustering_report \
+uv run python -m amia_2026.clustering.clustering_report \
   --output-path data/clustering/reports/breast_cancer_exclusion_clustering_report.md \
   --umap-hdbscan-metrics-path data/clustering/umap_hdbscan/exclusion/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
   --pacmap-hdbscan-metrics-path data/clustering/pacmap_hdbscan/exclusion/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json
 
-uv run python -m src.clustering.clustering_scatterplot \
+uv run python -m amia_2026.clustering.clustering_scatterplot \
   --method umap_hdbscan \
   --metrics-path data/clustering/umap_hdbscan/exclusion/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
   --assignments-path data/clustering/umap_hdbscan/exclusion/breast_cancer_trials_umap_hdbscan_clusters.parquet \

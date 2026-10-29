@@ -19,26 +19,15 @@ existing output files (and the trial-history CSV) wholesale; only the
 Optuna study's own file-based storage accumulates across runs.
 """
 
-import sys
-from pathlib import Path
 from typing import Callable
 
 import numpy as np
 import pyarrow as pa
 import umap
 
-# Allow running this file directly (e.g. `uv run src/clustering/umap_hdbscan_clustering.py`)
-# as well as via `-m` (e.g. `uv run python -m src.clustering.umap_hdbscan_clustering`).
-# Direct execution leaves __package__ unset and never puts the repo root on
-# sys.path, so the src.* imports below would otherwise fail with
-# "ModuleNotFoundError: No module named 'src'"; -m already sets both up
-# correctly, so this is a no-op in that case.
-if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-from src.paths import REPO_ROOT
-from src.clustering.reduction_hdbscan_pipeline import ReducerPlugin
-from src.clustering import reduction_hdbscan_pipeline
+from amia_2026.paths import REPO_ROOT
+from amia_2026.clustering.reduction_hdbscan_pipeline import ReducerPlugin
+from amia_2026.clustering import reduction_hdbscan_pipeline
 
 UMAP_REDUCED_EMBEDDING_PARQUET_SCHEMA = pa.schema(
     [

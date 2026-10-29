@@ -32,10 +32,10 @@ from typing import TYPE_CHECKING, ClassVar
 import requests
 from dotenv import load_dotenv
 
-from src.paths import REPO_ROOT
+from amia_2026.paths import REPO_ROOT
 
 if TYPE_CHECKING:
-    from src.embeddings.embedding_cache import EmbeddingCache
+    from amia_2026.embeddings.embedding_cache import EmbeddingCache
 
 logger = logging.getLogger(__name__)
 

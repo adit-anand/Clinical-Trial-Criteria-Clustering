@@ -1,4 +1,4 @@
-"""Shared logging setup for the pipeline CLI entry points under `src/`.
+"""Shared logging setup for the `amia_2026` pipeline CLI entry points.
 
 Every pipeline module's `main()` previously called `logging.basicConfig(level=logging.INFO)`
 directly, which only ever logs to the console. Centralizing that call here

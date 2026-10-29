@@ -38,13 +38,13 @@ import numpy as np
 import optuna
 import pyarrow as pa
 
-from src.logging_utils import configure_logging
-from src.paths import label_from_slug, slug_from_filename
-from src.clustering.algorithms import bertopic_model
-from src.clustering import clustering_io
-from src.clustering.optimization import optuna_search
-from src.clustering.optimization import reduction_sweep
-from src.clustering.algorithms.hdbscan_model import (
+from amia_2026.logging_utils import configure_logging
+from amia_2026.paths import label_from_slug, slug_from_filename
+from amia_2026.clustering.algorithms import bertopic_model
+from amia_2026.clustering import clustering_io
+from amia_2026.clustering.optimization import optuna_search
+from amia_2026.clustering.optimization import reduction_sweep
+from amia_2026.clustering.algorithms.hdbscan_model import (
     HDBSCAN_CLUSTER_PARQUET_SCHEMA,
     HDBSCAN_PARAM_NAMES,
     HDBSCANClusterer,

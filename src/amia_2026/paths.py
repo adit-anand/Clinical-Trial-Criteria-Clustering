@@ -1,16 +1,16 @@
-"""Shared repo-root path constant and filename helpers for the pipeline modules under `src/`.
+"""Shared repo-root path constant and filename helpers for the `amia_2026` package.
 
-Every pipeline module (`src/preprocessing/`, `src/embeddings/`,
-`src/clustering/`) needs the repository root to resolve its own default
+Every pipeline module (`amia_2026.preprocessing`, `amia_2026.embeddings`,
+`amia_2026.clustering`) needs the repository root to resolve its own default
 input/output paths under `data/`. Centralizing that one derivation here
-means a future change in how deep these modules live under `src/` only
-needs to be fixed in one place, rather than in each module's own
+means a future change in how deep these modules live under `src/amia_2026/`
+only needs to be fixed in one place, rather than in each module's own
 `Path(__file__).resolve().parents[N]`.
 """
 
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def slug_from_filename(filename: str, suffix: str) -> str:

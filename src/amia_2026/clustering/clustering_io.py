@@ -20,7 +20,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from src.paths import REPO_ROOT
+from amia_2026.paths import REPO_ROOT
 
 
 def read_embeddings_parquet(input_path: Path) -> pa.Table:
@@ -73,7 +73,7 @@ def filter_by_criterion_type(table: pa.Table, criterion_type: str) -> pa.Table:
 
     Rows whose `criterion_type` is `"both"` (unstructured eligibility text
     with no inclusion/exclusion headers to split on — see
-    `src/preprocessing/criteria_parser.py`) are eligible for *either* side,
+    `amia_2026/preprocessing/criteria_parser.py`) are eligible for *either* side,
     since they cannot be confidently assigned to only one: `criterion_type=
     "inclusion"` selects rows whose column value is `"inclusion"` or
     `"both"`; `criterion_type="exclusion"` selects `"exclusion"` or `"both"`.
@@ -250,7 +250,7 @@ def build_base_metrics_dict(
 
     Args:
         label: Human-readable label for this run, derived from `input_path`'s
-            filename (see `src.paths.slug_from_filename`/`label_from_slug`),
+            filename (see `amia_2026.paths.slug_from_filename`/`label_from_slug`),
             recorded here only for traceability — no longer used to resolve
             any path.
         criterion_type: Which side of the inclusion/exclusion split this run

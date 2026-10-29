@@ -19,25 +19,15 @@ import argparse
 import csv
 import logging
 import os
-import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Allow running this file directly (e.g. `uv run src/preprocessing/criteria_retrieval.py`)
-# as well as via `-m` (e.g. `uv run python -m src.preprocessing.criteria_retrieval`).
-# Direct execution leaves __package__ unset and never puts the repo root on
-# sys.path, so the src.* imports below would otherwise fail with
-# "ModuleNotFoundError: No module named 'src'"; -m already sets both up
-# correctly, so this is a no-op in that case.
-if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-from src.logging_utils import configure_logging
-from src.paths import REPO_ROOT
-from src.preprocessing.clinicaltrials_client import ClinicalTrialsGovClient
-from src.preprocessing.criteria_parser import parse_eligibility_criteria
-from src.preprocessing.ctrp_client import CTRPClient
+from amia_2026.logging_utils import configure_logging
+from amia_2026.paths import REPO_ROOT
+from amia_2026.preprocessing.clinicaltrials_client import ClinicalTrialsGovClient
+from amia_2026.preprocessing.criteria_parser import parse_eligibility_criteria
+from amia_2026.preprocessing.ctrp_client import CTRPClient
 
 logger = logging.getLogger(__name__)
 

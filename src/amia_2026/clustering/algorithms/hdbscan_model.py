@@ -18,10 +18,10 @@ from hdbscan import validity
 from sklearn.cluster import HDBSCAN
 from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score, silhouette_score
 
-from src.clustering import clustering_io
+from amia_2026.clustering import clustering_io
 
 if TYPE_CHECKING:
-    from src.clustering.algorithms.bertopic_model import TopicRepresentation
+    from amia_2026.clustering.algorithms.bertopic_model import TopicRepresentation
 
 # Shared with pacmap_hdbscan_clustering.py/umap_hdbscan_clustering.py: splits
 # a reducer-pipeline trial's combined search_space dict into HDBSCAN's own

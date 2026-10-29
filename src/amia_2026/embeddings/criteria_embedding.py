@@ -1,6 +1,6 @@
 """Embed a criteria CSV into a Parquet file of per-criterion vectors.
 
-Reads a criteria CSV produced by `src/preprocessing/criteria_retrieval.py`
+Reads a criteria CSV produced by `amia_2026/preprocessing/criteria_retrieval.py`
 (with columns ``nct_id``, ``study_first_posted_date``, ``criterion_text``,
 ``criterion_type``), embeds each row's ``criterion_text`` via a configurable
 `EmbeddingModel` backend (see `EmbeddingModel.py`), and writes the result as
@@ -27,26 +27,16 @@ file wholesale — there is no append/skip-if-exists/merge behavior.
 import argparse
 import csv
 import logging
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-# Allow running this file directly (e.g. `uv run src/embeddings/criteria_embedding.py`)
-# as well as via `-m` (e.g. `uv run python -m src.embeddings.criteria_embedding`).
-# Direct execution leaves __package__ unset and never puts the repo root on
-# sys.path, so the src.* imports below would otherwise fail with
-# "ModuleNotFoundError: No module named 'src'"; -m already sets both up
-# correctly, so this is a no-op in that case.
-if not __package__:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-from src.embeddings.embedding_cache import EmbeddingCache
-from src.embeddings.embedding_model import EmbeddingModel, build_embedding_model
-from src.logging_utils import configure_logging
-from src.paths import REPO_ROOT, slug_from_filename
+from amia_2026.embeddings.embedding_cache import EmbeddingCache
+from amia_2026.embeddings.embedding_model import EmbeddingModel, build_embedding_model
+from amia_2026.logging_utils import configure_logging
+from amia_2026.paths import REPO_ROOT, slug_from_filename
 
 logger = logging.getLogger(__name__)
 

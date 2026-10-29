@@ -1,4 +1,4 @@
-# Optuna search config for `src/clustering/pacmap_hdbscan_clustering.py`.
+# Optuna search config for `amia_2026/clustering/pacmap_hdbscan_clustering.py`.
 #
 # search_space entries: {kind: int|float|categorical|int_ratio, low, high,
 # choices, log, relative_to}. `int_ratio` suggests a float ratio in
