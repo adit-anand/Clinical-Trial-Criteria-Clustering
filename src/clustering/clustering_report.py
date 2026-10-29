@@ -282,15 +282,17 @@ def load_all(metrics_paths: dict[str, Path | None]) -> dict[str, LoadResult]:
     return results
 
 
-def compute_best_algorithm(loaded: dict[str, LoadResult]) -> tuple[str, float] | None:
+def compute_best_algorithm_by_silhouette(loaded: dict[str, LoadResult]) -> tuple[str, float] | None:
     """Pick the algorithm with the highest valid silhouette score.
 
     Silhouette score is the only metric present under an identical key in
     every algorithm's schema, is bounded in [-1, 1], and is consistently
     "higher is better" — unlike Davies-Bouldin (lower is better) or
     algorithm-specific values (inertia, noise fraction) that aren't
-    comparable across algorithms at all. This is the only cross-algorithm
-    derived statistic this report computes.
+    comparable across algorithms at all. This is the display-only
+    cross-algorithm derived statistic this report computes; see
+    `compute_best_algorithm_by_composite_score` for the selector the
+    combined report+scatterplot step actually uses.
 
     Args:
         loaded: Per-algorithm `LoadResult`s, as returned by `load_all`.
@@ -313,6 +315,44 @@ def compute_best_algorithm(loaded: dict[str, LoadResult]) -> tuple[str, float] |
     return best
 
 
+def compute_best_algorithm_by_composite_score(loaded: dict[str, LoadResult]) -> tuple[AlgorithmSpec, float] | None:
+    """Pick the algorithm with the highest valid composite objective score.
+
+    Unlike `compute_best_algorithm_by_silhouette` (consumed only for
+    display, so a bare display-name string suffices), this selector's
+    result must be usable by the combined report+scatterplot step
+    (`clustering_review.py`) to key back into both `ALGORITHM_SPECS` and
+    `clustering_scatterplot.VISUALIZATION_SPECS` and to re-index into
+    `loaded`/`metrics_paths` — so it returns the `AlgorithmSpec` itself,
+    not just its display name. This is a deliberate, documented asymmetry
+    with its sibling function, not an inconsistency to "fix" later.
+
+    Args:
+        loaded: Per-algorithm `LoadResult`s, as returned by `load_all`.
+
+    Returns:
+        `(spec, best_score)` for the highest-scoring algorithm among those
+        with `status == "ok"`, `metrics_valid is True`, and a non-`None`
+        `optuna_study_summary.best_score` (an older-schema metrics file
+        written before the composite score existed has no such key, and is
+        transparently excluded here rather than erroring). Ties are broken
+        in favor of `"pacmap_hdbscan"`, keyed explicitly by `AlgorithmSpec.key`
+        rather than by `ALGORITHM_SPECS` iteration order. Returns `None` if
+        no algorithm qualifies.
+    """
+    best: tuple[AlgorithmSpec, float] | None = None
+    for spec in ALGORITHM_SPECS:
+        result = loaded[spec.key]
+        if result.status != "ok" or not result.data.get("metrics_valid"):
+            continue
+        score = (result.data.get("optuna_study_summary") or {}).get("best_score")
+        if score is None:
+            continue
+        if best is None or score > best[1] or (score == best[1] and spec.key == "pacmap_hdbscan"):
+            best = (spec, score)
+    return best
+
+
 def _status_label(result: LoadResult) -> str:
     """Human-readable one-word(ish) status label for the summary table."""
     if result.status == "missing":
@@ -324,16 +364,22 @@ def _status_label(result: LoadResult) -> str:
     return "Available (metrics invalid)"
 
 
-def render_summary_section(loaded: dict[str, LoadResult], best: tuple[str, float] | None) -> str:
+def render_summary_section(
+    loaded: dict[str, LoadResult],
+    best: tuple[str, float] | None,
+    best_by_composite: tuple[AlgorithmSpec, float] | None,
+) -> str:
     """Render the top-level "## Summary" section.
 
     Args:
         loaded: Per-algorithm `LoadResult`s, as returned by `load_all`.
-        best: As returned by `compute_best_algorithm`.
+        best: As returned by `compute_best_algorithm_by_silhouette`.
+        best_by_composite: As returned by `compute_best_algorithm_by_composite_score`.
 
     Returns:
         A Markdown fragment: an algorithm-status table followed by the
-        best-by-silhouette line (or an explicit "none qualify" line).
+        best-by-silhouette line and the best-by-composite-score line (or an
+        explicit "none qualify" line for either).
     """
     lines = ["## Summary", "", "| Algorithm | Status |", "| --- | --- |"]
     for spec in ALGORITHM_SPECS:
@@ -344,6 +390,17 @@ def render_summary_section(loaded: dict[str, LoadResult], best: tuple[str, float
         lines.append(f"**Best by silhouette score:** {name} ({score:.4f})")
     else:
         lines.append("**Best by silhouette score:** No algorithm produced a valid silhouette score for comparison.")
+    if best_by_composite is not None:
+        spec, score = best_by_composite
+        lines.append(
+            f"**Best by composite score (used for the combined report+scatterplot step):** "
+            f"{spec.display_name} ({score:.4f})"
+        )
+    else:
+        lines.append(
+            "**Best by composite score (used for the combined report+scatterplot step):** "
+            "No algorithm produced a valid composite score for comparison."
+        )
     return "\n".join(lines)
 
 
@@ -428,7 +485,8 @@ def render_markdown(label: str, loaded: dict[str, LoadResult], generated_at: dat
     Returns:
         The complete report as a Markdown string.
     """
-    best = compute_best_algorithm(loaded)
+    best = compute_best_algorithm_by_silhouette(loaded)
+    best_by_composite = compute_best_algorithm_by_composite_score(loaded)
     algorithm_names = ", ".join(spec.display_name for spec in ALGORITHM_SPECS)
 
     sections = [
@@ -437,7 +495,7 @@ def render_markdown(label: str, loaded: dict[str, LoadResult], generated_at: dat
         f"- **Generated at:** {generated_at.isoformat()}",
         f"- **Algorithms considered:** {algorithm_names}",
         "",
-        render_summary_section(loaded, best),
+        render_summary_section(loaded, best, best_by_composite),
         "",
         render_shared_metrics_table(loaded),
         "",

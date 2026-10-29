@@ -50,6 +50,13 @@ as the next step's input path.
    interactive HTML scatterplot of its criteria in a 2-dimensional UMAP
    space (colored by cluster), reusing that method's own optimal-run seed
    for the projection.
+7. **`src/clustering/clustering_review.py`** — a combined step that runs
+   step 3's report, then automatically runs step 6's scatterplot for
+   whichever methodology has the higher composite objective score (ties
+   favor PaCMAP+HDBSCAN), resolving every path the scatterplot step needs
+   from the metrics JSON the report step already read — no
+   `--method`/`--assignments-path`/`--embeddings-path` re-entry. Steps 3
+   and 6 are untouched and still work standalone; this is purely additive.
 
 ## Project structure
 
@@ -87,6 +94,7 @@ src/
     ├── umap_hdbscan_clustering.py        # step 4
     ├── pacmap_hdbscan_clustering.py      # step 5
     ├── clustering_scatterplot.py         # step 6
+    ├── clustering_review.py              # step 7 (combines steps 3 and 6)
     ├── optimization/                     # reducer-and-algorithm-agnostic Optuna search engine
     │   ├── optuna_search.py              #   config/search-space parsing, composite scoring, study lifecycle
     │   └── reduction_sweep.py            #   seed/repeat reproducibility engine
@@ -563,6 +571,43 @@ HTML file wholesale; there is no append/skip-if-exists/merge behavior.
 | `--embeddings-path` | no       | Embeddings Parquet path to read when a fresh 2D projection is needed (every method except `umap_hdbscan` reusing an already-2D persisted projection via `--reduced-embeddings-path`). |
 | `--reduced-embeddings-path` | no | For `--method umap_hdbscan` only: that run's persisted reduced-embeddings Parquet path, reused as-is instead of fitting a fresh projection if its winning config was already 2D. |
 | `--log-file`        | no       | If given, also append logs to this file, in addition to the console. |
+
+## 7. Combined report + scatterplot
+
+```bash
+uv run python -m src.clustering.clustering_review \
+  --umap-hdbscan-metrics-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
+  --pacmap-hdbscan-metrics-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json \
+  --report-path data/clustering/reports/breast_cancer_clustering_report.md \
+  --scatterplot-path data/clustering/reports/breast_cancer_clustering_scatterplot.html
+```
+
+This chains steps 3 and 6 automatically: it generates the same report as
+step 3, then renders step 6's scatterplot for whichever methodology has the
+higher composite objective score (`optuna_study_summary.best_score`, already
+surfaced in the report's "Best by composite score" Summary line and Shared
+Metrics table), with ties resolved in favor of PaCMAP+HDBSCAN. Every path
+the scatterplot step needs (`--assignments-path`/`--embeddings-path`/
+`--reduced-embeddings-path`) is resolved automatically from the winning
+methodology's own metrics JSON — there is no `--method` or path flag to
+pass for the scatterplot half of this command. Pass only whichever
+`--<algorithm>-metrics-path` flag(s) you have; the report is always written
+even if no methodology qualifies for a scatterplot (e.g. both omitted, both
+invalid, or both from an older schema without a composite score) — a clear
+reason is logged and the command does not fail. Steps 3 and 6 themselves are
+untouched and remain usable standalone, including for cases this command
+doesn't cover (such as visualizing the lower-scoring methodology on demand).
+
+### Arguments
+
+| Argument         | Required | Description                                                                 |
+| ----------------- | -------- | ---------------------------------------------------------------------------- |
+| `--umap-hdbscan-metrics-path`   | no (at least one of the two `--*-metrics-path` flags should be given) | UMAP + HDBSCAN metrics JSON path (omit if this algorithm hasn't been run). |
+| `--pacmap-hdbscan-metrics-path` | no       | PaCMAP + HDBSCAN metrics JSON path (omit if this algorithm hasn't been run). |
+| `--report-path`      | yes      | Output Markdown report path. |
+| `--scatterplot-path` | yes      | Output HTML scatterplot path (written only if a methodology qualifies for selection). |
+| `--print`            | no       | Also print the generated report to stdout. |
+| `--log-file`         | no       | If given, also append logs to this file, in addition to the console. |
 
 ### Example: full pipeline for one condition
 
