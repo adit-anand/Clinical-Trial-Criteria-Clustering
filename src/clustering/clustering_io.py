@@ -175,6 +175,30 @@ def extract_traceability_columns(table: pa.Table) -> dict[str, list]:
     }
 
 
+def resolve_criterion_type_subdir(output_path: Path, criterion_type: str) -> Path:
+    """Insert `criterion_type` as a subdirectory between `output_path`'s parent and filename.
+
+    Keeps each clustering method's inclusion-side and exclusion-side output
+    artifacts physically separated on disk (e.g.
+    `data/clustering/umap_hdbscan/inclusion/...` vs `.../exclusion/...`)
+    without requiring callers to bake `criterion_type` into the filename or
+    type out the subdirectory themselves — callers pass an output path as
+    if writing directly into the method's own directory, and this inserts
+    the extra segment.
+
+    Args:
+        output_path: An output path as given by the caller (e.g. via
+            `--assignments-output-path`).
+        criterion_type: `"inclusion"` or `"exclusion"` (see
+            `filter_by_criterion_type`'s `VALID_CRITERION_TYPES`).
+
+    Returns:
+        `output_path` with `criterion_type` inserted as a new path segment
+        immediately before the filename.
+    """
+    return output_path.parent / criterion_type / output_path.name
+
+
 def relative_to_repo_root(path: Path) -> str:
     """Render `path` as a POSIX-style string relative to `REPO_ROOT` if possible.
 

@@ -256,8 +256,17 @@ def run(
             run's slug/label so its Optuna study and trial-history export
             never collide with the other side's run over the same input file.
         reduced_embeddings_output_path: Where to write reduced embeddings.
-        assignments_output_path: Where to write cluster assignments.
-        metrics_output_path: Where to write metrics.
+            `criterion_type` is inserted as a subdirectory immediately
+            before the filename (see
+            `clustering_io.resolve_criterion_type_subdir`), so the caller's
+            own path is treated as if writing directly into this method's
+            own directory, not a path to type `criterion_type` into by hand.
+        assignments_output_path: Where to write cluster assignments. Same
+            automatic `criterion_type` subdirectory insertion as
+            `reduced_embeddings_output_path`.
+        metrics_output_path: Where to write metrics. Same automatic
+            `criterion_type` subdirectory insertion as
+            `reduced_embeddings_output_path`.
         config_path: YAML config (combined reducer + HDBSCAN search space,
             objective weights, trial budget, reproducibility seeds/repeats,
             study/report directories) — see `optuna_search.load_optuna_config`.
@@ -268,7 +277,9 @@ def run(
 
     Returns:
         `(reduced_embeddings_output_path, assignments_output_path,
-        metrics_output_path)`, or `None` if every trial in the study was
+        metrics_output_path)` — the actual paths written, i.e. each
+        argument of the same name with `criterion_type` already inserted
+        as a subdirectory — or `None` if every trial in the study was
         invalid (nothing ever fit — nothing is written in that case).
 
     Raises:
@@ -282,6 +293,11 @@ def run(
 
     table = clustering_io.read_embeddings_parquet(input_path)
     table = clustering_io.filter_by_criterion_type(table, criterion_type)
+    reduced_embeddings_output_path = clustering_io.resolve_criterion_type_subdir(
+        reduced_embeddings_output_path, criterion_type
+    )
+    assignments_output_path = clustering_io.resolve_criterion_type_subdir(assignments_output_path, criterion_type)
+    metrics_output_path = clustering_io.resolve_criterion_type_subdir(metrics_output_path, criterion_type)
     total_rows = table.num_rows
     filtered = clustering_io.filter_successful_rows(table)
     n_samples = filtered.num_rows
@@ -580,19 +596,23 @@ def build_arg_parser(description: str, default_config_path: Path) -> argparse.Ar
         "--reduced-embeddings-output-path",
         type=Path,
         required=True,
-        help="Output reduced-embeddings Parquet path",
+        help="Output reduced-embeddings Parquet path; --criterion-type is automatically inserted as a "
+        "subdirectory immediately before the filename (e.g. '.../umap_hdbscan/x.parquet' with "
+        "--criterion-type inclusion actually writes to '.../umap_hdbscan/inclusion/x.parquet')",
     )
     parser.add_argument(
         "--assignments-output-path",
         type=Path,
         required=True,
-        help="Output cluster-assignments Parquet path",
+        help="Output cluster-assignments Parquet path; same automatic --criterion-type subdirectory "
+        "insertion as --reduced-embeddings-output-path",
     )
     parser.add_argument(
         "--metrics-output-path",
         type=Path,
         required=True,
-        help="Output metrics JSON path",
+        help="Output metrics JSON path; same automatic --criterion-type subdirectory insertion as "
+        "--reduced-embeddings-output-path",
     )
     parser.add_argument(
         "--config-path",

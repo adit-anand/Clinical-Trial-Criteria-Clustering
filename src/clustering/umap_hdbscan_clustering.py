@@ -11,7 +11,8 @@ reproducibility seed/repeat handling via `reduction_sweep.py`, the composite
 objective via `optuna_search.score_reduction_candidate`, and the three output
 artifacts written at the paths given via
 `--reduced-embeddings-output-path`/`--assignments-output-path`/
-`--metrics-output-path`).
+`--metrics-output-path`, each with `--criterion-type` automatically
+inserted as a subdirectory immediately before the filename).
 
 Re-running this step against the same output paths overwrites all three
 existing output files (and the trial-history CSV) wholesale; only the

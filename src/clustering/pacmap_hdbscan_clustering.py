@@ -11,7 +11,8 @@ reproducibility seed/repeat handling via `reduction_sweep.py`, the composite
 objective via `optuna_search.score_reduction_candidate`, and the three output
 artifacts written at the paths given via
 `--reduced-embeddings-output-path`/`--assignments-output-path`/
-`--metrics-output-path`).
+`--metrics-output-path`, each with `--criterion-type` automatically
+inserted as a subdirectory immediately before the filename).
 
 PaCMAP has no `min_dist` equivalent to UMAP's — its neighborhood/distance
 behavior is instead shaped by `mn_ratio`/`fp_ratio`, which weight mid-near vs.
