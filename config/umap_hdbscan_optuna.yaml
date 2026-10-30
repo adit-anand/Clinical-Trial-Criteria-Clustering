@@ -26,8 +26,8 @@ search_space:
   # HDBSCAN's own hyperparameters
   min_cluster_size:
     kind: int
-    low: 50
-    high: 300
+    low: 20
+    high: 150
   # Swept as a ratio of min_cluster_size (not independently 5-300): letting
   # min_samples land far above min_cluster_size is what HDBSCAN tends to
   # resolve into a degenerate dominant-cluster-or-all-noise result. Note
@@ -36,7 +36,7 @@ search_space:
   min_samples:
     kind: int_ratio
     low: 0.1
-    high: 1.0
+    high: 0.7
     relative_to: min_cluster_size
   cluster_selection_method:
     kind: categorical
@@ -85,7 +85,7 @@ objective_weights:
   topic_size_entropy_weight: 1.0
   missing_bertopic_quality_fallback_score: 0.0
 
-n_trials: 50
+n_trials: 100
 sampler_seed: 42
 
 study_dir: data/clustering/umap_hdbscan/optuna_studies

@@ -790,12 +790,85 @@ def compute_bertopic_quality_metrics(
         return None
 
 
-def build_study(storage_path: Path, study_name: str, sampler_seed: int) -> "optuna.Study":
-    """Create or resume a file-based Optuna study.
+def _expected_distribution(spec: HyperparamSpec) -> "optuna.distributions.BaseDistribution":
+    """The Optuna distribution a `HyperparamSpec` suggests under, per `suggest_hyperparams`.
+
+    `"int_ratio"` resolves to a `FloatDistribution`, not an `IntDistribution`
+    -- `suggest_hyperparams` suggests its ratio via `trial.suggest_float`
+    (see its own docstring); only the ratio's distribution is ever recorded
+    by Optuna, never the resolved integer value.
+    """
+    if spec.kind == "int":
+        return optuna.distributions.IntDistribution(low=int(spec.low), high=int(spec.high), log=spec.log)
+    if spec.kind in ("float", "int_ratio"):
+        return optuna.distributions.FloatDistribution(low=float(spec.low), high=float(spec.high), log=spec.log)
+    if spec.kind == "categorical":
+        return optuna.distributions.CategoricalDistribution(spec.choices)
+    raise ValueError(f"Unknown hyperparameter kind {spec.kind!r}")
+
+
+def _resumed_study_schema_matches(
+    storage: "optuna.storages.BaseStorage", study_name: str, search_space: dict[str, HyperparamSpec]
+) -> bool:
+    """Whether every already-recorded trial's per-parameter distribution still matches `search_space`.
+
+    A later edit to a `--config-path` YAML file can change a hyperparameter's
+    `kind`/`low`/`high`/`choices` (e.g. `min_samples` moving from a plain
+    `kind: int` sweep to a `kind: int_ratio` one) while its resumable
+    file-backed study (same `study_name`/`storage_path`, derived only from
+    the input filename and reducer plugin -- see `run`) still holds trials
+    recorded under the old distribution. Resuming that study is not
+    survivable: the multivariate `TPESampler` only discovers the mismatch
+    once it scans *all* trials while sampling a new one, raising
+    `ValueError: Cannot set different distribution kind to the same
+    parameter name.` well after `build_study` has already returned -- too
+    late to recover cleanly. This lets `build_study` detect the mismatch
+    upfront instead, by comparing distributions directly (no sampling
+    involved).
+
+    Args:
+        storage: The study's already-constructed `JournalStorage`.
+        study_name: The study's name.
+        search_space: The *current* config's search space to check against.
+
+    Returns:
+        `True` if the study doesn't exist yet, has no trials, or every
+        recorded parameter also named in `search_space` has the identical
+        distribution. `False` on any mismatch (the study must be cleared).
+    """
+    try:
+        study = optuna.load_study(study_name=study_name, storage=storage)
+    except KeyError:
+        return True  # journal file exists, but this study_name isn't in it yet
+
+    expected = {name: _expected_distribution(spec) for name, spec in search_space.items()}
+    for trial in study.get_trials(deepcopy=False):
+        for param_name, distribution in trial.distributions.items():
+            expected_distribution = expected.get(param_name)
+            if expected_distribution is not None and distribution != expected_distribution:
+                return False
+    return True
+
+
+def build_study(
+    storage_path: Path, study_name: str, sampler_seed: int, search_space: dict[str, HyperparamSpec]
+) -> "optuna.Study":
+    """Create or resume a file-based Optuna study, clearing it first if its schema is stale.
 
     Uses `optuna.storages.JournalStorage` over a `JournalFileBackend`
     (a plain append-only file) rather than the SQLite/SQLAlchemy storage
     backend, so resuming a study carries no SQLite dependency.
+
+    Before resuming, validates the existing journal file (if any) via
+    `_resumed_study_schema_matches`. If it holds trials recorded under a
+    search space incompatible with `search_space` (see that function's
+    docstring), the stale journal file is deleted and a fresh study is
+    created in its place -- an incompatible study can never be resumed, so
+    there is no safe alternative to clearing it. This is a deliberate,
+    logged exception to the resumable-study's own accumulate-across-runs
+    design (see this module's own docstring): correctness of the *current*
+    run wins over preserving trial history that's no longer interpretable
+    under the current schema anyway.
 
     Args:
         storage_path: Path to the study's journal file. Parent directories
@@ -805,10 +878,27 @@ def build_study(storage_path: Path, study_name: str, sampler_seed: int) -> "optu
             The sampler is `multivariate=True`, so it models correlated
             hyperparameters (e.g. `min_cluster_size`/`min_samples`) jointly
             rather than as independent per-parameter marginals.
+        search_space: The current config's search space, used to detect a
+            stale on-disk schema before resuming.
 
     Returns:
         The created or resumed `optuna.Study`, with `direction="maximize"`.
     """
+    if storage_path.exists():
+        existing_storage = optuna.storages.JournalStorage(
+            optuna.storages.journal.JournalFileBackend(str(storage_path))
+        )
+        if not _resumed_study_schema_matches(existing_storage, study_name, search_space):
+            logger.warning(
+                "build_study: existing study %r at %s has at least one hyperparameter recorded "
+                "under a different Optuna distribution than the current search_space config defines "
+                "(its kind/low/high/choices changed since this study was first created) -- deleting "
+                "it and starting a fresh study",
+                study_name,
+                storage_path,
+            )
+            storage_path.unlink()
+
     storage_path.parent.mkdir(parents=True, exist_ok=True)
     storage = optuna.storages.JournalStorage(
         optuna.storages.journal.JournalFileBackend(str(storage_path))
