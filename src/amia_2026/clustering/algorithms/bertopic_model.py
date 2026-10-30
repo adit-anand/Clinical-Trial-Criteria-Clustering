@@ -170,14 +170,17 @@ def fit_bertopic_topics(
     from bertopic import BERTopic
     from bertopic.dimensionality import BaseDimensionalityReduction
     from bertopic.representation import ZeroShotClassification
+    from sklearn.feature_extraction.text import CountVectorizer
 
     umap_model = BaseDimensionalityReduction()
     representation_model = ZeroShotClassification(candidate_topics=candidate_labels, model=zeroshot_model)
+    vectorizer_model = CountVectorizer(stop_words="english")
 
     topic_model = BERTopic(
         umap_model=umap_model,
         hdbscan_model=hdbscan_estimator,
         representation_model=representation_model,
+        vectorizer_model=vectorizer_model,
         calculate_probabilities=False,
     )
     topics, probs = topic_model.fit_transform(criterion_texts, embeddings=reduced_matrix)
