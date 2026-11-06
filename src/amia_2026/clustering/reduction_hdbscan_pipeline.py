@@ -147,7 +147,7 @@ def build_metrics_dict(
     label: str,
     criterion_type: str,
     input_path: Path,
-    reduced_embeddings_output_path: Path,
+    reduced_embeddings_output_path: Path | None,
     assignments_output_path: Path,
     n_samples: int,
     n_samples_excluded: int,
@@ -172,7 +172,11 @@ def build_metrics_dict(
         label: Human-readable label for this run, derived from `input_path`'s filename.
         criterion_type: Which side of the inclusion/exclusion split this run covers.
         input_path: The embeddings Parquet path that was read.
-        reduced_embeddings_output_path: Where the reduced embeddings were written.
+        reduced_embeddings_output_path: Where the reduced embeddings were
+            written, or `None` if the winning config's `n_components != 2`
+            (reduced embeddings are only persisted when 2-dimensional, since
+            that's the only case anything downstream — the scatter plot —
+            reuses them; see `run`).
         assignments_output_path: Where cluster assignments were written.
         n_samples: Number of successfully-embedded rows reduced/clustered.
         n_samples_excluded: Number of input rows dropped for having failed embeddings.
@@ -211,7 +215,11 @@ def build_metrics_dict(
     )
     return {
         **base,
-        "reduced_embeddings_output_path": clustering_io.relative_to_repo_root(reduced_embeddings_output_path),
+        "reduced_embeddings_output_path": (
+            clustering_io.relative_to_repo_root(reduced_embeddings_output_path)
+            if reduced_embeddings_output_path is not None
+            else None
+        ),
         "n_clusters_actual": metrics_result["n_clusters_actual"],
         "noise_count": metrics_result["noise_count"],
         "noise_fraction": metrics_result["noise_fraction"],
@@ -239,7 +247,7 @@ def build_keybert_metrics_dict(
     label: str,
     criterion_type: str,
     input_path: Path,
-    reduced_embeddings_output_path: Path,
+    reduced_embeddings_output_path: Path | None,
     assignments_output_path: Path,
     n_samples: int,
     n_samples_excluded: int,
@@ -274,7 +282,11 @@ def build_keybert_metrics_dict(
         label: Human-readable label for this run, derived from `input_path`'s filename.
         criterion_type: Which side of the inclusion/exclusion split this run covers.
         input_path: The embeddings Parquet path that was read.
-        reduced_embeddings_output_path: Where the reduced embeddings were written.
+        reduced_embeddings_output_path: Where the reduced embeddings were
+            written, or `None` if the winning config's `n_components != 2`
+            (same condition as `build_metrics_dict`'s own; both files always
+            agree on whether reduced embeddings were persisted, since both
+            describe the same winning partition).
         assignments_output_path: Where cluster assignments were written (the
             same assignments Parquet `build_metrics_dict` points to -- this
             representation never gets its own).
@@ -320,7 +332,11 @@ def build_keybert_metrics_dict(
     )
     return {
         **base,
-        "reduced_embeddings_output_path": clustering_io.relative_to_repo_root(reduced_embeddings_output_path),
+        "reduced_embeddings_output_path": (
+            clustering_io.relative_to_repo_root(reduced_embeddings_output_path)
+            if reduced_embeddings_output_path is not None
+            else None
+        ),
         "n_clusters_actual": metrics_result["n_clusters_actual"],
         "noise_count": metrics_result["noise_count"],
         "noise_fraction": metrics_result["noise_fraction"],
@@ -358,7 +374,7 @@ def run(
     config_path: Path,
     candidate_labels: list[str],
     zeroshot_model: str,
-) -> tuple[Path, Path, Path, Path] | None:
+) -> tuple[Path | None, Path, Path, Path] | None:
     """Run the full read-filter-search-write pipeline for one reducer.
 
     Args:
@@ -396,9 +412,13 @@ def run(
         with `criterion_type` already inserted as a subdirectory, plus the
         sibling path the second (`KeyBERTInspired`-representation) metrics
         JSON was written to (or was meant to be written to, if that pass
-        itself failed -- see this function's body) — or `None` if every
-        trial in the study was invalid (nothing ever fit — nothing is
-        written in that case).
+        itself failed -- see this function's body). `reduced_embeddings_
+        output_path` is `None` instead whenever the winning config's
+        `n_components != 2` (reduced embeddings are only persisted when
+        2-dimensional — see this function's body); cluster assignments are
+        always written for the winning configuration regardless. The whole
+        tuple is `None` if every trial in the study was invalid (nothing
+        ever fit — nothing is written in that case).
 
     Raises:
         FileNotFoundError: If the input Parquet or `config_path` does not exist.
@@ -616,9 +636,35 @@ def run(
     hdbscan_clusterer = build_hdbscan_clusterer(winner["hyperparams"])
 
     clustered_at = datetime.now(timezone.utc)
-    reduced_rows = build_reduced_embedding_rows(filtered, representative.reduced_matrix, clustered_at)
-    clustering_io.write_parquet(reduced_rows, plugin.reduced_embedding_schema, reduced_embeddings_output_path)
 
+    # Reduced embeddings are only ever reused downstream when 2-dimensional
+    # (the scatter plot's persisted-projection reuse, see
+    # `clustering_scatterplot._umap_hdbscan_persisted_projection`) -- never
+    # persisted otherwise, since a higher-dimensional reduced matrix has no
+    # other consumer and would just be dead weight on disk.
+    n_components = candidate.hyperparams["n_components"]
+    if n_components == 2:
+        reduced_rows = build_reduced_embedding_rows(filtered, representative.reduced_matrix, clustered_at)
+        clustering_io.write_parquet(reduced_rows, plugin.reduced_embedding_schema, reduced_embeddings_output_path)
+        written_reduced_embeddings_output_path = reduced_embeddings_output_path
+    else:
+        logger.info(
+            "run: winning n_components=%d != 2 for %r; skipping reduced-embeddings write (only needed "
+            "for the scatter plot)",
+            n_components, label,
+        )
+        written_reduced_embeddings_output_path = None
+
+    # Cluster assignments are always written for the winning configuration,
+    # regardless of `n_components` -- every downstream consumer (the report,
+    # the scatter plot's points/labels, the KeyBERT-representation pass)
+    # needs per-data-point assignments, not just the 2D case. If the
+    # configured --assignments-output-path's directory is missing/uncreatable
+    # or not writable, fall back to the current working directory rather than
+    # losing this artifact entirely -- every later reference to
+    # `assignments_output_path` (the metrics JSON, run()'s return value, the
+    # log line below) uses this same, possibly-reassigned path.
+    assignments_output_path = clustering_io.resolve_writable_path(assignments_output_path)
     assignment_rows = hdbscan_clusterer.build_assignment_rows(
         filtered, bertopic_result.labels, bertopic_result.probabilities, bertopic_result.topics, clustered_at
     )
@@ -657,7 +703,7 @@ def run(
         label=label,
         criterion_type=criterion_type,
         input_path=input_path,
-        reduced_embeddings_output_path=reduced_embeddings_output_path,
+        reduced_embeddings_output_path=written_reduced_embeddings_output_path,
         assignments_output_path=assignments_output_path,
         n_samples=n_samples,
         n_samples_excluded=n_excluded,
@@ -703,7 +749,7 @@ def run(
             label=label,
             criterion_type=criterion_type,
             input_path=input_path,
-            reduced_embeddings_output_path=reduced_embeddings_output_path,
+            reduced_embeddings_output_path=written_reduced_embeddings_output_path,
             assignments_output_path=assignments_output_path,
             n_samples=n_samples,
             n_samples_excluded=n_excluded,
@@ -735,12 +781,17 @@ def run(
         "(noise=%d/%d (%.1f%%), silhouette=%s, excluded=%d failed-embedding row(s), "
         "trials: %d ok, %d degenerate, %d invalid)",
         best_trial.number, plugin.display_name, candidate.hyperparams, candidate.winning_seed.seed, n_samples,
-        winner["metrics_result"]["n_clusters_actual"], label, reduced_embeddings_output_path,
+        winner["metrics_result"]["n_clusters_actual"], label, written_reduced_embeddings_output_path,
         assignments_output_path, metrics_output_path, winner["metrics_result"]["noise_count"], n_samples,
         winner["metrics_result"]["noise_fraction"] * 100, winner["metrics_result"]["metrics"]["silhouette_score"],
         n_excluded, status_counts["ok"], status_counts["degenerate"], status_counts["invalid"],
     )
-    return reduced_embeddings_output_path, assignments_output_path, metrics_output_path, keybert_metrics_output_path
+    return (
+        written_reduced_embeddings_output_path,
+        assignments_output_path,
+        metrics_output_path,
+        keybert_metrics_output_path,
+    )
 
 
 def build_arg_parser(description: str, default_config_path: Path) -> argparse.ArgumentParser:

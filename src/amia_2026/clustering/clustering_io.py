@@ -13,6 +13,8 @@ algorithm's own module.
 """
 
 import json
+import logging
+import os
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +23,8 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from amia_2026.paths import REPO_ROOT
+
+logger = logging.getLogger(__name__)
 
 
 def read_embeddings_parquet(input_path: Path) -> pa.Table:
@@ -284,6 +288,41 @@ def build_base_metrics_dict(
         "cluster_sizes": cluster_sizes,
         "clustered_at": clustered_at.isoformat(),
     }
+
+
+def resolve_writable_path(output_path: Path) -> Path:
+    """Fall back to a `Path.cwd()` sibling if `output_path`'s directory can't be written to.
+
+    Tries to create `output_path`'s parent directory (if it doesn't already
+    exist) and confirms the result is writable. Only that specific class of
+    problem — the target directory missing and uncreatable, or existing but
+    not writable (e.g. a permissions issue, a read-only mount) — triggers
+    the fallback; any other failure (e.g. the disk filling up during the
+    actual write) is left to surface from the write call itself, not caught
+    here.
+
+    Args:
+        output_path: The originally intended output path.
+
+    Returns:
+        `output_path` unchanged if its directory is writable; otherwise
+        `Path.cwd() / output_path.name` (logged as a warning, never silently).
+    """
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        writable = os.access(output_path.parent, os.W_OK)
+    except OSError:
+        writable = False
+
+    if writable:
+        return output_path
+
+    fallback_path = Path.cwd() / output_path.name
+    logger.warning(
+        "resolve_writable_path: %s is missing/uncreatable or not writable; falling back to %s",
+        output_path.parent, fallback_path,
+    )
+    return fallback_path
 
 
 def write_parquet(rows: list[dict], schema: pa.Schema, output_path: Path) -> None:
