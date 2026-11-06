@@ -92,10 +92,6 @@ def run(
     embeddings_path = _resolve_repo_relative_path(input_path) if input_path else None
     assignments_output_path = data.get("assignments_output_path")
     assignments_path = _resolve_repo_relative_path(assignments_output_path) if assignments_output_path else None
-    reduced_embeddings_output_path = data.get("reduced_embeddings_output_path")
-    reduced_embeddings_path = (
-        _resolve_repo_relative_path(reduced_embeddings_output_path) if reduced_embeddings_output_path else None
-    )
 
     try:
         clustering_scatterplot.run(
@@ -104,7 +100,6 @@ def run(
             assignments_path,
             scatterplot_path,
             embeddings_path=embeddings_path,
-            reduced_embeddings_path=reduced_embeddings_path,
         )
     except (FileNotFoundError, ValueError) as exc:
         logger.warning(

@@ -4,7 +4,7 @@
 condition's embeddings with their own reducer before clustering the reduced
 vectors, tuning both jointly via one Optuna search. Everything about that
 orchestration — reading input, building the Optuna objective,
-resolving the winning trial, writing the three output artifacts — is
+resolving the winning trial, writing the output artifacts — is
 identical between them; the only real differences are reducer-specific
 (hyperparameter names, the fit callable, the fixed-metric config key, and a
 couple of output field names). This module holds that shared orchestration
@@ -44,7 +44,6 @@ from typing import Callable
 
 import numpy as np
 import optuna
-import pyarrow as pa
 
 from amia_2026.logging_utils import configure_logging
 from amia_2026.paths import label_from_slug, slug_from_filename
@@ -72,8 +71,6 @@ class ReducerPlugin:
             `"umap"` -> study name suffix `"_umap_hdbscan"`).
         display_name: Human-readable name used in log messages and the
             dimensionality-reduction note (e.g. `"UMAP"`).
-        reduced_embedding_schema: This reducer's output Parquet schema (same
-            shape as every reducer's, just defined in its own module).
         fixed_metric_config_key: The key into `OptunaSearchConfig.fixed` this
             reducer's own distance metric is configured under (e.g.
             `"metric"` for UMAP, `"distance"` for PaCMAP).
@@ -92,41 +89,11 @@ class ReducerPlugin:
 
     name: str
     display_name: str
-    reduced_embedding_schema: pa.Schema
     fixed_metric_config_key: str
     winning_config_field: str
     fixed_metric_field: str
     make_fit_reduced: Callable[[str], Callable[..., np.ndarray]]
     validate_hyperparameters: Callable[[dict, int], None]
-
-
-def build_reduced_embedding_rows(table: pa.Table, reduced_matrix: np.ndarray, reduced_at: datetime) -> list[dict]:
-    """Zip each surviving row's traceability columns with its reduced vector.
-
-    Args:
-        table: The table `reduced_matrix` was produced from (row order must match).
-        reduced_matrix: The reducer's output, shape `(table.num_rows, n_components)`.
-        reduced_at: Wall-clock time this reduction run completed.
-
-    Returns:
-        One output dict per row, matching a `ReducerPlugin.reduced_embedding_schema`'s columns.
-    """
-    columns = clustering_io.extract_traceability_columns(table)
-    rows = []
-    for i in range(table.num_rows):
-        rows.append(
-            {
-                "nct_id": columns["nct_id"][i],
-                "study_first_posted_date": columns["study_first_posted_date"][i],
-                "criterion_text": columns["criterion_text"][i],
-                "criterion_type": columns["criterion_type"][i],
-                "reduced_embedding": [float(x) for x in reduced_matrix[i]],
-                "embedding_backend": columns["embedding_backend"][i],
-                "embedding_model": columns["embedding_model"][i],
-                "reduced_at": reduced_at,
-            }
-        )
-    return rows
 
 
 def annotate_dimensionality_note(
@@ -155,7 +122,6 @@ def build_metrics_dict(
     plugin: ReducerPlugin,
     label: str,
     input_path: Path,
-    reduced_embeddings_output_path: Path | None,
     assignments_output_path: Path,
     n_samples: int,
     n_samples_excluded: int,
@@ -179,11 +145,6 @@ def build_metrics_dict(
         plugin: This reducer's `ReducerPlugin`.
         label: Human-readable label for this run, derived from `input_path`'s filename.
         input_path: The embeddings Parquet path that was read.
-        reduced_embeddings_output_path: Where the reduced embeddings were
-            written, or `None` if the winning config's `n_components != 2`
-            (reduced embeddings are only persisted when 2-dimensional, since
-            that's the only case anything downstream — the scatter plot —
-            reuses them; see `run`).
         assignments_output_path: Where cluster assignments were written.
         n_samples: Number of successfully-embedded rows reduced/clustered.
         n_samples_excluded: Number of input rows dropped for having failed embeddings.
@@ -221,11 +182,6 @@ def build_metrics_dict(
     )
     return {
         **base,
-        "reduced_embeddings_output_path": (
-            clustering_io.relative_to_repo_root(reduced_embeddings_output_path)
-            if reduced_embeddings_output_path is not None
-            else None
-        ),
         "n_clusters_actual": metrics_result["n_clusters_actual"],
         "noise_count": metrics_result["noise_count"],
         "noise_fraction": metrics_result["noise_fraction"],
@@ -252,7 +208,6 @@ def build_keybert_metrics_dict(
     plugin: ReducerPlugin,
     label: str,
     input_path: Path,
-    reduced_embeddings_output_path: Path | None,
     assignments_output_path: Path,
     n_samples: int,
     n_samples_excluded: int,
@@ -286,11 +241,6 @@ def build_keybert_metrics_dict(
         plugin: This reducer's `ReducerPlugin`.
         label: Human-readable label for this run, derived from `input_path`'s filename.
         input_path: The embeddings Parquet path that was read.
-        reduced_embeddings_output_path: Where the reduced embeddings were
-            written, or `None` if the winning config's `n_components != 2`
-            (same condition as `build_metrics_dict`'s own; both files always
-            agree on whether reduced embeddings were persisted, since both
-            describe the same winning partition).
         assignments_output_path: Where cluster assignments were written (the
             same assignments Parquet `build_metrics_dict` points to -- this
             representation never gets its own).
@@ -335,11 +285,6 @@ def build_keybert_metrics_dict(
     )
     return {
         **base,
-        "reduced_embeddings_output_path": (
-            clustering_io.relative_to_repo_root(reduced_embeddings_output_path)
-            if reduced_embeddings_output_path is not None
-            else None
-        ),
         "n_clusters_actual": metrics_result["n_clusters_actual"],
         "noise_count": metrics_result["noise_count"],
         "noise_fraction": metrics_result["noise_fraction"],
@@ -370,7 +315,6 @@ def build_keybert_metrics_dict(
 def run(
     plugin: ReducerPlugin,
     input_path: Path,
-    reduced_embeddings_output_path: Path,
     assignments_output_path: Path,
     metrics_output_path: Path,
     config_path: Path,
@@ -379,13 +323,12 @@ def run(
     llm_model: str,
     primary_summary_prompt_path: Path,
     secondary_summary_prompt_path: Path,
-) -> tuple[Path | None, Path, Path, Path] | None:
+) -> tuple[Path, Path, Path] | None:
     """Run the full read-search-write pipeline for one reducer.
 
     Args:
         plugin: This reducer's `ReducerPlugin`.
         input_path: Embeddings Parquet to read.
-        reduced_embeddings_output_path: Where to write reduced embeddings.
         assignments_output_path: Where to write cluster assignments.
         metrics_output_path: Where to write metrics.
         config_path: YAML config (combined reducer + HDBSCAN search space,
@@ -406,18 +349,16 @@ def run(
             system prompt (see `llm_labeling.secondary_summarize`).
 
     Returns:
-        `(reduced_embeddings_output_path, assignments_output_path,
-        metrics_output_path, keybert_metrics_output_path)` — the actual
-        paths written, i.e. each `*_output_path` argument of the same name,
-        plus the sibling path the second (`KeyBERTInspired`-representation)
-        metrics JSON was written to (or was meant to be written to, if that
-        pass itself failed -- see this function's body). `reduced_embeddings_
-        output_path` is `None` instead whenever the winning config's
-        `n_components != 2` (reduced embeddings are only persisted when
-        2-dimensional — see this function's body); cluster assignments are
-        always written for the winning configuration regardless. The whole
-        tuple is `None` if every trial in the study was invalid (nothing
-        ever fit — nothing is written in that case).
+        `(assignments_output_path, metrics_output_path,
+        keybert_metrics_output_path)` — the actual paths written, i.e. each
+        `*_output_path` argument of the same name, plus the sibling path the
+        second (`KeyBERTInspired`-representation) metrics JSON was written
+        to (or was meant to be written to, if that pass itself failed -- see
+        this function's body). Cluster assignments (including each row's
+        original embedding -- see `HDBSCANClusterer.build_assignment_rows`)
+        are always written for the winning configuration. The whole tuple is
+        `None` if every trial in the study was invalid (nothing ever fit --
+        nothing is written in that case).
 
     Raises:
         FileNotFoundError: If the input Parquet or `config_path` does not exist.
@@ -658,33 +599,18 @@ def run(
 
     clustered_at = datetime.now(timezone.utc)
 
-    # Reduced embeddings are only ever reused downstream when 2-dimensional
-    # (the scatter plot's persisted-projection reuse, see
-    # `clustering_scatterplot._umap_hdbscan_persisted_projection`) -- never
-    # persisted otherwise, since a higher-dimensional reduced matrix has no
-    # other consumer and would just be dead weight on disk.
-    n_components = candidate.hyperparams["n_components"]
-    if n_components == 2:
-        reduced_rows = build_reduced_embedding_rows(filtered, representative.reduced_matrix, clustered_at)
-        clustering_io.write_parquet(reduced_rows, plugin.reduced_embedding_schema, reduced_embeddings_output_path)
-        written_reduced_embeddings_output_path = reduced_embeddings_output_path
-    else:
-        logger.info(
-            "run: winning n_components=%d != 2 for %r; skipping reduced-embeddings write (only needed "
-            "for the scatter plot)",
-            n_components, label,
-        )
-        written_reduced_embeddings_output_path = None
-
-    # Cluster assignments are always written for the winning configuration,
-    # regardless of `n_components` -- every downstream consumer (the report,
-    # the scatter plot's points/labels, the KeyBERT-representation pass)
-    # needs per-data-point assignments, not just the 2D case. If the
-    # configured --assignments-output-path's directory is missing/uncreatable
-    # or not writable, fall back to the current working directory rather than
-    # losing this artifact entirely -- every later reference to
-    # `assignments_output_path` (the metrics JSON, run()'s return value, the
-    # log line below) uses this same, possibly-reassigned path.
+    # Cluster assignments are always written for the winning configuration --
+    # every downstream consumer (the report, the scatter plot's points/
+    # labels, the KeyBERT-representation pass) needs per-data-point
+    # assignments. Each row's original (pre-reduction) embedding is written
+    # alongside it (see `HDBSCANClusterer.build_assignment_rows`), so this
+    # file is independently usable without re-joining the input embeddings
+    # file. If the configured --assignments-output-path's directory is
+    # missing/uncreatable or not writable, fall back to the current working
+    # directory rather than losing this artifact entirely -- every later
+    # reference to `assignments_output_path` (the metrics JSON, run()'s
+    # return value, the log line below) uses this same, possibly-reassigned
+    # path.
     assignments_output_path = clustering_io.resolve_writable_path(assignments_output_path)
     assignment_rows = hdbscan_clusterer.build_assignment_rows(
         filtered, bertopic_result.labels, bertopic_result.probabilities, bertopic_result.topics, clustered_at
@@ -723,7 +649,6 @@ def run(
         plugin,
         label=label,
         input_path=input_path,
-        reduced_embeddings_output_path=written_reduced_embeddings_output_path,
         assignments_output_path=assignments_output_path,
         n_samples=n_samples,
         n_samples_excluded=n_excluded,
@@ -773,7 +698,6 @@ def run(
             plugin,
             label=label,
             input_path=input_path,
-            reduced_embeddings_output_path=written_reduced_embeddings_output_path,
             assignments_output_path=assignments_output_path,
             n_samples=n_samples,
             n_samples_excluded=n_excluded,
@@ -801,17 +725,16 @@ def run(
         clustering_io.write_json(keybert_metrics_dict, keybert_metrics_output_path)
 
     logger.info(
-        "run: best trial #%d %s config %s (seed=%d) clustered %d row(s) into %d topic(s) for %r -> %s, %s, %s "
+        "run: best trial #%d %s config %s (seed=%d) clustered %d row(s) into %d topic(s) for %r -> %s, %s "
         "(noise=%d/%d (%.1f%%), silhouette=%s, excluded=%d failed-embedding row(s), "
         "trials: %d ok, %d degenerate, %d invalid)",
         best_trial.number, plugin.display_name, candidate.hyperparams, candidate.winning_seed.seed, n_samples,
-        winner["metrics_result"]["n_clusters_actual"], label, written_reduced_embeddings_output_path,
+        winner["metrics_result"]["n_clusters_actual"], label,
         assignments_output_path, metrics_output_path, winner["metrics_result"]["noise_count"], n_samples,
         winner["metrics_result"]["noise_fraction"] * 100, winner["metrics_result"]["metrics"]["silhouette_score"],
         n_excluded, status_counts["ok"], status_counts["degenerate"], status_counts["invalid"],
     )
     return (
-        written_reduced_embeddings_output_path,
         assignments_output_path,
         metrics_output_path,
         keybert_metrics_output_path,
@@ -836,12 +759,6 @@ def build_arg_parser(description: str, default_config_path: Path) -> argparse.Ar
         type=Path,
         required=True,
         help="Input embeddings Parquet path (as written by criteria_embedding.py)",
-    )
-    parser.add_argument(
-        "--reduced-embeddings-output-path",
-        type=Path,
-        required=True,
-        help="Output reduced-embeddings Parquet path",
     )
     parser.add_argument(
         "--assignments-output-path",
@@ -910,7 +827,7 @@ def build_arg_parser(description: str, default_config_path: Path) -> argparse.Ar
 
 
 def main(plugin: ReducerPlugin, description: str, default_config_path: Path) -> None:
-    """Shared CLI entry point: run the Optuna search and write reduced embeddings/cluster assignments/metrics."""
+    """Shared CLI entry point: run the Optuna search and write cluster assignments/metrics."""
     args = build_arg_parser(description, default_config_path).parse_args()
     configure_logging(args.log_file)
     candidate_labels = bertopic_model.parse_candidate_labels(args.candidate_labels)
@@ -918,7 +835,6 @@ def main(plugin: ReducerPlugin, description: str, default_config_path: Path) -> 
     run(
         plugin,
         args.input_path,
-        args.reduced_embeddings_output_path,
         args.assignments_output_path,
         args.metrics_output_path,
         args.config_path,

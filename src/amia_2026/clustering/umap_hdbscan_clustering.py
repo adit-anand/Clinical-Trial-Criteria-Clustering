@@ -8,38 +8,23 @@ reduce-then-HDBSCAN orchestration in `reduction_hdbscan_pipeline.py`, which
 PaCMAP-specific pieces instead. See that module's docstring for the full
 read-search-write pipeline description (Optuna study setup/resumption,
 reproducibility seed/repeat handling via `reduction_sweep.py`, the composite
-objective via `optuna_search.score_reduction_candidate`, and the three output
+objective via `optuna_search.score_reduction_candidate`, and the output
 artifacts written at the paths given via
-`--reduced-embeddings-output-path`/`--assignments-output-path`/
-`--metrics-output-path`).
+`--assignments-output-path`/`--metrics-output-path`).
 
-Re-running this step against the same output paths overwrites all three
-existing output files (and the trial-history CSV) wholesale; only the
-Optuna study's own file-based storage accumulates across runs.
+Re-running this step against the same output paths overwrites both existing
+output files (and the trial-history CSV) wholesale; only the Optuna study's
+own file-based storage accumulates across runs.
 """
 
 from typing import Callable
 
 import numpy as np
-import pyarrow as pa
 import umap
 
 from amia_2026.paths import REPO_ROOT
 from amia_2026.clustering.reduction_hdbscan_pipeline import ReducerPlugin
 from amia_2026.clustering import reduction_hdbscan_pipeline
-
-UMAP_REDUCED_EMBEDDING_PARQUET_SCHEMA = pa.schema(
-    [
-        ("nct_id", pa.string()),
-        ("study_first_posted_date", pa.string()),
-        ("criterion_text", pa.string()),
-        ("criterion_type", pa.string()),
-        ("reduced_embedding", pa.list_(pa.float32())),
-        ("embedding_backend", pa.string()),
-        ("embedding_model", pa.string()),
-        ("reduced_at", pa.timestamp("us", tz="UTC")),
-    ]
-)
 
 
 def make_fit_umap_reduced(metric: str) -> Callable[..., np.ndarray]:
@@ -100,7 +85,6 @@ def validate_umap_hyperparameters(hyperparams: dict, n_samples: int) -> None:
 PLUGIN = ReducerPlugin(
     name="umap",
     display_name="UMAP",
-    reduced_embedding_schema=UMAP_REDUCED_EMBEDDING_PARQUET_SCHEMA,
     fixed_metric_config_key="metric",
     winning_config_field="winning_umap_config",
     fixed_metric_field="umap_fixed_metric",
@@ -112,7 +96,7 @@ DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "umap_hdbscan_optuna.yaml"
 
 
 def main() -> None:
-    """CLI entry point: run the Optuna search and write reduced embeddings/cluster assignments/metrics."""
+    """CLI entry point: run the Optuna search and write cluster assignments/metrics."""
     reduction_hdbscan_pipeline.main(
         PLUGIN,
         "Reduce criterion embeddings via UMAP, then cluster via HDBSCAN, tuned by an Optuna search.",

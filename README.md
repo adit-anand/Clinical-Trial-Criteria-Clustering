@@ -33,8 +33,8 @@ eligibility criterion regardless of `criterion_type` (`inclusion`,
    UMAP step) to additionally compute per-cluster topic keywords plus a
    zero-shot-classification label against a caller-supplied candidate label
    set — BERTopic's own cluster assignments, not the earlier HDBSCAN fit,
-   are what the Optuna objective scores and what gets written. Writes the
-   reduced embeddings plus cluster assignments and metrics.
+   are what the Optuna objective scores and what gets written. Writes
+   cluster assignments (including each row's original embedding) and metrics.
    Read/validate/write logic shared between the clustering approaches lives
    in `amia_2026/clustering/clustering_io.py`; the HDBSCAN fitting/metrics code
    and BERTopic topic-representation layer shared by both reducer-based
@@ -332,7 +332,6 @@ wholesale.
 ```bash
 uv run python -m amia_2026.clustering.umap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --reduced-embeddings-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_reduced_embeddings.parquet \
   --assignments-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_clusters.parquet \
   --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
   --candidate-labels "oncology eligibility,treatment history,disease measurement"
@@ -415,25 +414,22 @@ study rather than starting over, and the configured `n_trials` (default
 every invocation. A full per-trial history CSV is written under the YAML
 file's `results_dir` (`data/clustering/reports/` by default) on every run.
 
-It writes the reduced embeddings, cluster assignments, and metrics to
-`--reduced-embeddings-output-path`/`--assignments-output-path`/
-`--metrics-output-path`.
+It writes cluster assignments and metrics to
+`--assignments-output-path`/`--metrics-output-path`.
 
-The reduced-embeddings Parquet file has one row per successfully-embedded
+The cluster-assignments Parquet file has one row per successfully-embedded
 criterion, containing `nct_id`, `study_first_posted_date`, `criterion_text`,
-`criterion_type`, `reduced_embedding`, `embedding_backend`,
-`embedding_model`, and `reduced_at` — independently joinable back to the
-source criteria via `nct_id` without needing the cluster assignments. The
-cluster-assignments Parquet file contains `nct_id`,
-`study_first_posted_date`, `criterion_text`, `criterion_type`, `cluster_id`
-(`-1` for BERTopic's own outlier/noise topic), `cluster_probability` (`0.0`
-for noise points), `embedding_backend`, `embedding_model`, `clustered_at`,
-`topic_keywords` (BERTopic's own per-topic keywords, unaffected by LLM
-relabeling), and `topic_label` (the LLM-relabeled theme for the winning
-trial — see above; noise rows keep their original zero-shot-derived label,
-since noise is never sent to the LLM) — every row sharing a `cluster_id`
-carries that cluster's own topic representation, including noise rows. The
-metrics JSON reports run provenance (sample/cluster counts,
+`criterion_type`, `cluster_id` (`-1` for BERTopic's own outlier/noise
+topic), `cluster_probability` (`0.0` for noise points), `embedding` (that
+row's original, pre-reduction embedding vector, carried through verbatim
+from the input Parquet — independently joinable/usable without re-reading
+the input embeddings file), `embedding_backend`, `embedding_model`,
+`clustered_at`, `topic_keywords` (BERTopic's own per-topic keywords,
+unaffected by LLM relabeling), and `topic_label` (the LLM-relabeled theme
+for the winning trial — see above; noise rows keep their original
+zero-shot-derived label, since noise is never sent to the LLM) — every row
+sharing a `cluster_id` carries that cluster's own topic representation,
+including noise rows. The metrics JSON reports run provenance (sample/cluster counts,
 `noise_count`/`noise_fraction`) plus clustering performance metrics
 computed from BERTopic's own cluster assignments — silhouette score, the
 Davies-Bouldin index, the Calinski-Harabasz index (computed only over
@@ -477,7 +473,6 @@ error before any trial runs.
 | Argument                           | Required | Description                                                                 |
 | ----------------------------------- | -------- | ---------------------------------------------------------------------------- |
 | `--input-path`                       | yes      | Input embeddings Parquet path (as written by `criteria_embedding.py`). |
-| `--reduced-embeddings-output-path`   | yes      | Output reduced-embeddings Parquet path. |
 | `--assignments-output-path`          | yes      | Output cluster-assignments Parquet path. |
 | `--metrics-output-path`              | yes      | Output metrics JSON path. |
 | `--config-path`                      | no       | Optuna search config YAML (combined UMAP + HDBSCAN search space, objective weights, trial budget, reproducibility seeds/repeats); default: `config/umap_hdbscan_optuna.yaml`. |
@@ -493,7 +488,6 @@ error before any trial runs.
 ```bash
 uv run python -m amia_2026.clustering.pacmap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --reduced-embeddings-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_reduced_embeddings.parquet \
   --assignments-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_clusters.parquet \
   --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json \
   --candidate-labels "oncology eligibility,treatment history,disease measurement"
@@ -518,11 +512,9 @@ reproducibility mechanics, the BERTopic topic-representation layer, the
 composite objective (DBCV plus trustworthiness/continuity/steadiness/
 cohesiveness via `zadu` under cosine distance, folded with the same
 degenerate-result penalties), study resumability, trial-history export, and
-overwrite-on-rerun behavior — is identical to step 4. It writes the reduced
-embeddings, cluster assignments,
-and metrics to `--reduced-embeddings-output-path`/`--assignments-output-path`/
-`--metrics-output-path`, with the reduced-embeddings schema,
-cluster-assignments schema, and metrics JSON shape (as
+overwrite-on-rerun behavior — is identical to step 4. It writes cluster
+assignments and metrics to `--assignments-output-path`/`--metrics-output-path`,
+with the cluster-assignments schema and metrics JSON shape (as
 `winning_pacmap_config` instead of `winning_umap_config`) otherwise
 identical to step 4's.
 
@@ -531,7 +523,6 @@ identical to step 4's.
 | Argument                           | Required | Description                                                                 |
 | ----------------------------------- | -------- | ---------------------------------------------------------------------------- |
 | `--input-path`                       | yes      | Input embeddings Parquet path (as written by `criteria_embedding.py`). |
-| `--reduced-embeddings-output-path`   | yes      | Output reduced-embeddings Parquet path. |
 | `--assignments-output-path`          | yes      | Output cluster-assignments Parquet path. |
 | `--metrics-output-path`              | yes      | Output metrics JSON path. |
 | `--config-path`                      | no       | Optuna search config YAML (combined PaCMAP + HDBSCAN search space, objective weights, trial budget, reproducibility seeds/repeats); default: `config/pacmap_hdbscan_optuna.yaml`. |
@@ -549,7 +540,7 @@ uv run python -m amia_2026.clustering.clustering_scatterplot \
   --method umap_hdbscan \
   --metrics-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
   --assignments-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_clusters.parquet \
-  --reduced-embeddings-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_reduced_embeddings.parquet \
+  --embeddings-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_scatterplot.html
 ```
 
@@ -560,18 +551,13 @@ writes an interactive HTML scatterplot of those criteria in a 2-dimensional
 UMAP space to `--output-path`, with points colored by cluster (a distinct
 color for the two HDBSCAN-based methods' noise points), a legend mapping
 color to cluster, and a hover tooltip showing each point's criterion text.
-Pass `--embeddings-path` to supply the original embeddings Parquet, needed
-whenever a fresh 2D projection has to be fit rather than reusing a
-persisted one.
+`--embeddings-path` (the original embeddings Parquet) is required — neither
+method persists a reusable 2D projection of its own, so a fresh one is
+always fit from it.
 
 The 2D projection always reuses that method's own "optimal run" seed rather
 than introducing new randomness: `umap_hdbscan`/`pacmap_hdbscan`'s
-`winning_seed`. For `umap_hdbscan` specifically, if that run's winning configuration was already 2-dimensional
-and you pass `--reduced-embeddings-path` pointing at its persisted
-reduced-embeddings Parquet, those coordinates are reused directly instead
-of fitting a new UMAP projection; otherwise (and always for
-`pacmap_hdbscan`, whose own persisted projection is PaCMAP, not UMAP) a
-fresh 2-dimensional UMAP projection is computed from `--embeddings-path`.
+`winning_seed`.
 
 Re-running this step against the same output path overwrites the existing
 HTML file wholesale; there is no append/skip-if-exists/merge behavior.
@@ -585,8 +571,7 @@ HTML file wholesale; there is no append/skip-if-exists/merge behavior.
 | `--assignments-path`| yes      | That method's cluster-assignments Parquet path (the file whose rows become the plotted points). |
 | `--output-path`     | yes      | Output HTML path. |
 | `--seed`            | no       | Override the 2D UMAP projection's seed (default: reuse that method's own optimal-run seed). |
-| `--embeddings-path` | no       | Embeddings Parquet path to read when a fresh 2D projection is needed (every method except `umap_hdbscan` reusing an already-2D persisted projection via `--reduced-embeddings-path`). |
-| `--reduced-embeddings-path` | no | For `--method umap_hdbscan` only: that run's persisted reduced-embeddings Parquet path, reused as-is instead of fitting a fresh projection if its winning config was already 2D. |
+| `--embeddings-path` | yes      | Embeddings Parquet path to fit the fresh 2D projection from. |
 | `--log-file`        | no       | If given, also append logs to this file, in addition to the console. |
 
 ## 7. Combined report + scatterplot
@@ -604,9 +589,9 @@ step 3, then renders step 6's scatterplot for whichever methodology has the
 higher composite objective score (`optuna_study_summary.best_score`, already
 surfaced in the report's "Best by composite score" Summary line and Shared
 Metrics table), with ties resolved in favor of PaCMAP+HDBSCAN. Every path
-the scatterplot step needs (`--assignments-path`/`--embeddings-path`/
-`--reduced-embeddings-path`) is resolved automatically from the winning
-methodology's own metrics JSON — there is no `--method` or path flag to
+the scatterplot step needs (`--assignments-path`/`--embeddings-path`) is
+resolved automatically from the winning methodology's own metrics JSON —
+there is no `--method` or path flag to
 pass for the scatterplot half of this command. Pass only whichever
 `--<algorithm>-metrics-path` flag(s) you have; the report is always written
 even if no methodology qualifies for a scatterplot (e.g. both omitted, both
@@ -644,14 +629,12 @@ uv run python -m amia_2026.embeddings.criteria_embedding \
 
 uv run python -m amia_2026.clustering.umap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --reduced-embeddings-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_reduced_embeddings.parquet \
   --assignments-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_clusters.parquet \
   --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
   --candidate-labels "oncology eligibility,treatment history,disease measurement"
 
 uv run python -m amia_2026.clustering.pacmap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --reduced-embeddings-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_reduced_embeddings.parquet \
   --assignments-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_clusters.parquet \
   --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json \
   --candidate-labels "oncology eligibility,treatment history,disease measurement"
@@ -665,6 +648,6 @@ uv run python -m amia_2026.clustering.clustering_scatterplot \
   --method umap_hdbscan \
   --metrics-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
   --assignments-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_clusters.parquet \
-  --reduced-embeddings-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_reduced_embeddings.parquet \
+  --embeddings-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_scatterplot.html
 ```

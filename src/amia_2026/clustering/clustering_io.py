@@ -127,7 +127,7 @@ def extract_traceability_columns(table: pa.Table) -> dict[str, list]:
 
     Returns:
         A dict with keys `nct_id`, `study_first_posted_date`,
-        `criterion_text`, `criterion_type`, `embedding_backend`,
+        `criterion_text`, `criterion_type`, `embedding`, `embedding_backend`,
         `embedding_model`, each a list of length `table.num_rows`. Each
         algorithm's own `build_assignment_rows` zips these with its own
         per-row cluster output (e.g. `cluster_id`, and for HDBSCAN also
@@ -138,6 +138,7 @@ def extract_traceability_columns(table: pa.Table) -> dict[str, list]:
         "study_first_posted_date": table.column("study_first_posted_date").to_pylist(),
         "criterion_text": table.column("criterion_text").to_pylist(),
         "criterion_type": table.column("criterion_type").to_pylist(),
+        "embedding": table.column("embedding").to_pylist(),
         "embedding_backend": table.column("embedding_backend").to_pylist(),
         "embedding_model": table.column("embedding_model").to_pylist(),
     }

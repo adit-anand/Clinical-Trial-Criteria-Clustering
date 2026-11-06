@@ -38,6 +38,7 @@ HDBSCAN_CLUSTER_PARQUET_SCHEMA = pa.schema(
         ("criterion_type", pa.string()),
         ("cluster_id", pa.int32()),
         ("cluster_probability", pa.float32()),
+        ("embedding", pa.list_(pa.float32())),
         ("embedding_backend", pa.string()),
         ("embedding_model", pa.string()),
         ("clustered_at", pa.timestamp("us", tz="UTC")),
@@ -328,7 +329,11 @@ class HDBSCANClusterer:
 
         Returns:
             One output dict per row, matching
-            `HDBSCAN_CLUSTER_PARQUET_SCHEMA`'s columns.
+            `HDBSCAN_CLUSTER_PARQUET_SCHEMA`'s columns -- including each
+            row's original (pre-reduction) `embedding` vector, carried
+            through verbatim from `table`'s own `embedding` column, so the
+            assignments Parquet is independently usable without re-joining
+            the input embeddings file.
         """
         columns = clustering_io.extract_traceability_columns(table)
         topics_by_id = {topic.topic_id: topic for topic in topics}
@@ -344,6 +349,7 @@ class HDBSCANClusterer:
                     "criterion_type": columns["criterion_type"][i],
                     "cluster_id": int(labels[i]),
                     "cluster_probability": float(probabilities[i]),
+                    "embedding": columns["embedding"][i],
                     "embedding_backend": columns["embedding_backend"][i],
                     "embedding_model": columns["embedding_model"][i],
                     "clustered_at": clustered_at,
