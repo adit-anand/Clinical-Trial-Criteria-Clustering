@@ -69,42 +69,6 @@ def filter_successful_rows(table: pa.Table) -> pa.Table:
     return filtered
 
 
-VALID_CRITERION_TYPES = ("inclusion", "exclusion")
-
-
-def filter_by_criterion_type(table: pa.Table, criterion_type: str) -> pa.Table:
-    """Filter a table down to rows eligible for one side of an inclusion/exclusion split.
-
-    Rows whose `criterion_type` is `"both"` (unstructured eligibility text
-    with no inclusion/exclusion headers to split on — see
-    `amia_2026/preprocessing/criteria_parser.py`) are eligible for *either* side,
-    since they cannot be confidently assigned to only one: `criterion_type=
-    "inclusion"` selects rows whose column value is `"inclusion"` or
-    `"both"`; `criterion_type="exclusion"` selects `"exclusion"` or `"both"`.
-
-    Args:
-        table: A table as returned by `read_embeddings_parquet`.
-        criterion_type: `"inclusion"` or `"exclusion"`.
-
-    Returns:
-        The eligible subset of `table`.
-
-    Raises:
-        ValueError: If `criterion_type` isn't one of `VALID_CRITERION_TYPES`,
-            or if the result has zero rows — there is nothing to cluster
-            either way.
-    """
-    if criterion_type not in VALID_CRITERION_TYPES:
-        raise ValueError(f"Unknown criterion_type {criterion_type!r}; expected one of {VALID_CRITERION_TYPES}")
-    filtered = table.filter(pc.field("criterion_type").isin([criterion_type, "both"]))
-    if filtered.num_rows == 0:
-        raise ValueError(
-            f"No rows with criterion_type in {{{criterion_type!r}, 'both'}} found in input "
-            f"(0 of {table.num_rows} row(s) matched); refusing to cluster an empty dataset"
-        )
-    return filtered
-
-
 def validate_embedding_dimensions(table: pa.Table) -> int:
     """Confirm every row's `embedding` vector has the same length.
 
@@ -179,30 +143,6 @@ def extract_traceability_columns(table: pa.Table) -> dict[str, list]:
     }
 
 
-def resolve_criterion_type_subdir(output_path: Path, criterion_type: str) -> Path:
-    """Insert `criterion_type` as a subdirectory between `output_path`'s parent and filename.
-
-    Keeps each clustering method's inclusion-side and exclusion-side output
-    artifacts physically separated on disk (e.g.
-    `data/clustering/umap_hdbscan/inclusion/...` vs `.../exclusion/...`)
-    without requiring callers to bake `criterion_type` into the filename or
-    type out the subdirectory themselves — callers pass an output path as
-    if writing directly into the method's own directory, and this inserts
-    the extra segment.
-
-    Args:
-        output_path: An output path as given by the caller (e.g. via
-            `--assignments-output-path`).
-        criterion_type: `"inclusion"` or `"exclusion"` (see
-            `filter_by_criterion_type`'s `VALID_CRITERION_TYPES`).
-
-    Returns:
-        `output_path` with `criterion_type` inserted as a new path segment
-        immediately before the filename.
-    """
-    return output_path.parent / criterion_type / output_path.name
-
-
 def relative_to_repo_root(path: Path) -> str:
     """Render `path` as a POSIX-style string relative to `REPO_ROOT` if possible.
 
@@ -235,7 +175,6 @@ def compute_cluster_sizes(labels: np.ndarray) -> dict[str, int]:
 
 def build_base_metrics_dict(
     label: str,
-    criterion_type: str,
     input_path: Path,
     assignments_output_path: Path,
     n_samples: int,
@@ -257,9 +196,6 @@ def build_base_metrics_dict(
             filename (see `amia_2026.paths.slug_from_filename`/`label_from_slug`),
             recorded here only for traceability — no longer used to resolve
             any path.
-        criterion_type: Which side of the inclusion/exclusion split this run
-            covers (see `filter_by_criterion_type`), recorded as its own
-            field so downstream consumers don't need to parse `label`.
         input_path: The embeddings Parquet path that was read.
         assignments_output_path: Where cluster assignments were written.
         n_samples: Number of successfully-embedded rows clustered.
@@ -277,7 +213,6 @@ def build_base_metrics_dict(
     """
     return {
         "condition": label,
-        "criterion_type": criterion_type,
         "input_path": relative_to_repo_root(input_path),
         "assignments_output_path": relative_to_repo_root(assignments_output_path),
         "n_samples": n_samples,

@@ -3,7 +3,7 @@
 `umap_hdbscan_clustering.py` and `pacmap_hdbscan_clustering.py` both reduce a
 condition's embeddings with their own reducer before clustering the reduced
 vectors, tuning both jointly via one Optuna search. Everything about that
-orchestration — reading/filtering input, building the Optuna objective,
+orchestration — reading input, building the Optuna objective,
 resolving the winning trial, writing the three output artifacts — is
 identical between them; the only real differences are reducer-specific
 (hyperparameter names, the fit callable, the fixed-metric config key, and a
@@ -145,7 +145,6 @@ def annotate_dimensionality_note(
 def build_metrics_dict(
     plugin: ReducerPlugin,
     label: str,
-    criterion_type: str,
     input_path: Path,
     reduced_embeddings_output_path: Path | None,
     assignments_output_path: Path,
@@ -170,7 +169,6 @@ def build_metrics_dict(
     Args:
         plugin: This reducer's `ReducerPlugin`.
         label: Human-readable label for this run, derived from `input_path`'s filename.
-        criterion_type: Which side of the inclusion/exclusion split this run covers.
         input_path: The embeddings Parquet path that was read.
         reduced_embeddings_output_path: Where the reduced embeddings were
             written, or `None` if the winning config's `n_components != 2`
@@ -202,7 +200,6 @@ def build_metrics_dict(
     """
     base = clustering_io.build_base_metrics_dict(
         label=label,
-        criterion_type=criterion_type,
         input_path=input_path,
         assignments_output_path=assignments_output_path,
         n_samples=n_samples,
@@ -245,7 +242,6 @@ def build_metrics_dict(
 def build_keybert_metrics_dict(
     plugin: ReducerPlugin,
     label: str,
-    criterion_type: str,
     input_path: Path,
     reduced_embeddings_output_path: Path | None,
     assignments_output_path: Path,
@@ -280,7 +276,6 @@ def build_keybert_metrics_dict(
     Args:
         plugin: This reducer's `ReducerPlugin`.
         label: Human-readable label for this run, derived from `input_path`'s filename.
-        criterion_type: Which side of the inclusion/exclusion split this run covers.
         input_path: The embeddings Parquet path that was read.
         reduced_embeddings_output_path: Where the reduced embeddings were
             written, or `None` if the winning config's `n_components != 2`
@@ -319,7 +314,6 @@ def build_keybert_metrics_dict(
     """
     base = clustering_io.build_base_metrics_dict(
         label=label,
-        criterion_type=criterion_type,
         input_path=input_path,
         assignments_output_path=assignments_output_path,
         n_samples=n_samples,
@@ -367,7 +361,6 @@ def build_keybert_metrics_dict(
 def run(
     plugin: ReducerPlugin,
     input_path: Path,
-    criterion_type: str,
     reduced_embeddings_output_path: Path,
     assignments_output_path: Path,
     metrics_output_path: Path,
@@ -375,28 +368,14 @@ def run(
     candidate_labels: list[str],
     zeroshot_model: str,
 ) -> tuple[Path | None, Path, Path, Path] | None:
-    """Run the full read-filter-search-write pipeline for one reducer.
+    """Run the full read-search-write pipeline for one reducer.
 
     Args:
         plugin: This reducer's `ReducerPlugin`.
         input_path: Embeddings Parquet to read.
-        criterion_type: `"inclusion"` or `"exclusion"` — which side of the
-            inclusion/exclusion split to cluster (see
-            `clustering_io.filter_by_criterion_type`); also folded into this
-            run's slug/label so its Optuna study and trial-history export
-            never collide with the other side's run over the same input file.
         reduced_embeddings_output_path: Where to write reduced embeddings.
-            `criterion_type` is inserted as a subdirectory immediately
-            before the filename (see
-            `clustering_io.resolve_criterion_type_subdir`), so the caller's
-            own path is treated as if writing directly into this method's
-            own directory, not a path to type `criterion_type` into by hand.
-        assignments_output_path: Where to write cluster assignments. Same
-            automatic `criterion_type` subdirectory insertion as
-            `reduced_embeddings_output_path`.
-        metrics_output_path: Where to write metrics. Same automatic
-            `criterion_type` subdirectory insertion as
-            `reduced_embeddings_output_path`.
+        assignments_output_path: Where to write cluster assignments.
+        metrics_output_path: Where to write metrics.
         config_path: YAML config (combined reducer + HDBSCAN search space,
             objective weights, trial budget, reproducibility seeds/repeats,
             study/report directories) — see `optuna_search.load_optuna_config`.
@@ -408,11 +387,10 @@ def run(
     Returns:
         `(reduced_embeddings_output_path, assignments_output_path,
         metrics_output_path, keybert_metrics_output_path)` — the actual
-        paths written, i.e. each `*_output_path` argument of the same name
-        with `criterion_type` already inserted as a subdirectory, plus the
-        sibling path the second (`KeyBERTInspired`-representation) metrics
-        JSON was written to (or was meant to be written to, if that pass
-        itself failed -- see this function's body). `reduced_embeddings_
+        paths written, i.e. each `*_output_path` argument of the same name,
+        plus the sibling path the second (`KeyBERTInspired`-representation)
+        metrics JSON was written to (or was meant to be written to, if that
+        pass itself failed -- see this function's body). `reduced_embeddings_
         output_path` is `None` instead whenever the winning config's
         `n_components != 2` (reduced embeddings are only persisted when
         2-dimensional — see this function's body); cluster assignments are
@@ -426,16 +404,10 @@ def run(
             if embedding dimensionality is inconsistent, or if `config_path`
             fails validation (see `optuna_search.load_optuna_config`).
     """
-    slug = f"{slug_from_filename(input_path.name, '_trials_embeddings.parquet')}_{criterion_type}"
+    slug = slug_from_filename(input_path.name, "_trials_embeddings.parquet")
     label = label_from_slug(slug)
 
     table = clustering_io.read_embeddings_parquet(input_path)
-    table = clustering_io.filter_by_criterion_type(table, criterion_type)
-    reduced_embeddings_output_path = clustering_io.resolve_criterion_type_subdir(
-        reduced_embeddings_output_path, criterion_type
-    )
-    assignments_output_path = clustering_io.resolve_criterion_type_subdir(assignments_output_path, criterion_type)
-    metrics_output_path = clustering_io.resolve_criterion_type_subdir(metrics_output_path, criterion_type)
     total_rows = table.num_rows
     filtered = clustering_io.filter_successful_rows(table)
     n_samples = filtered.num_rows
@@ -701,7 +673,6 @@ def run(
     metrics_dict = build_metrics_dict(
         plugin,
         label=label,
-        criterion_type=criterion_type,
         input_path=input_path,
         reduced_embeddings_output_path=written_reduced_embeddings_output_path,
         assignments_output_path=assignments_output_path,
@@ -747,7 +718,6 @@ def run(
         keybert_metrics_dict = build_keybert_metrics_dict(
             plugin,
             label=label,
-            criterion_type=criterion_type,
             input_path=input_path,
             reduced_embeddings_output_path=written_reduced_embeddings_output_path,
             assignments_output_path=assignments_output_path,
@@ -814,37 +784,22 @@ def build_arg_parser(description: str, default_config_path: Path) -> argparse.Ar
         help="Input embeddings Parquet path (as written by criteria_embedding.py)",
     )
     parser.add_argument(
-        "--criterion-type",
-        type=str,
-        choices=["inclusion", "exclusion"],
-        required=True,
-        help=(
-            "Which side of eligibility criteria to cluster. Rows with criterion_type='both' "
-            "(unstructured eligibility text with no inclusion/exclusion headers to split on) are "
-            "included on both sides. Give each side's outputs distinct paths/filenames."
-        ),
-    )
-    parser.add_argument(
         "--reduced-embeddings-output-path",
         type=Path,
         required=True,
-        help="Output reduced-embeddings Parquet path; --criterion-type is automatically inserted as a "
-        "subdirectory immediately before the filename (e.g. '.../umap_hdbscan/x.parquet' with "
-        "--criterion-type inclusion actually writes to '.../umap_hdbscan/inclusion/x.parquet')",
+        help="Output reduced-embeddings Parquet path",
     )
     parser.add_argument(
         "--assignments-output-path",
         type=Path,
         required=True,
-        help="Output cluster-assignments Parquet path; same automatic --criterion-type subdirectory "
-        "insertion as --reduced-embeddings-output-path",
+        help="Output cluster-assignments Parquet path",
     )
     parser.add_argument(
         "--metrics-output-path",
         type=Path,
         required=True,
-        help="Output metrics JSON path; same automatic --criterion-type subdirectory insertion as "
-        "--reduced-embeddings-output-path",
+        help="Output metrics JSON path",
     )
     parser.add_argument(
         "--config-path",
@@ -884,7 +839,6 @@ def main(plugin: ReducerPlugin, description: str, default_config_path: Path) -> 
     run(
         plugin,
         args.input_path,
-        args.criterion_type,
         args.reduced_embeddings_output_path,
         args.assignments_output_path,
         args.metrics_output_path,

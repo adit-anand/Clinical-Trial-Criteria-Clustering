@@ -6,13 +6,12 @@ function, plus its own output schema/CLI defaults) to the generic
 reduce-then-HDBSCAN orchestration in `reduction_hdbscan_pipeline.py`, which
 `pacmap_hdbscan_clustering.py` shares via the same seam, swapping in its own
 PaCMAP-specific pieces instead. See that module's docstring for the full
-read-filter-search-write pipeline description (Optuna study setup/resumption,
+read-search-write pipeline description (Optuna study setup/resumption,
 reproducibility seed/repeat handling via `reduction_sweep.py`, the composite
 objective via `optuna_search.score_reduction_candidate`, and the three output
 artifacts written at the paths given via
 `--reduced-embeddings-output-path`/`--assignments-output-path`/
-`--metrics-output-path`, each with `--criterion-type` automatically
-inserted as a subdirectory immediately before the filename).
+`--metrics-output-path`).
 
 Re-running this step against the same output paths overwrites all three
 existing output files (and the trial-history CSV) wholesale; only the

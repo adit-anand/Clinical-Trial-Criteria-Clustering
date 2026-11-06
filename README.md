@@ -6,11 +6,9 @@ Every step below takes its input and output file paths as explicit CLI
 flags — there is no "condition" argument used to derive default paths
 anywhere except step 1, where it's the actual ClinicalTrials.gov search
 term. Chaining steps together means passing the previous step's output path
-as the next step's input path. The one exception is steps 4-5's three
-output-path flags: each clustering method's own directory automatically
-gets an `inclusion/`/`exclusion/` subdirectory inserted before the
-filename, derived from `--criterion-type`, so the two sides' artifacts for
-the same method never collide on disk (see step 4).
+as the next step's input path. Clustering (steps 4-5) runs once over every
+eligibility criterion regardless of `criterion_type` (`inclusion`,
+`exclusion`, or `both`) — there is no per-side flag or output subdirectory.
 
 1. **`amia_2026/preprocessing/criteria_retrieval.py`** — fetches NCI-affiliated
    clinical trials for a condition from ClinicalTrials.gov, retrieves their
@@ -327,40 +325,21 @@ wholesale.
 ```bash
 uv run python -m amia_2026.clustering.umap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --criterion-type inclusion \
-  --reduced-embeddings-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_reduced_embeddings.parquet \
-  --assignments-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_clusters.parquet \
-  --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
-  --candidate-labels "oncology eligibility,treatment history,disease measurement"
-
-uv run python -m amia_2026.clustering.umap_hdbscan_clustering \
-  --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --criterion-type exclusion \
   --reduced-embeddings-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_reduced_embeddings.parquet \
   --assignments-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_clusters.parquet \
   --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
   --candidate-labels "oncology eligibility,treatment history,disease measurement"
 ```
 
-The inclusion run above actually writes to
-`data/clustering/umap_hdbscan/inclusion/breast_cancer_trials_umap_hdbscan_clusters.parquet`
-(and its sibling reduced-embeddings/metrics files); the exclusion run writes
-the same filenames under `data/clustering/umap_hdbscan/exclusion/` instead —
-`--criterion-type` is automatically inserted as a subdirectory immediately
-before the filename for all three output-path flags (see
-`clustering_io.resolve_criterion_type_subdir`), so both commands above can
-reuse identical output filenames without colliding. `--criterion-type` is
-required (`inclusion` or `exclusion`, with `"both"`-typed rows included on
-both sides) and each side must be run separately. The study name, its
-resumable Optuna storage journal, and its trial-history CSV filename are all
-derived from the input filename *and* `--criterion-type` together, so the
-two sides always get independent, non-colliding resumable studies even when
-read from the same input Parquet.
+This clusters every eligibility criterion in `--input-path` together,
+regardless of its `criterion_type` (`inclusion`, `exclusion`, or `both`) —
+there is no per-side flag or run. The study name, its resumable Optuna
+storage journal, and its trial-history CSV filename are all derived from
+the input filename alone.
 
 This reads the same embeddings Parquet file format as the other clustering
-steps (given via `--input-path`), filters it down to the selected
-`--criterion-type` side, drops rows whose embedding failed, and runs an
-Optuna study whose every trial reduces the remaining embedding
+steps (given via `--input-path`), drops rows whose embedding failed, and
+runs an Optuna study whose every trial reduces the remaining embedding
 vectors' dimensionality with UMAP before clustering the reduced vectors
 with HDBSCAN. Each trial suggests a *combined* hyperparameter set — UMAP's
 own (`n_components`/`n_neighbors`/`min_dist`) *and* HDBSCAN's own
@@ -468,10 +447,9 @@ error before any trial runs.
 | Argument                           | Required | Description                                                                 |
 | ----------------------------------- | -------- | ---------------------------------------------------------------------------- |
 | `--input-path`                       | yes      | Input embeddings Parquet path (as written by `criteria_embedding.py`). |
-| `--criterion-type`                   | yes      | Which side to cluster: `inclusion` or `exclusion`. Rows with `criterion_type="both"` are included on both sides. Also automatically inserted as a subdirectory before each of the three output-path flags below. |
-| `--reduced-embeddings-output-path`   | yes      | Output reduced-embeddings Parquet path, with `--criterion-type` inserted as a subdirectory before the filename. |
-| `--assignments-output-path`          | yes      | Output cluster-assignments Parquet path, with `--criterion-type` inserted as a subdirectory before the filename. |
-| `--metrics-output-path`              | yes      | Output metrics JSON path, with `--criterion-type` inserted as a subdirectory before the filename. |
+| `--reduced-embeddings-output-path`   | yes      | Output reduced-embeddings Parquet path. |
+| `--assignments-output-path`          | yes      | Output cluster-assignments Parquet path. |
+| `--metrics-output-path`              | yes      | Output metrics JSON path. |
 | `--config-path`                      | no       | Optuna search config YAML (combined UMAP + HDBSCAN search space, objective weights, trial budget, reproducibility seeds/repeats); default: `config/umap_hdbscan_optuna.yaml`. |
 | `--candidate-labels`                 | yes      | Comma-separated candidate topic labels for BERTopic's zero-shot classification layer, e.g. `"oncology eligibility,treatment history,disease measurement"`. |
 | `--zeroshot-model`                   | no       | HuggingFace zero-shot-classification model id for that same layer (default: `facebook/bart-large-mnli`). |
@@ -482,24 +460,14 @@ error before any trial runs.
 ```bash
 uv run python -m amia_2026.clustering.pacmap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --criterion-type inclusion \
-  --reduced-embeddings-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_reduced_embeddings.parquet \
-  --assignments-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_clusters.parquet \
-  --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json \
-  --candidate-labels "oncology eligibility,treatment history,disease measurement"
-
-uv run python -m amia_2026.clustering.pacmap_hdbscan_clustering \
-  --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --criterion-type exclusion \
   --reduced-embeddings-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_reduced_embeddings.parquet \
   --assignments-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_clusters.parquet \
   --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json \
   --candidate-labels "oncology eligibility,treatment history,disease measurement"
 ```
 
-Same `--criterion-type` requirement, automatic inclusion/exclusion
-subdirectory insertion, and study-name-qualification behavior as step 4
-(see above).
+Same study-name-qualification behavior as step 4 (see above): it clusters
+every criterion in `--input-path` together, with no per-side flag or run.
 
 The same idea as step 4, reducing with [PaCMAP](https://github.com/YingfanWang/PaCMAP)
 instead of UMAP. PaCMAP has no `min_dist` equivalent — its
@@ -530,10 +498,9 @@ identical to step 4's.
 | Argument                           | Required | Description                                                                 |
 | ----------------------------------- | -------- | ---------------------------------------------------------------------------- |
 | `--input-path`                       | yes      | Input embeddings Parquet path (as written by `criteria_embedding.py`). |
-| `--criterion-type`                   | yes      | Which side to cluster: `inclusion` or `exclusion`. Rows with `criterion_type="both"` are included on both sides. Also automatically inserted as a subdirectory before each of the three output-path flags below. |
-| `--reduced-embeddings-output-path`   | yes      | Output reduced-embeddings Parquet path, with `--criterion-type` inserted as a subdirectory before the filename. |
-| `--assignments-output-path`          | yes      | Output cluster-assignments Parquet path, with `--criterion-type` inserted as a subdirectory before the filename. |
-| `--metrics-output-path`              | yes      | Output metrics JSON path, with `--criterion-type` inserted as a subdirectory before the filename. |
+| `--reduced-embeddings-output-path`   | yes      | Output reduced-embeddings Parquet path. |
+| `--assignments-output-path`          | yes      | Output cluster-assignments Parquet path. |
+| `--metrics-output-path`              | yes      | Output metrics JSON path. |
 | `--config-path`                      | no       | Optuna search config YAML (combined PaCMAP + HDBSCAN search space, objective weights, trial budget, reproducibility seeds/repeats); default: `config/pacmap_hdbscan_optuna.yaml`. |
 | `--candidate-labels`                 | yes      | Comma-separated candidate topic labels for BERTopic's zero-shot classification layer, e.g. `"oncology eligibility,treatment history,disease measurement"`. |
 | `--zeroshot-model`                   | no       | HuggingFace zero-shot-classification model id for that same layer (default: `facebook/bart-large-mnli`). |
@@ -544,16 +511,11 @@ identical to step 4's.
 ```bash
 uv run python -m amia_2026.clustering.clustering_scatterplot \
   --method umap_hdbscan \
-  --metrics-path data/clustering/umap_hdbscan/inclusion/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
-  --assignments-path data/clustering/umap_hdbscan/inclusion/breast_cancer_trials_umap_hdbscan_clusters.parquet \
-  --reduced-embeddings-path data/clustering/umap_hdbscan/inclusion/breast_cancer_trials_umap_reduced_embeddings.parquet \
-  --output-path data/clustering/umap_hdbscan/inclusion/breast_cancer_trials_umap_hdbscan_scatterplot.html
+  --metrics-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
+  --assignments-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_clusters.parquet \
+  --reduced-embeddings-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_reduced_embeddings.parquet \
+  --output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_scatterplot.html
 ```
-
-This step has no `--criterion-type` flag of its own — unlike steps 4-5, it
-takes the exact paths it's given with no subdirectory inserted, so point it
-directly at whichever side's files you want to visualize (as in the
-`inclusion/` paths above, which steps 4-5 wrote automatically).
 
 This reads whichever clustering method's output paths are passed to it
 (`--method`, one of `umap_hdbscan`/`pacmap_hdbscan`, plus
@@ -595,10 +557,10 @@ HTML file wholesale; there is no append/skip-if-exists/merge behavior.
 
 ```bash
 uv run python -m amia_2026.clustering.clustering_review \
-  --umap-hdbscan-metrics-path data/clustering/umap_hdbscan/inclusion/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
-  --pacmap-hdbscan-metrics-path data/clustering/pacmap_hdbscan/inclusion/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json \
-  --report-path data/clustering/reports/breast_cancer_inclusion_clustering_report.md \
-  --scatterplot-path data/clustering/reports/breast_cancer_inclusion_clustering_scatterplot.html
+  --umap-hdbscan-metrics-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
+  --pacmap-hdbscan-metrics-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json \
+  --report-path data/clustering/reports/breast_cancer_clustering_report.md \
+  --scatterplot-path data/clustering/reports/breast_cancer_clustering_scatterplot.html
 ```
 
 This chains steps 3 and 6 automatically: it generates the same report as
@@ -631,13 +593,9 @@ doesn't cover (such as visualizing the lower-scoring methodology on demand).
 ### Example: full pipeline for one condition
 
 Retrieval and embedding run once per condition, covering all criteria types.
-Every clustering/report/scatterplot step, however, must be run once per
-`--criterion-type` (`inclusion`, then `exclusion`) — each side's clustering
-output (steps 4-5) automatically lands under its own `inclusion/`/
-`exclusion/` subdirectory of each method's directory (see step 4), and each
-side's report/scatterplot (steps 3/6, which have no `--criterion-type` of
-their own) gets its own output filenames below (`_inclusion_`/
-`_exclusion_` inserted) and its own fully independent results and report.
+Every clustering/report/scatterplot step also runs once, over every
+eligibility criterion regardless of `criterion_type` — there is no
+inclusion/exclusion split anywhere in the pipeline.
 
 ```bash
 uv run python -m amia_2026.preprocessing.criteria_retrieval "breast cancer" \
@@ -648,68 +606,29 @@ uv run python -m amia_2026.embeddings.criteria_embedding \
   --output-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --backend huggingface
 
-# --- inclusion side ---
-
 uv run python -m amia_2026.clustering.umap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --criterion-type inclusion \
   --reduced-embeddings-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_reduced_embeddings.parquet \
   --assignments-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_clusters.parquet \
   --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
   --candidate-labels "oncology eligibility,treatment history,disease measurement"
-# writes under data/clustering/umap_hdbscan/inclusion/ (--criterion-type inserted automatically)
 
 uv run python -m amia_2026.clustering.pacmap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --criterion-type inclusion \
   --reduced-embeddings-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_reduced_embeddings.parquet \
   --assignments-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_clusters.parquet \
   --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json \
   --candidate-labels "oncology eligibility,treatment history,disease measurement"
-# writes under data/clustering/pacmap_hdbscan/inclusion/ (--criterion-type inserted automatically)
 
 uv run python -m amia_2026.clustering.clustering_report \
-  --output-path data/clustering/reports/breast_cancer_inclusion_clustering_report.md \
-  --umap-hdbscan-metrics-path data/clustering/umap_hdbscan/inclusion/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
-  --pacmap-hdbscan-metrics-path data/clustering/pacmap_hdbscan/inclusion/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json
+  --output-path data/clustering/reports/breast_cancer_clustering_report.md \
+  --umap-hdbscan-metrics-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
+  --pacmap-hdbscan-metrics-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json
 
 uv run python -m amia_2026.clustering.clustering_scatterplot \
   --method umap_hdbscan \
-  --metrics-path data/clustering/umap_hdbscan/inclusion/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
-  --assignments-path data/clustering/umap_hdbscan/inclusion/breast_cancer_trials_umap_hdbscan_clusters.parquet \
-  --reduced-embeddings-path data/clustering/umap_hdbscan/inclusion/breast_cancer_trials_umap_reduced_embeddings.parquet \
-  --output-path data/clustering/umap_hdbscan/inclusion/breast_cancer_trials_umap_hdbscan_scatterplot.html
-
-# --- exclusion side (repeat with --criterion-type exclusion; same output-path flags, since
-#     --criterion-type alone is what separates the two sides' files on disk for steps 4-5) ---
-
-uv run python -m amia_2026.clustering.umap_hdbscan_clustering \
-  --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --criterion-type exclusion \
-  --reduced-embeddings-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_reduced_embeddings.parquet \
-  --assignments-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_clusters.parquet \
-  --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
-  --candidate-labels "oncology eligibility,treatment history,disease measurement"
-# writes under data/clustering/umap_hdbscan/exclusion/ (--criterion-type inserted automatically)
-
-uv run python -m amia_2026.clustering.pacmap_hdbscan_clustering \
-  --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --criterion-type exclusion \
-  --reduced-embeddings-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_reduced_embeddings.parquet \
-  --assignments-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_clusters.parquet \
-  --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json \
-  --candidate-labels "oncology eligibility,treatment history,disease measurement"
-# writes under data/clustering/pacmap_hdbscan/exclusion/ (--criterion-type inserted automatically)
-
-uv run python -m amia_2026.clustering.clustering_report \
-  --output-path data/clustering/reports/breast_cancer_exclusion_clustering_report.md \
-  --umap-hdbscan-metrics-path data/clustering/umap_hdbscan/exclusion/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
-  --pacmap-hdbscan-metrics-path data/clustering/pacmap_hdbscan/exclusion/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json
-
-uv run python -m amia_2026.clustering.clustering_scatterplot \
-  --method umap_hdbscan \
-  --metrics-path data/clustering/umap_hdbscan/exclusion/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
-  --assignments-path data/clustering/umap_hdbscan/exclusion/breast_cancer_trials_umap_hdbscan_clusters.parquet \
-  --reduced-embeddings-path data/clustering/umap_hdbscan/exclusion/breast_cancer_trials_umap_reduced_embeddings.parquet \
-  --output-path data/clustering/umap_hdbscan/exclusion/breast_cancer_trials_umap_hdbscan_scatterplot.html
+  --metrics-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
+  --assignments-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_clusters.parquet \
+  --reduced-embeddings-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_reduced_embeddings.parquet \
+  --output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_scatterplot.html
 ```
