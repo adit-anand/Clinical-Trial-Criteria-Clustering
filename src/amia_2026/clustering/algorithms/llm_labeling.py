@@ -14,12 +14,18 @@ so every other consumer of a `TopicRepresentation` keeps working unmodified.
 Two stages, run in sequence:
     1. Primary summarization: one LLM call per non-noise cluster, over that
        cluster's own top-N (by `cluster_probability`) eligibility criteria,
-       producing a short overarching theme.
+       producing a short overarching theme. Each call's response is a JSON
+       array holding one `{"cluster_id", "label"}` object (see
+       `config/llm_prompts/primary_summary_prompt.txt`).
     2. Secondary summarization: one LLM call across every cluster's primary
        theme at once (semantic distinctness between clusters cannot be judged
-       one cluster at a time), producing the final per-cluster label.
+       one cluster at a time), producing the final per-cluster label. The
+       response is a JSON array with one `{"cluster_id", "old_label",
+       "new_label"}` object per cluster (see
+       `config/llm_prompts/secondary_summary_prompt.txt`).
 """
 
+import json
 import logging
 import time
 from dataclasses import replace
@@ -38,6 +44,11 @@ TOP_N_CRITERIA_PER_CLUSTER = 50
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2
 MAX_OUTPUT_TOKENS = 128
+# The secondary call's response holds one JSON object (old_label + new_label)
+# per cluster, so its ceiling must scale with cluster count rather than use
+# primary's single-object budget -- comfortably covers HDBSCANClusterer's
+# own MAX_N_CLUSTERS=100.
+SECONDARY_MAX_OUTPUT_TOKENS = 4096
 
 DEFAULT_PRIMARY_PROMPT_PATH = REPO_ROOT / "config" / "llm_prompts" / "primary_summary_prompt.txt"
 DEFAULT_SECONDARY_PROMPT_PATH = REPO_ROOT / "config" / "llm_prompts" / "secondary_summary_prompt.txt"
@@ -60,7 +71,7 @@ def _build_client():
     return anthropic.Anthropic()
 
 
-def _call_llm(client, model: str, system_prompt: str, user_content: str) -> str:
+def _call_llm(client, model: str, system_prompt: str, user_content: str, max_tokens: int = MAX_OUTPUT_TOKENS) -> str:
     """Make one retried Anthropic Messages API call and return its text response.
 
     Args:
@@ -71,6 +82,7 @@ def _call_llm(client, model: str, system_prompt: str, user_content: str) -> str:
         user_content: The fully-assembled user-turn content (data plus a
             fixed, code-supplied output-format instruction — see
             `_build_primary_user_content`/`_build_secondary_user_content`).
+        max_tokens: Response token ceiling (see `MAX_OUTPUT_TOKENS`/`SECONDARY_MAX_OUTPUT_TOKENS`).
 
     Returns:
         The response's first `text`-type content block, stripped.
@@ -89,7 +101,7 @@ def _call_llm(client, model: str, system_prompt: str, user_content: str) -> str:
         try:
             response = client.messages.create(
                 model=model,
-                max_tokens=MAX_OUTPUT_TOKENS,
+                max_tokens=max_tokens,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_content}],
             )
@@ -117,6 +129,38 @@ def _call_llm(client, model: str, system_prompt: str, user_content: str) -> str:
     raise RuntimeError(f"_call_llm: giving up after {MAX_RETRIES} attempts") from last_exc
 
 
+def _parse_json_array(text: str) -> list[dict]:
+    """Parse an LLM response expected to be a JSON array of objects, tolerating a wrapping code fence.
+
+    Both labelling prompts (`config/llm_prompts/primary_summary_prompt.txt`,
+    `secondary_summary_prompt.txt`) now specify this exact shape -- "an
+    array of dictionaries" -- as their own output format, so this is the
+    one place that contract is actually enforced/parsed.
+
+    Args:
+        text: The raw LLM response text.
+
+    Returns:
+        The parsed list of dicts.
+
+    Raises:
+        ValueError: If `text` isn't parseable as a JSON array of objects.
+    """
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = stripped.split("\n", 1)[1] if "\n" in stripped else stripped[3:]
+        stripped = stripped.strip()
+        if stripped.endswith("```"):
+            stripped = stripped[:-3].strip()
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"expected a JSON array response, got unparseable text: {text!r}") from exc
+    if not isinstance(parsed, list) or not all(isinstance(item, dict) for item in parsed):
+        raise ValueError(f"expected a JSON array of objects, got: {parsed!r}")
+    return parsed
+
+
 def select_top_criteria(
     criterion_texts: list[str], labels: np.ndarray, probabilities: np.ndarray, topic_id: int, top_n: int
 ) -> list[str]:
@@ -138,15 +182,21 @@ def select_top_criteria(
     return [criterion_texts[i] for i in indices[:top_n]]
 
 
-def _build_primary_user_content(criteria: list[str], guide_labels: list[str]) -> str:
-    """Assemble one cluster's primary-summarization user-turn content."""
+def _build_primary_user_content(topic_id: int, criteria: list[str], guide_labels: list[str]) -> str:
+    """Assemble one cluster's primary-summarization user-turn content.
+
+    `topic_id` is included so the model has a concrete id to echo back in
+    its `cluster_id` field (see `config/llm_prompts/primary_summary_prompt.txt`'s
+    own output-format instruction, enforced by `_parse_json_array`/`primary_summarize`).
+    """
     guide_block = ", ".join(guide_labels)
     criteria_block = "\n".join(f"{i + 1}. {text}" for i, text in enumerate(criteria))
     return (
+        f"cluster_id: {topic_id}\n\n"
         f"Reference labels (optional guidance, not a strict list): {guide_block}\n\n"
         f"Eligibility criteria in this cluster:\n{criteria_block}\n\n"
-        "Respond with ONLY the overarching theme, 5 words or fewer. No numbering, "
-        "quotation marks, or additional commentary."
+        'Respond with ONLY a JSON array containing one object: {"cluster_id": '
+        f'{topic_id}, "label": "<theme, 5 words or fewer>"}}. No commentary, no markdown code fences.'
     )
 
 
@@ -154,6 +204,12 @@ def primary_summarize(
     client, model: str, system_prompt: str, criteria_by_topic: dict[int, list[str]], guide_labels: list[str]
 ) -> dict[int, str]:
     """One Anthropic call per non-noise topic, each over that topic's own top criteria.
+
+    Each call's response is a JSON array holding one `{"cluster_id",
+    "label"}` object (see `config/llm_prompts/primary_summary_prompt.txt`);
+    `label` is extracted and keyed to the *requested* `topic_id` regardless
+    of what `cluster_id` the model echoed back (mismatches are logged, not
+    fatal -- we already know which call this response answers).
 
     Args:
         client: An `anthropic.Anthropic` client.
@@ -164,11 +220,30 @@ def primary_summarize(
 
     Returns:
         `{topic_id: primary theme string}`, one entry per key of `criteria_by_topic`.
+
+    Raises:
+        ValueError: If a response isn't a JSON array, is empty, or its first
+            object has no usable `label` field.
     """
     primary_labels: dict[int, str] = {}
     for topic_id, criteria in criteria_by_topic.items():
-        user_content = _build_primary_user_content(criteria, guide_labels)
-        primary_labels[topic_id] = _call_llm(client, model, system_prompt, user_content)
+        user_content = _build_primary_user_content(topic_id, criteria, guide_labels)
+        response_text = _call_llm(client, model, system_prompt, user_content)
+        parsed = _parse_json_array(response_text)
+        if not parsed:
+            raise ValueError(f"primary_summarize: empty JSON array response for topic_id={topic_id}")
+        entry = parsed[0]
+        label = entry.get("label")
+        if not label:
+            raise ValueError(f"primary_summarize: response entry missing 'label' for topic_id={topic_id}: {entry!r}")
+        returned_id = entry.get("cluster_id")
+        if returned_id is not None and int(returned_id) != topic_id:
+            logger.warning(
+                "primary_summarize: response cluster_id=%r does not match requested topic_id=%d; "
+                "using the label anyway, keyed to the requested topic_id",
+                returned_id, topic_id,
+            )
+        primary_labels[topic_id] = str(label).strip()
     return primary_labels
 
 
@@ -176,42 +251,56 @@ def _build_secondary_user_content(primary_labels: dict[int, str], guide_labels: 
     """Assemble the single secondary-summarization user-turn content covering every cluster at once."""
     guide_block = ", ".join(guide_labels)
     ordered_ids = sorted(primary_labels)
-    themes_block = "\n".join(f"{topic_id}: {primary_labels[topic_id]}" for topic_id in ordered_ids)
+    themes_block = "\n".join(
+        f'{{"cluster_id": {topic_id}, "old_label": "{primary_labels[topic_id]}"}}' for topic_id in ordered_ids
+    )
     return (
         f"Reference labels (optional guidance, not a strict list): {guide_block}\n\n"
-        f"Primary per-cluster themes (format '<topic_id>: <theme>'):\n{themes_block}\n\n"
-        "For EACH line above, output one line in the exact format '<topic_id>: <final label>', "
-        "where <final label> is 5 words or fewer, semantically distinct from every other cluster's "
-        "final label, and clearly related to that cluster's own primary theme. Output exactly one "
-        "line per cluster listed above, in the same order, with no extra commentary."
+        f"Primary per-cluster labels:\n{themes_block}\n\n"
+        'Respond with ONLY a JSON array containing one object per cluster above, each formatted as '
+        '{"cluster_id": <id>, "old_label": "<the label above>", "new_label": "<revised label, 5 words '
+        'or fewer, semantically distinct from every other cluster\'s new_label>"}. Include every '
+        "cluster_id listed above exactly once. No commentary, no markdown code fences."
     )
 
 
 def _parse_secondary_response(text: str, expected_ids: list[int]) -> dict[int, str]:
-    """Parse `'<topic_id>: <label>'` lines; silently skip anything unparseable or unexpected.
+    """Parse the secondary-summarization JSON array response into `{topic_id: new_label}`.
+
+    Never raises -- an unparseable response (or one missing/malformed
+    entries) degrades to fewer results rather than failing, since callers
+    fill any gap from `primary_labels`.
 
     Args:
-        text: The secondary-summarization call's raw text response.
+        text: The secondary-summarization call's raw text response -- a
+            JSON array of `{"cluster_id", "old_label", "new_label"}` objects
+            (see `config/llm_prompts/secondary_summary_prompt.txt`).
         expected_ids: The topic ids that were actually sent to this call.
 
     Returns:
-        `{topic_id: final label}` for every line that parsed to one of `expected_ids`.
-        May have fewer entries than `expected_ids` if the model dropped or
-        malformed a line -- callers fill the gap from `primary_labels`.
+        `{topic_id: new_label}` for every entry that parsed to one of
+        `expected_ids` and had a usable `new_label`. May have fewer entries
+        than `expected_ids` if the model dropped or malformed an entry --
+        callers fill the gap from `primary_labels`.
     """
+    try:
+        entries = _parse_json_array(text)
+    except ValueError:
+        logger.warning("_parse_secondary_response: could not parse a JSON array from the response: %r", text)
+        return {}
+
     expected = set(expected_ids)
     parsed: dict[int, str] = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or ":" not in line:
+    for entry in entries:
+        new_label = entry.get("new_label")
+        if not new_label:
             continue
-        prefix, _, rest = line.partition(":")
         try:
-            topic_id = int(prefix.strip())
-        except ValueError:
+            topic_id = int(entry.get("cluster_id"))
+        except (TypeError, ValueError):
             continue
         if topic_id in expected:
-            parsed[topic_id] = rest.strip()
+            parsed[topic_id] = str(new_label).strip()
     return parsed
 
 
@@ -236,7 +325,7 @@ def secondary_summarize(
     if not primary_labels:
         return {}
     user_content = _build_secondary_user_content(primary_labels, guide_labels)
-    response_text = _call_llm(client, model, system_prompt, user_content)
+    response_text = _call_llm(client, model, system_prompt, user_content, max_tokens=SECONDARY_MAX_OUTPUT_TOKENS)
     parsed = _parse_secondary_response(response_text, list(primary_labels))
 
     missing = set(primary_labels) - set(parsed)
