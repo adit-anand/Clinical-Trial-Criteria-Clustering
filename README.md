@@ -217,6 +217,13 @@ also set:
 HF_TOKEN=your-token-here
 ```
 
+Steps 4-5's winning-trial LLM relabeling (see below) requires an Anthropic
+API key:
+
+```
+ANTHROPIC_API_KEY=your-key-here
+```
+
 ## 1. Fetching eligibility criteria
 
 ```bash
@@ -359,8 +366,28 @@ against `--candidate-labels` via a zero-shot-classification pipeline
 (`--zeroshot-model`; a topic falls back to its raw keywords if no candidate
 label scores confidently enough). BERTopic's own resulting cluster
 assignments for that trial — not the earlier plain-HDBSCAN fit — are what
-every trial's quality metrics and Optuna objective score are computed from,
-and what the winning trial's output reports.
+every trial's quality metrics and Optuna objective score are computed from.
+This zero-shot-classification step runs identically for every trial,
+including re-evaluations of the eventual winner, and is what every quality
+metric (`relative_validity_index`/`bertopic_quality_metrics`, including
+`zeroshot_label_confidence_rate`) and the Optuna objective are scored from —
+nothing below changes any of that.
+
+Once the winning trial is already selected and scored, its topic *labels*
+only (not its cluster assignments, not its keywords) are overwritten by a
+second, two-stage Anthropic-LLM pass: **primary summarization** sends each
+cluster's own top-50 eligibility criteria (by `cluster_probability`,
+descending) to `--llm-model`, asking for a single overarching theme of 5
+words or fewer; **secondary summarization** then sends every cluster's
+primary theme together in one call, asking for final labels that are
+semantically distinct from each other (also 5 words or fewer) — distinctness
+can only be judged across clusters at once, so this stage is never split
+per-cluster. `--candidate-labels` is reused as soft guidance for both LLM
+calls. `--primary-summary-prompt-path`/`--secondary-summary-prompt-path`
+point at the system prompt used for each stage (defaults under
+`config/llm_prompts/`). If this pass fails for any reason, the run falls
+back to the zero-shot label rather than aborting. This is what the winning
+trial's output (below) actually reports.
 
 Within one trial, two things happen nested:
 
@@ -401,23 +428,26 @@ cluster-assignments Parquet file contains `nct_id`,
 `study_first_posted_date`, `criterion_text`, `criterion_type`, `cluster_id`
 (`-1` for BERTopic's own outlier/noise topic), `cluster_probability` (`0.0`
 for noise points), `embedding_backend`, `embedding_model`, `clustered_at`,
-`topic_keywords` (BERTopic's own per-topic keywords), and `topic_label`
-(the zero-shot-assigned candidate label, or a keyword-derived fallback) —
-every row sharing a `cluster_id` carries that cluster's own topic
-representation, including noise rows. The metrics JSON reports run
-provenance (sample/cluster counts, `noise_count`/`noise_fraction`) plus
-clustering performance metrics computed from BERTopic's own cluster
-assignments — silhouette score, the Davies-Bouldin index, the
-Calinski-Harabasz index (computed only over non-noise points),
-`relative_validity_index` (DBCV), `winning_umap_config`, `winning_seed`,
-`winning_seed_noise_fraction_std`, `dr_metrics`
+`topic_keywords` (BERTopic's own per-topic keywords, unaffected by LLM
+relabeling), and `topic_label` (the LLM-relabeled theme for the winning
+trial — see above; noise rows keep their original zero-shot-derived label,
+since noise is never sent to the LLM) — every row sharing a `cluster_id`
+carries that cluster's own topic representation, including noise rows. The
+metrics JSON reports run provenance (sample/cluster counts,
+`noise_count`/`noise_fraction`) plus clustering performance metrics
+computed from BERTopic's own cluster assignments — silhouette score, the
+Davies-Bouldin index, the Calinski-Harabasz index (computed only over
+non-noise points), `relative_validity_index` (DBCV), `winning_umap_config`,
+`winning_seed`, `winning_seed_noise_fraction_std`, `dr_metrics`
 (trustworthiness/continuity/steadiness/cohesiveness for the winning trial's
 UMAP output), `topics` (one entry per cluster/topic id, each with its
-keywords, assigned label, and member count), `candidate_labels`/
-`zeroshot_model` (what the zero-shot layer was configured with), and
-`optuna_study_summary`/`objective_weights` (trial counts by status, the
-winning trial number/score, the study/trial-history file paths, and the
-weights actually used).
+keywords, LLM-relabeled label, and member count), `candidate_labels`/
+`zeroshot_model` (what the per-trial zero-shot layer was configured with —
+`candidate_labels` also doubles as the LLM relabeling pass's guidance
+list), `llm_relabeling` (the `--llm-model`/prompt-path values that pass was
+configured with), and `optuna_study_summary`/`objective_weights` (trial
+counts by status, the winning trial number/score, the study/trial-history
+file paths, and the weights actually used).
 
 A trial is only considered fully valid if its resulting cluster count
 falls between `HDBSCANClusterer.MIN_N_CLUSTERS` (`10`) and `MAX_N_CLUSTERS`
@@ -451,8 +481,11 @@ error before any trial runs.
 | `--assignments-output-path`          | yes      | Output cluster-assignments Parquet path. |
 | `--metrics-output-path`              | yes      | Output metrics JSON path. |
 | `--config-path`                      | no       | Optuna search config YAML (combined UMAP + HDBSCAN search space, objective weights, trial budget, reproducibility seeds/repeats); default: `config/umap_hdbscan_optuna.yaml`. |
-| `--candidate-labels`                 | yes      | Comma-separated candidate topic labels for BERTopic's zero-shot classification layer, e.g. `"oncology eligibility,treatment history,disease measurement"`. |
-| `--zeroshot-model`                   | no       | HuggingFace zero-shot-classification model id for that same layer (default: `facebook/bart-large-mnli`). |
+| `--candidate-labels`                 | yes      | Comma-separated candidate topic labels. Drives every trial's BERTopic zero-shot classification layer, and is reused as soft guidance for the winning trial's LLM relabeling, e.g. `"oncology eligibility,treatment history,disease measurement"`. |
+| `--zeroshot-model`                   | no       | HuggingFace zero-shot-classification model id for the per-trial layer (default: `facebook/bart-large-mnli`). |
+| `--llm-model`                        | no       | Anthropic model id for the winning trial's two-stage LLM relabeling pass (default: `claude-haiku-5-5`); requires `ANTHROPIC_API_KEY` in `.env`. |
+| `--primary-summary-prompt-path`      | no       | Text file with the primary-summarization system prompt (default: `config/llm_prompts/primary_summary_prompt.txt`). |
+| `--secondary-summary-prompt-path`    | no       | Text file with the secondary-summarization system prompt (default: `config/llm_prompts/secondary_summary_prompt.txt`). |
 | `--log-file`                         | no       | If given, also append logs to this file, in addition to the console. |
 
 ## 5. PaCMAP + HDBSCAN + BERTopic clustering
@@ -502,8 +535,11 @@ identical to step 4's.
 | `--assignments-output-path`          | yes      | Output cluster-assignments Parquet path. |
 | `--metrics-output-path`              | yes      | Output metrics JSON path. |
 | `--config-path`                      | no       | Optuna search config YAML (combined PaCMAP + HDBSCAN search space, objective weights, trial budget, reproducibility seeds/repeats); default: `config/pacmap_hdbscan_optuna.yaml`. |
-| `--candidate-labels`                 | yes      | Comma-separated candidate topic labels for BERTopic's zero-shot classification layer, e.g. `"oncology eligibility,treatment history,disease measurement"`. |
-| `--zeroshot-model`                   | no       | HuggingFace zero-shot-classification model id for that same layer (default: `facebook/bart-large-mnli`). |
+| `--candidate-labels`                 | yes      | Comma-separated candidate topic labels. Drives every trial's BERTopic zero-shot classification layer, and is reused as soft guidance for the winning trial's LLM relabeling, e.g. `"oncology eligibility,treatment history,disease measurement"`. |
+| `--zeroshot-model`                   | no       | HuggingFace zero-shot-classification model id for the per-trial layer (default: `facebook/bart-large-mnli`). |
+| `--llm-model`                        | no       | Anthropic model id for the winning trial's two-stage LLM relabeling pass (default: `claude-haiku-5-5`); requires `ANTHROPIC_API_KEY` in `.env`. |
+| `--primary-summary-prompt-path`      | no       | Text file with the primary-summarization system prompt (default: `config/llm_prompts/primary_summary_prompt.txt`). |
+| `--secondary-summary-prompt-path`    | no       | Text file with the secondary-summarization system prompt (default: `config/llm_prompts/secondary_summary_prompt.txt`). |
 | `--log-file`                         | no       | If given, also append logs to this file, in addition to the console. |
 
 ## 6. Scatterplot visualization

@@ -23,9 +23,13 @@ module reports always matches `get_topic_info()`'s own `Topic` column.
 
 import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 from sklearn.cluster import HDBSCAN
+
+if TYPE_CHECKING:
+    from transformers.pipelines.base import Pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -201,7 +205,7 @@ def fit_bertopic_topics(
     reduced_matrix: np.ndarray,
     hdbscan_estimator: HDBSCAN,
     candidate_labels: list[str],
-    zeroshot_model: str,
+    zeroshot_model: "str | Pipeline",
 ) -> BERTopicFitResult:
     """Fit BERTopic once over an already-reduced embedding matrix, reusing a preconfigured HDBSCAN estimator.
 
@@ -217,9 +221,14 @@ def fit_bertopic_topics(
         candidate_labels: The caller-supplied candidate topic labels (see
             `parse_candidate_labels`) `ZeroShotClassification` scores each
             topic against.
-        zeroshot_model: The HuggingFace zero-shot-classification model id or
-            an already-initialized `transformers` pipeline to pass to
-            `ZeroShotClassification`.
+        zeroshot_model: Either the HuggingFace zero-shot-classification
+            model id (`ZeroShotClassification` builds -- and reloads -- a
+            fresh `transformers` pipeline from it every call) or an
+            already-initialized `transformers` pipeline to reuse as-is.
+            Callers fitting this repeatedly in a loop (e.g. once per Optuna
+            trial) should build the pipeline once and pass it here on every
+            call, rather than passing the bare model id and re-paying the
+            weight-loading cost each time.
 
     Returns:
         A `BERTopicFitResult`.
