@@ -30,6 +30,13 @@ from sklearn.cluster import HDBSCAN
 logger = logging.getLogger(__name__)
 
 DEFAULT_ZEROSHOT_MODEL = "facebook/bart-large-mnli"
+# `KeyBERTInspired` (unlike `ZeroShotClassification`) re-embeds representative
+# documents to score candidate keywords by similarity, so it needs
+# `BERTopic`'s own `embedding_model` set -- reusing this project's own
+# criteria-text embedding model (see `embedding_model.BertEmbeddingModel`)
+# keeps that scoring domain-aligned with clinical eligibility criteria text,
+# rather than introducing an unrelated generic default.
+DEFAULT_KEYBERT_EMBEDDING_MODEL = "NeuML/pubmedbert-base-embeddings"
 
 
 def parse_candidate_labels(raw: str) -> list[str]:
@@ -139,6 +146,56 @@ def same_partition(expected: np.ndarray, actual: np.ndarray) -> bool:
     return True
 
 
+def _extract_topic_representations(topic_model) -> list[TopicRepresentation]:
+    """Build one `TopicRepresentation` per row of a fitted `topic_model.get_topic_info()`.
+
+    Args:
+        topic_model: A fitted `bertopic.BERTopic` instance.
+
+    Returns:
+        One `TopicRepresentation` per distinct topic id present in `get_topic_info()`.
+    """
+    topic_info = topic_model.get_topic_info()
+    topic_representations = []
+    for row in topic_info.itertuples(index=False):
+        keywords = [word for word in row.Representation if word]
+        label = " ".join(keywords) if keywords else ""
+        topic_representations.append(
+            TopicRepresentation(topic_id=int(row.Topic), keywords=keywords, label=label, count=int(row.Count))
+        )
+    return topic_representations
+
+
+def extract_topic_embeddings(topic_model) -> dict[int, np.ndarray]:
+    """Reconstruct a fitted `topic_model`'s `topic_id -> centroid embedding` dict.
+
+    `topic_embeddings_`'s row order is never trusted positionally (see
+    `BERTopicFitResult.topic_embeddings`'s docstring) -- reconstruct the
+    id-to-row correspondence from `topic_sizes_`, the same topic-id
+    universe `topic_embeddings_` was itself built from (both ultimately
+    derive from the same fitted `documents` frame's `Topic` column), and
+    fail loudly rather than silently misalign if the two ever disagree.
+
+    Args:
+        topic_model: A fitted `bertopic.BERTopic` instance.
+
+    Returns:
+        A dict keyed by `topic_id` (including `-1`).
+
+    Raises:
+        RuntimeError: If `topic_embeddings_`'s row count doesn't match the
+            number of topic ids in `topic_sizes_`.
+    """
+    topic_ids_in_order = sorted(topic_model.topic_sizes_.keys())
+    raw_topic_embeddings = np.asarray(topic_model.topic_embeddings_)
+    if raw_topic_embeddings.shape[0] != len(topic_ids_in_order):
+        raise RuntimeError(
+            f"extract_topic_embeddings: topic_embeddings_ has {raw_topic_embeddings.shape[0]} row(s) but "
+            f"{len(topic_ids_in_order)} topic id(s) are present in topic_sizes_; cannot safely align"
+        )
+    return {tid: raw_topic_embeddings[i] for i, tid in enumerate(topic_ids_in_order)}
+
+
 def fit_bertopic_topics(
     criterion_texts: list[str],
     reduced_matrix: np.ndarray,
@@ -187,29 +244,76 @@ def fit_bertopic_topics(
     labels = np.asarray(topics)
     probabilities = np.asarray(probs)
 
-    topic_info = topic_model.get_topic_info()
-    topic_representations = []
-    for row in topic_info.itertuples(index=False):
-        keywords = [word for word in row.Representation if word]
-        label = " ".join(keywords) if keywords else ""
-        topic_representations.append(
-            TopicRepresentation(topic_id=int(row.Topic), keywords=keywords, label=label, count=int(row.Count))
-        )
+    topic_representations = _extract_topic_representations(topic_model)
+    topic_embeddings = extract_topic_embeddings(topic_model)
 
-    # `topic_embeddings_`'s row order is never trusted positionally (see
-    # `BERTopicFitResult.topic_embeddings`'s docstring) -- reconstruct the
-    # id-to-row correspondence from `topic_sizes_`, the same topic-id
-    # universe `topic_embeddings_` was itself built from (both ultimately
-    # derive from the same fitted `documents` frame's `Topic` column), and
-    # fail loudly rather than silently misalign if the two ever disagree.
-    topic_ids_in_order = sorted(topic_model.topic_sizes_.keys())
-    raw_topic_embeddings = np.asarray(topic_model.topic_embeddings_)
-    if raw_topic_embeddings.shape[0] != len(topic_ids_in_order):
-        raise RuntimeError(
-            f"fit_bertopic_topics: topic_embeddings_ has {raw_topic_embeddings.shape[0]} row(s) but "
-            f"{len(topic_ids_in_order)} topic id(s) are present in topic_sizes_; cannot safely align"
-        )
-    topic_embeddings = {tid: raw_topic_embeddings[i] for i, tid in enumerate(topic_ids_in_order)}
+    return BERTopicFitResult(
+        labels=labels, probabilities=probabilities, topics=topic_representations, topic_embeddings=topic_embeddings
+    )
+
+
+def fit_bertopic_topics_keybert(
+    criterion_texts: list[str],
+    reduced_matrix: np.ndarray,
+    hdbscan_estimator: HDBSCAN,
+) -> BERTopicFitResult:
+    """Fit BERTopic, then recompute its topic representations via `update_topics()` with KeyBERTInspired.
+
+    Produces a second, directly comparable topic-representation result for
+    the same partition `fit_bertopic_topics` would produce given the same
+    `reduced_matrix`/`hdbscan_estimator` hyperparameters (BERTopic/HDBSCAN's
+    own refit is deterministic given identical inputs). The initial fit's
+    own representation is discarded immediately -- `update_topics()` is
+    called on that same fitted model before any topic is ever extracted, so
+    only the `KeyBERTInspired` + stop-word-filtered representation is ever
+    read out.
+
+    Unlike `ZeroShotClassification`, `KeyBERTInspired` re-embeds
+    representative documents to score candidate keywords by similarity, so
+    the fitted model is given `DEFAULT_KEYBERT_EMBEDDING_MODEL` as its own
+    `embedding_model` (`fit_bertopic_topics` never needs this, since
+    `ZeroShotClassification` doesn't re-embed anything).
+
+    Args:
+        criterion_texts: One document string per row of `reduced_matrix`
+            (same documents `fit_bertopic_topics` would be given for the
+            same trial).
+        reduced_matrix: The reducer's already-reduced output for the
+            partition being compared against — never re-reduced by BERTopic.
+        hdbscan_estimator: An *unfit* estimator built from the same
+            hyperparameters as the partition being compared against (see
+            `HDBSCANClusterer.build_estimator`). BERTopic fits this object
+            internally.
+
+    Returns:
+        A `BERTopicFitResult` whose `topics`/`topic_embeddings` come from
+        the `KeyBERTInspired` representation model over an English-stop-word-
+        filtered vocabulary.
+    """
+    from bertopic import BERTopic
+    from bertopic.dimensionality import BaseDimensionalityReduction
+    from bertopic.representation import KeyBERTInspired
+    from sklearn.feature_extraction.text import CountVectorizer
+
+    umap_model = BaseDimensionalityReduction()
+    topic_model = BERTopic(
+        umap_model=umap_model,
+        hdbscan_model=hdbscan_estimator,
+        embedding_model=DEFAULT_KEYBERT_EMBEDDING_MODEL,
+        calculate_probabilities=False,
+    )
+    topics, probs = topic_model.fit_transform(criterion_texts, embeddings=reduced_matrix)
+    labels = np.asarray(topics)
+    probabilities = np.asarray(probs)
+
+    topic_model.update_topics(
+        criterion_texts,
+        vectorizer_model=CountVectorizer(stop_words="english"),
+        representation_model=KeyBERTInspired(),
+    )
+
+    topic_representations = _extract_topic_representations(topic_model)
+    topic_embeddings = extract_topic_embeddings(topic_model)
 
     return BERTopicFitResult(
         labels=labels, probabilities=probabilities, topics=topic_representations, topic_embeddings=topic_embeddings

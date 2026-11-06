@@ -234,6 +234,120 @@ def build_metrics_dict(
     }
 
 
+def build_keybert_metrics_dict(
+    plugin: ReducerPlugin,
+    label: str,
+    criterion_type: str,
+    input_path: Path,
+    reduced_embeddings_output_path: Path,
+    assignments_output_path: Path,
+    n_samples: int,
+    n_samples_excluded: int,
+    embedding_dim: int,
+    embedding_backend: str | None,
+    embedding_model: str | None,
+    candidate: reduction_sweep.ReducerConfigCandidate,
+    metrics_result: dict,
+    relative_validity: float | None,
+    keybert_result: bertopic_model.BERTopicFitResult,
+    zeroshot_labels: np.ndarray,
+    zeroshot_metrics_output_path: Path,
+    seeds: list[int],
+    repeats_per_seed: int,
+    fixed_metric: str,
+    clustered_at: datetime,
+) -> dict:
+    """Assemble the second (`KeyBERTInspired`-representation) metrics JSON payload for the winning trial.
+
+    A sibling of `build_metrics_dict` for the same winning trial's partition,
+    describing the alternate `KeyBERTInspired` + English-stop-word-filtered
+    topic representation produced by `bertopic_model.fit_bertopic_topics_keybert`
+    instead of the zero-shot one. `metrics_result`/`relative_validity`/
+    `candidate` are the *zero-shot winner's* own already-computed values,
+    reused verbatim rather than recomputed from `keybert_result.labels` --
+    both results share one partition, so every clustering-quality number
+    here is representation-independent and must stay numerically identical
+    to `build_metrics_dict`'s own.
+
+    Args:
+        plugin: This reducer's `ReducerPlugin`.
+        label: Human-readable label for this run, derived from `input_path`'s filename.
+        criterion_type: Which side of the inclusion/exclusion split this run covers.
+        input_path: The embeddings Parquet path that was read.
+        reduced_embeddings_output_path: Where the reduced embeddings were written.
+        assignments_output_path: Where cluster assignments were written (the
+            same assignments Parquet `build_metrics_dict` points to -- this
+            representation never gets its own).
+        n_samples: Number of successfully-embedded rows reduced/clustered.
+        n_samples_excluded: Number of input rows dropped for having failed embeddings.
+        embedding_dim: Original (non-reduced) embedding dimensionality.
+        embedding_backend: Backend recorded on the clustered rows.
+        embedding_model: Model recorded on the clustered rows.
+        candidate: The winning trial's `ReducerConfigCandidate`.
+        metrics_result: The winning trial's own `HDBSCANClusterer.compute_metrics`
+            return value (computed from the zero-shot `bertopic_result.labels`,
+            reused here since both representations share the same labels).
+        relative_validity: The winning trial's own DBCV score.
+        keybert_result: The `KeyBERTInspired`-representation `BERTopicFitResult`
+            for this same winning trial.
+        zeroshot_labels: The zero-shot winner's own `bertopic_result.labels`,
+            used (instead of `keybert_result.labels`) to compute `cluster_sizes`
+            so this file's `cluster_sizes` is always copied verbatim from the
+            zero-shot winner, never independently recomputed from the
+            `KeyBERTInspired` fit's own labels -- see this function's docstring.
+        zeroshot_metrics_output_path: Where the primary (zero-shot) metrics
+            JSON was written, recorded here so this file can locate it.
+        seeds: The configured reproducibility seed list.
+        repeats_per_seed: Number of repeats run per seed.
+        fixed_metric: This reducer's fixed distance metric value.
+        clustered_at: Wall-clock time this run completed.
+
+    Returns:
+        A JSON-serializable dict.
+    """
+    base = clustering_io.build_base_metrics_dict(
+        label=label,
+        criterion_type=criterion_type,
+        input_path=input_path,
+        assignments_output_path=assignments_output_path,
+        n_samples=n_samples,
+        n_samples_excluded=n_samples_excluded,
+        embedding_dim=embedding_dim,
+        embedding_backend=embedding_backend,
+        embedding_model=embedding_model,
+        cluster_sizes=clustering_io.compute_cluster_sizes(zeroshot_labels),
+        clustered_at=clustered_at,
+    )
+    return {
+        **base,
+        "reduced_embeddings_output_path": clustering_io.relative_to_repo_root(reduced_embeddings_output_path),
+        "n_clusters_actual": metrics_result["n_clusters_actual"],
+        "noise_count": metrics_result["noise_count"],
+        "noise_fraction": metrics_result["noise_fraction"],
+        "metrics": metrics_result["metrics"],
+        "metrics_valid": metrics_result["metrics_valid"],
+        "relative_validity_index": relative_validity,
+        "notes": metrics_result["notes"]
+        + candidate.notes
+        + ["zeroshot_label_confidence_rate (under bertopic_quality_metrics) does not apply to this representation"],
+        "topics": [
+            {"topic_id": topic.topic_id, "keywords": topic.keywords, "label": topic.label, "count": topic.count}
+            for topic in keybert_result.topics
+        ],
+        "representation_model": "KeyBERTInspired",
+        "vectorizer_stop_words": "english",
+        "zeroshot_representation_metrics_output_path": clustering_io.relative_to_repo_root(
+            zeroshot_metrics_output_path
+        ),
+        plugin.winning_config_field: {k: v for k, v in candidate.hyperparams.items() if k not in HDBSCAN_PARAM_NAMES},
+        "winning_seed": candidate.winning_seed.seed,
+        "winning_seed_noise_fraction_std": candidate.winning_seed.noise_fraction_std,
+        plugin.fixed_metric_field: fixed_metric,
+        "reproducibility_seeds": seeds,
+        "reproducibility_repeats_per_seed": repeats_per_seed,
+    }
+
+
 def run(
     plugin: ReducerPlugin,
     input_path: Path,
@@ -244,7 +358,7 @@ def run(
     config_path: Path,
     candidate_labels: list[str],
     zeroshot_model: str,
-) -> tuple[Path, Path, Path] | None:
+) -> tuple[Path, Path, Path, Path] | None:
     """Run the full read-filter-search-write pipeline for one reducer.
 
     Args:
@@ -277,10 +391,14 @@ def run(
 
     Returns:
         `(reduced_embeddings_output_path, assignments_output_path,
-        metrics_output_path)` — the actual paths written, i.e. each
-        argument of the same name with `criterion_type` already inserted
-        as a subdirectory — or `None` if every trial in the study was
-        invalid (nothing ever fit — nothing is written in that case).
+        metrics_output_path, keybert_metrics_output_path)` — the actual
+        paths written, i.e. each `*_output_path` argument of the same name
+        with `criterion_type` already inserted as a subdirectory, plus the
+        sibling path the second (`KeyBERTInspired`-representation) metrics
+        JSON was written to (or was meant to be written to, if that pass
+        itself failed -- see this function's body) — or `None` if every
+        trial in the study was invalid (nothing ever fit — nothing is
+        written in that case).
 
     Raises:
         FileNotFoundError: If the input Parquet or `config_path` does not exist.
@@ -506,6 +624,32 @@ def run(
     )
     clustering_io.write_parquet(assignment_rows, HDBSCAN_CLUSTER_PARQUET_SCHEMA, assignments_output_path)
 
+    # A second, directly comparable topic-representation result for this same
+    # winning partition -- `KeyBERTInspired` + an English-stop-word-filtered
+    # vocabulary, via `update_topics()`, instead of `ZeroShotClassification`.
+    # Never affects scoring/the Optuna objective (this runs exactly once, for
+    # the already-finalized winner) and never changes `labels`/`probabilities`
+    # -- only a second metrics JSON is written; the assignments Parquet above
+    # is shared by both representations.
+    keybert_metrics_output_path = metrics_output_path.with_stem(metrics_output_path.stem + "_keybert_representation")
+    try:
+        keybert_result = bertopic_model.fit_bertopic_topics_keybert(
+            criterion_texts, representative.reduced_matrix, hdbscan_clusterer.build_estimator()
+        )
+    except Exception:
+        logger.exception(
+            "run: KeyBERTInspired representation pass failed for %r; writing only the primary metrics file", label
+        )
+        keybert_result = None
+    else:
+        if not bertopic_model.same_partition(bertopic_result.labels, keybert_result.labels):
+            logger.warning(
+                "run: KeyBERTInspired representation pass's own BERTopic/HDBSCAN refit disagrees with the "
+                "winning trial's zero-shot partition for %r (expected a relabeling of the same partition) -- "
+                "writing it anyway, with shared fields copied from the zero-shot winner regardless",
+                label,
+            )
+
     embedding_backend = filtered.column("embedding_backend")[0].as_py()
     embedding_model = filtered.column("embedding_model")[0].as_py()
     metrics_dict = build_metrics_dict(
@@ -547,7 +691,44 @@ def run(
         "best_score": best_trial.value,
     }
     metrics_dict["objective_weights"] = asdict(config.objective_weights)
+    if keybert_result is not None:
+        metrics_dict["keybert_representation_metrics_output_path"] = clustering_io.relative_to_repo_root(
+            keybert_metrics_output_path
+        )
     clustering_io.write_json(metrics_dict, metrics_output_path)
+
+    if keybert_result is not None:
+        keybert_metrics_dict = build_keybert_metrics_dict(
+            plugin,
+            label=label,
+            criterion_type=criterion_type,
+            input_path=input_path,
+            reduced_embeddings_output_path=reduced_embeddings_output_path,
+            assignments_output_path=assignments_output_path,
+            n_samples=n_samples,
+            n_samples_excluded=n_excluded,
+            embedding_dim=embedding_dim,
+            embedding_backend=embedding_backend,
+            embedding_model=embedding_model,
+            candidate=candidate,
+            metrics_result=winner["metrics_result"],
+            relative_validity=winner["relative_validity"],
+            keybert_result=keybert_result,
+            zeroshot_labels=bertopic_result.labels,
+            zeroshot_metrics_output_path=metrics_output_path,
+            seeds=config.reproducibility.seeds,
+            repeats_per_seed=config.reproducibility.repeats_per_seed,
+            fixed_metric=fixed_metric,
+            clustered_at=clustered_at,
+        )
+        keybert_quality = optuna_search.compute_bertopic_quality_metrics(keybert_result, document_term_index)
+        keybert_metrics_dict["dr_metrics"] = asdict(dr_metrics) if dr_metrics is not None else None
+        keybert_metrics_dict["bertopic_quality_metrics"] = (
+            asdict(keybert_quality) if keybert_quality is not None else None
+        )
+        keybert_metrics_dict["optuna_study_summary"] = metrics_dict["optuna_study_summary"]
+        keybert_metrics_dict["objective_weights"] = asdict(config.objective_weights)
+        clustering_io.write_json(keybert_metrics_dict, keybert_metrics_output_path)
 
     logger.info(
         "run: best trial #%d %s config %s (seed=%d) clustered %d row(s) into %d topic(s) for %r -> %s, %s, %s "
@@ -559,7 +740,7 @@ def run(
         winner["metrics_result"]["noise_fraction"] * 100, winner["metrics_result"]["metrics"]["silhouette_score"],
         n_excluded, status_counts["ok"], status_counts["degenerate"], status_counts["invalid"],
     )
-    return reduced_embeddings_output_path, assignments_output_path, metrics_output_path
+    return reduced_embeddings_output_path, assignments_output_path, metrics_output_path, keybert_metrics_output_path
 
 
 def build_arg_parser(description: str, default_config_path: Path) -> argparse.ArgumentParser:
