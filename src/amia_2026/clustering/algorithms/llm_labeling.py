@@ -129,6 +129,30 @@ def _call_llm(client, model: str, system_prompt: str, user_content: str, max_tok
     raise RuntimeError(f"_call_llm: giving up after {MAX_RETRIES} attempts") from last_exc
 
 
+def _extract_json_snippet(text: str) -> str | None:
+    """Best-effort extraction of a JSON array/object embedded in surrounding prose.
+
+    Both labelling prompts say "no commentary", but models sometimes answer
+    with a lead-in anyway (e.g. "Here's the array: [...]"), which breaks a
+    direct `json.loads` even though valid JSON is embedded in the text.
+    Tries the substring spanning the first `[` through the last `]` first
+    (every expected response shape is an array), then the first `{` through
+    the last `}`.
+
+    Args:
+        text: The raw (fence-stripped) LLM response text.
+
+    Returns:
+        The extracted substring, or `None` if neither bracket pair is found.
+    """
+    for open_char, close_char in (("[", "]"), ("{", "}")):
+        start = text.find(open_char)
+        end = text.rfind(close_char)
+        if start != -1 and end != -1 and end > start:
+            return text[start : end + 1]
+    return None
+
+
 def _parse_json_array(text: str) -> list[dict]:
     """Parse an LLM response expected to be a JSON array of objects, tolerating a wrapping code fence.
 
@@ -138,7 +162,10 @@ def _parse_json_array(text: str) -> list[dict]:
     one place that contract is actually enforced/parsed. A bare JSON object
     (no wrapping array) is also accepted and treated as a single-element
     array -- the primary call asks for exactly one object per response, and
-    models sometimes drop the wrapping array despite the instruction.
+    models sometimes drop the wrapping array despite the instruction. If the
+    response isn't directly parseable (e.g. a lead-in sentence before the
+    JSON), falls back to extracting a bracket-delimited snippet via
+    `_extract_json_snippet` before giving up.
 
     Args:
         text: The raw LLM response text.
@@ -147,7 +174,8 @@ def _parse_json_array(text: str) -> list[dict]:
         The parsed list of dicts.
 
     Raises:
-        ValueError: If `text` isn't parseable as a JSON array of objects (or a single object).
+        ValueError: If `text` isn't parseable as a JSON array of objects (or a single object),
+            even after attempting snippet extraction.
     """
     stripped = text.strip()
     if stripped.startswith("```"):
@@ -158,7 +186,13 @@ def _parse_json_array(text: str) -> list[dict]:
     try:
         parsed = json.loads(stripped)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"expected a JSON array response, got unparseable text: {text!r}") from exc
+        snippet = _extract_json_snippet(stripped)
+        if snippet is None:
+            raise ValueError(f"expected a JSON array response, got unparseable text: {text!r}") from exc
+        try:
+            parsed = json.loads(snippet)
+        except json.JSONDecodeError:
+            raise ValueError(f"expected a JSON array response, got unparseable text: {text!r}") from exc
     if isinstance(parsed, dict):
         parsed = [parsed]
     if not isinstance(parsed, list) or not all(isinstance(item, dict) for item in parsed):
@@ -216,6 +250,12 @@ def primary_summarize(
     of what `cluster_id` the model echoed back (mismatches are logged, not
     fatal -- we already know which call this response answers).
 
+    A single topic's call failing (LLM error, unparseable/empty response, no
+    usable `label`) is logged and that topic is skipped -- it is never fatal
+    to every other topic's already-successful call, so one bad response
+    doesn't force `relabel_topics_with_llm` to fall back to BERTopic/
+    zero-shot labels for the whole run.
+
     Args:
         client: An `anthropic.Anthropic` client.
         model: Anthropic model id.
@@ -224,30 +264,38 @@ def primary_summarize(
         guide_labels: The `--candidate-labels` list, passed through as soft guidance.
 
     Returns:
-        `{topic_id: primary theme string}`, one entry per key of `criteria_by_topic`.
-
-    Raises:
-        ValueError: If a response isn't a JSON array, is empty, or its first
-            object has no usable `label` field.
+        `{topic_id: primary theme string}` -- one entry per key of
+        `criteria_by_topic` that produced a usable label. May have fewer
+        entries than `criteria_by_topic` if some topics' calls failed;
+        callers (`relabel_topics_with_llm`) keep the original label for any
+        topic_id missing here.
     """
     primary_labels: dict[int, str] = {}
     for topic_id, criteria in criteria_by_topic.items():
         user_content = _build_primary_user_content(topic_id, criteria, guide_labels)
-        response_text = _call_llm(client, model, system_prompt, user_content)
-        parsed = _parse_json_array(response_text)
-        if not parsed:
-            raise ValueError(f"primary_summarize: empty JSON array response for topic_id={topic_id}")
-        entry = parsed[0]
-        label = entry.get("label")
-        if not label:
-            raise ValueError(f"primary_summarize: response entry missing 'label' for topic_id={topic_id}: {entry!r}")
-        returned_id = entry.get("cluster_id")
-        if returned_id is not None and int(returned_id) != topic_id:
-            logger.warning(
-                "primary_summarize: response cluster_id=%r does not match requested topic_id=%d; "
-                "using the label anyway, keyed to the requested topic_id",
-                returned_id, topic_id,
+        try:
+            response_text = _call_llm(client, model, system_prompt, user_content)
+            parsed = _parse_json_array(response_text)
+            if not parsed:
+                raise ValueError(f"empty JSON array response for topic_id={topic_id}")
+            entry = parsed[0]
+            label = entry.get("label")
+            if not label:
+                raise ValueError(f"response entry missing 'label' for topic_id={topic_id}: {entry!r}")
+            returned_id = entry.get("cluster_id")
+            if returned_id is not None and int(returned_id) != topic_id:
+                logger.warning(
+                    "primary_summarize: response cluster_id=%r does not match requested topic_id=%d; "
+                    "using the label anyway, keyed to the requested topic_id",
+                    returned_id, topic_id,
+                )
+        except Exception:
+            logger.exception(
+                "primary_summarize: failed to get a usable label for topic_id=%d; its existing label will "
+                "be kept instead",
+                topic_id,
             )
+            continue
         primary_labels[topic_id] = str(label).strip()
     return primary_labels
 
