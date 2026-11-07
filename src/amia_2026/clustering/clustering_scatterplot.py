@@ -303,26 +303,23 @@ def build_color_discrete_map(legend_order: list[str]) -> dict[str, str]:
     return color_map
 
 
-def render_scatterplot(frame: dict[str, list], label: str, method: str, seed: int, seed_explicit: bool) -> go.Figure:
+PLOT_TITLE = "Breast Cancer Trials' Eligibility Criteria Clusters"
+
+
+def render_scatterplot(frame: dict[str, list]) -> go.Figure:
     """Build the interactive Plotly scatterplot.
 
     Args:
         frame: As returned by `build_plot_frame`.
-        label: Human-readable label for the plot title, derived from the
-            cluster-assignments filename.
-        method: The clustering method key being visualized.
-        seed: The resolved seed.
-        seed_explicit: Whether `seed` was actually recorded by clustering
-            (`True`) or a fallback default (`False`) — reflected in the title.
 
     Returns:
         A `plotly.graph_objects.Figure` with cluster-colored points (pastel,
         colorblind-safe hues — see `PASTEL_COLORBLIND_PALETTE`), a legend
-        naming each cluster by its own topic label, and a criterion-text
-        hover tooltip.
+        naming each cluster by its own topic label, a criterion-text hover
+        tooltip, and a centered, fixed title (`PLOT_TITLE`). The x/y axes
+        carry no ticks, lines, or gridlines, since the UMAP projection's
+        coordinate scale has no intrinsic meaning.
     """
-    seed_note = f"seed={seed}" if seed_explicit else f"seed={seed} (fallback default; not recorded by clustering)"
-    title = f'"{label}" — {method} clusters (2D UMAP, {seed_note})'
     legend_order = resolve_legend_order(frame["cluster_label"])
     fig = px.scatter(
         frame,
@@ -332,9 +329,15 @@ def render_scatterplot(frame: dict[str, list], label: str, method: str, seed: in
         category_orders={"cluster_label": legend_order},
         color_discrete_map=build_color_discrete_map(legend_order),
         hover_data={"criterion_text": True, "nct_id": True, "x": False, "y": False},
-        title=title,
+        title=PLOT_TITLE,
         labels={"cluster_label": "Cluster"},
     )
+    fig.update_layout(title_x=0.5)
+    axis_style = dict(
+        showticklabels=False, ticks="", showline=False, showgrid=False, zeroline=False, title=None
+    )
+    fig.update_xaxes(**axis_style)
+    fig.update_yaxes(**axis_style)
     return fig
 
 
@@ -384,7 +387,7 @@ def run(
 
     points_2d = resolve_points(spec, assignments_table.num_rows, seed, embeddings_path=embeddings_path)
     frame = build_plot_frame(assignments_table, points_2d)
-    fig = render_scatterplot(frame, label, method, seed, seed_explicit)
+    fig = render_scatterplot(frame)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.write_html(output_path)
