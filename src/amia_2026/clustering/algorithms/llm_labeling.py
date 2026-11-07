@@ -135,7 +135,10 @@ def _parse_json_array(text: str) -> list[dict]:
     Both labelling prompts (`config/llm_prompts/primary_summary_prompt.txt`,
     `secondary_summary_prompt.txt`) now specify this exact shape -- "an
     array of dictionaries" -- as their own output format, so this is the
-    one place that contract is actually enforced/parsed.
+    one place that contract is actually enforced/parsed. A bare JSON object
+    (no wrapping array) is also accepted and treated as a single-element
+    array -- the primary call asks for exactly one object per response, and
+    models sometimes drop the wrapping array despite the instruction.
 
     Args:
         text: The raw LLM response text.
@@ -144,7 +147,7 @@ def _parse_json_array(text: str) -> list[dict]:
         The parsed list of dicts.
 
     Raises:
-        ValueError: If `text` isn't parseable as a JSON array of objects.
+        ValueError: If `text` isn't parseable as a JSON array of objects (or a single object).
     """
     stripped = text.strip()
     if stripped.startswith("```"):
@@ -156,6 +159,8 @@ def _parse_json_array(text: str) -> list[dict]:
         parsed = json.loads(stripped)
     except json.JSONDecodeError as exc:
         raise ValueError(f"expected a JSON array response, got unparseable text: {text!r}") from exc
+    if isinstance(parsed, dict):
+        parsed = [parsed]
     if not isinstance(parsed, list) or not all(isinstance(item, dict) for item in parsed):
         raise ValueError(f"expected a JSON array of objects, got: {parsed!r}")
     return parsed
