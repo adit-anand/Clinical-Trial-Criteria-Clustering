@@ -50,6 +50,7 @@ from typing import Callable, Literal
 
 import numpy as np
 
+from amia_2026.logging_utils import log_memory_usage
 from amia_2026.clustering.algorithms.hdbscan_model import HDBSCAN_PARAM_NAMES, HDBSCANClusterer, compute_relative_validity_index
 
 logger = logging.getLogger(__name__)
@@ -194,17 +195,39 @@ def evaluate_repeat(
     reducer_hyperparams = {key: value for key, value in hyperparams.items() if key not in HDBSCAN_PARAM_NAMES}
     try:
         reduced_matrix = fit_reduced(embedding_matrix, seed=seed, **reducer_hyperparams)
+    except MemoryError as exc:
+        # Caught separately from the generic case below so a memory
+        # exhaustion is loudly flagged (ERROR + a memory reading) rather than
+        # silently folded into "errored", which previously read identically
+        # to an ordinary bad-hyperparameter failure in logs/the audit trail.
+        logger.error("evaluate_repeat: reduction raised MemoryError (seed=%d, repeat=%d): %s", seed, repeat_index, exc)
+        log_memory_usage(logger, f"evaluate_repeat: after MemoryError during reduction (seed={seed})", level=logging.ERROR)
+        return RepeatResult(repeat_index=repeat_index, status="errored", detail=f"MEMORY ERROR during reduction: {exc}")
     except Exception as exc:  # noqa: BLE001 - a reducer-internal failure shouldn't abort the whole trial
         return RepeatResult(repeat_index=repeat_index, status="errored", detail=f"Reduction failed: {exc}")
 
     try:
         model = hdbscan_clusterer.fit_hdbscan(reduced_matrix)
+    except MemoryError as exc:
+        logger.error(
+            "evaluate_repeat: HDBSCAN fit raised MemoryError (seed=%d, repeat=%d): %s", seed, repeat_index, exc
+        )
+        log_memory_usage(logger, f"evaluate_repeat: after MemoryError during HDBSCAN fit (seed={seed})", level=logging.ERROR)
+        return RepeatResult(
+            repeat_index=repeat_index, status="errored", detail=f"MEMORY ERROR during HDBSCAN fit: {exc}"
+        )
     except Exception as exc:  # noqa: BLE001 - an HDBSCAN-internal failure shouldn't abort the whole trial
         return RepeatResult(repeat_index=repeat_index, status="errored", detail=f"HDBSCAN fit failed: {exc}")
 
     labels = model.labels_
     probabilities = model.probabilities_
     metrics_result = hdbscan_clusterer.compute_metrics(reduced_matrix, labels)
+
+    # Routine breadcrumb (not an error): if the OS kills this process outright
+    # (e.g. an OOM-killer SIGKILL, which raises no Python exception at all)
+    # during some later repeat, this is the most recent memory reading on
+    # record, narrowing down when the climb became fatal.
+    log_memory_usage(logger, f"evaluate_repeat: completed (seed={seed}, repeat={repeat_index})")
 
     if not metrics_result["metrics_valid"]:
         return RepeatResult(

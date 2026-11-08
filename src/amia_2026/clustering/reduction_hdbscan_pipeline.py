@@ -45,7 +45,7 @@ from typing import Callable
 import numpy as np
 import optuna
 
-from amia_2026.logging_utils import configure_logging
+from amia_2026.logging_utils import configure_logging, log_memory_usage
 from amia_2026.paths import label_from_slug, slug_from_filename
 from amia_2026.clustering.algorithms import bertopic_model
 from amia_2026.clustering.algorithms import llm_labeling
@@ -405,6 +405,7 @@ def run(
     from transformers import pipeline as build_hf_pipeline
 
     zeroshot_pipeline = build_hf_pipeline("zero-shot-classification", model=zeroshot_model)
+    log_memory_usage(logger, "run: loaded zero-shot-classification pipeline")
 
     reducer_space = {name: spec for name, spec in config.search_space.items() if name not in HDBSCAN_PARAM_NAMES}
     hdbscan_space = {name: spec for name, spec in config.search_space.items() if name in HDBSCAN_PARAM_NAMES}
@@ -469,9 +470,23 @@ def run(
                 candidate_labels,
                 zeroshot_pipeline,
             )
+        except MemoryError:
+            # Caught separately from the generic case below so a memory
+            # exhaustion here is loudly flagged (ERROR + a memory reading)
+            # rather than being indistinguishable, in logs, from an ordinary
+            # BERTopic fit failure for this hyperparameter combination.
+            logger.error("evaluate_trial: BERTopic fit raised MemoryError for hyperparams=%s", hyperparams)
+            log_memory_usage(logger, "evaluate_trial: after MemoryError during BERTopic fit", level=logging.ERROR)
+            return {"status": "invalid", "candidate": candidate, "hyperparams": hyperparams}
         except Exception:
             logger.exception("evaluate_trial: BERTopic fit failed for hyperparams=%s", hyperparams)
             return {"status": "invalid", "candidate": candidate, "hyperparams": hyperparams}
+
+        # Routine breadcrumb: BERTopic's zero-shot-classification fit is the
+        # other major memory consumer per trial (see the zero-shot pipeline
+        # note in `run`) -- if the process is killed outright right after
+        # this, this reading is the most recent one on record.
+        log_memory_usage(logger, "evaluate_trial: completed BERTopic fit")
 
         if not bertopic_model.same_partition(representative.labels, bertopic_result.labels):
             logger.warning(
@@ -543,6 +558,7 @@ def run(
         study.optimize(objective, n_trials=n_remaining)
     else:
         logger.info("run: study %r already has >= %d trial(s); skipping new trials", study_name, config.n_trials)
+    log_memory_usage(logger, "run: study.optimize finished")
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     trial_history_path = config.results_dir / f"{study_name}_optuna_trials_{timestamp}.csv"
@@ -599,6 +615,9 @@ def run(
             candidate_labels, llm_model, primary_summary_prompt_path, secondary_summary_prompt_path,
         )
         bertopic_result = replace(bertopic_result, topics=new_topics)
+    except MemoryError:
+        logger.error("run: LLM-based cluster relabeling raised MemoryError for %r; keeping zero-shot labels", label)
+        log_memory_usage(logger, "run: after MemoryError during LLM relabeling", level=logging.ERROR)
     except Exception:
         logger.exception("run: LLM-based cluster relabeling failed for %r; keeping zero-shot labels", label)
 
@@ -634,6 +653,13 @@ def run(
         keybert_result = bertopic_model.fit_bertopic_topics_keybert(
             criterion_texts, representative.reduced_matrix, hdbscan_clusterer.build_estimator()
         )
+    except MemoryError:
+        logger.error(
+            "run: KeyBERTInspired representation pass raised MemoryError for %r; writing only the primary "
+            "metrics file", label,
+        )
+        log_memory_usage(logger, "run: after MemoryError during KeyBERTInspired pass", level=logging.ERROR)
+        keybert_result = None
     except Exception:
         logger.exception(
             "run: KeyBERTInspired representation pass failed for %r; writing only the primary metrics file", label
@@ -837,7 +863,7 @@ def main(plugin: ReducerPlugin, description: str, default_config_path: Path) -> 
     configure_logging(args.log_file)
     candidate_labels = bertopic_model.parse_candidate_labels(args.candidate_labels)
 
-    run(
+    result = run(
         plugin,
         args.input_path,
         args.assignments_output_path,
@@ -849,3 +875,11 @@ def main(plugin: ReducerPlugin, description: str, default_config_path: Path) -> 
         args.primary_summary_prompt_path,
         args.secondary_summary_prompt_path,
     )
+    if result is None:
+        # `run` already logged why (see its own "writing nothing" warnings);
+        # surface that as a failed process exit rather than letting a run
+        # that wrote no output at all look like a clean success.
+        raise SystemExit(
+            f"{plugin.display_name} clustering run for {args.input_path} produced no valid trial; "
+            "no assignments/metrics were written (see the warning above for why)"
+        )

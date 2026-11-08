@@ -7,7 +7,30 @@ in one place.
 """
 
 import logging
+import resource
 from pathlib import Path
+
+
+def log_memory_usage(log: logging.Logger, context: str, level: int = logging.INFO) -> None:
+    """Log this process's peak resident-set size so far, tagged with `context`.
+
+    A process killed outright by the OS (e.g. the Linux OOM killer sending
+    SIGKILL during a large reducer/HDBSCAN/BERTopic fit) never raises a
+    Python exception, so the usual exception-logging path records nothing
+    about it. Calling this at memory-sensitive checkpoints leaves a trail of
+    readings in the log, so the most recent one before such a kill narrows
+    down where it happened. `ru_maxrss` is reported in kilobytes on Linux.
+
+    Args:
+        log: The caller's own logger.
+        context: Short label identifying the checkpoint (e.g. a function name
+            and what it just did/is about to do).
+        level: Logging level to log at; `logging.ERROR` when called right
+            after catching a `MemoryError`, `logging.INFO` for routine
+            breadcrumbs.
+    """
+    peak_rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    log.log(level, "%s: peak RSS so far = %.1f MB", context, peak_rss_kb / 1024)
 
 
 def configure_logging(log_file: Path | None = None) -> None:
