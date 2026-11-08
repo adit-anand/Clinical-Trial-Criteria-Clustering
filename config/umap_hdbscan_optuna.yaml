@@ -54,8 +54,8 @@ fixed:
 # Each trial fits this many seeds x repeats-per-seed before being scored,
 # picking the most reproducible seed (see reduction_sweep.py).
 reproducibility:
-  seeds: [1, 2, 3]
-  repeats_per_seed: 5
+  seeds: [1, 2]
+  repeats_per_seed: 3
 
 objective_weights:
   noise_penalty: 1.0

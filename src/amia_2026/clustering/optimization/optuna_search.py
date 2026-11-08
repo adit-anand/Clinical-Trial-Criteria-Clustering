@@ -942,8 +942,8 @@ def count_trial_statuses(study: "optuna.Study") -> dict[str, int]:
     Reads `status` from each trial's `user_attrs` (the caller's objective
     closure must call `trial.set_user_attr("status", ...)` before
     returning), so this reflects every trial across every resumed process
-    invocation — unlike an in-memory `trial_cache`, which only ever holds
-    the trials the *current* process itself just ran.
+    invocation, including trials run by earlier process invocations whose
+    own in-memory fit artifacts are long gone.
 
     Args:
         study: The study to summarize.

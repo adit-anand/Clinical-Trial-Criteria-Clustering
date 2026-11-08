@@ -45,7 +45,7 @@ before any study runs.
 
 import logging
 import statistics
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Literal
 
 import numpy as np
@@ -269,6 +269,19 @@ def evaluate_seed(
 
     mean_noise_fraction = statistics.fmean(noise_fractions)
     representative = min(usable, key=lambda r: abs(r.metrics_result["noise_fraction"] - mean_noise_fraction))
+
+    # Only the representative repeat's `reduced_matrix`/`labels`/`probabilities`
+    # are ever read again (via `representative_repeat`, once this seed's own
+    # reproducibility is resolved) -- every other "ok"/"degenerate" repeat
+    # would otherwise keep a full, unused copy of each alive for as long as
+    # this trial's `ReducerConfigCandidate` is alive (see `evaluate_config`
+    # and, further up the call chain, `reduction_hdbscan_pipeline.run`'s
+    # per-trial caching).
+    repeats = [
+        r if r.repeat_index == representative.repeat_index or r.status not in ("ok", "degenerate")
+        else replace(r, reduced_matrix=None, labels=None, probabilities=None)
+        for r in repeats
+    ]
 
     return SeedResult(
         seed=seed,

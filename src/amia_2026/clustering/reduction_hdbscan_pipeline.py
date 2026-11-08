@@ -420,17 +420,21 @@ def run(
         )
 
     def evaluate_trial(hyperparams: dict) -> dict:
-        """Evaluate one combined reducer+HDBSCAN hyperparameter combination into a trial-cache-shaped record.
+        """Evaluate one combined reducer+HDBSCAN hyperparameter combination into a result record.
 
         Pulled out of the objective closure so the post-`study.optimize` winner
-        resolution can call it too: a resumed study's `study.best_trial` may be
-        from a *previous* process invocation, never present in this process's
-        own `trial_cache` (Optuna's storage persists only hyperparameters/score,
-        not our fit artifacts) — re-evaluating is the only way to recover its
-        reduced matrix/labels/probabilities/topics/dr_metrics/bertopic_quality,
-        and is safe since the reducer (given the same `random_state`),
-        HDBSCAN, and BERTopic's own refit are all fully deterministic given
-        the same inputs.
+        resolution can call it too: every trial's own fit artifacts (reduced
+        matrix/labels/probabilities/topics/dr_metrics/bertopic_quality) are
+        discarded once `objective` returns a score rather than cached, since
+        Optuna's own storage already persists everything the objective needs
+        (hyperparameters/score/status) across trials and across resumed
+        process invocations. Only the study's eventual winning trial ever
+        needs those artifacts again, so `run` always re-evaluates it here
+        exactly once after `study.optimize` finishes, rather than keeping
+        every trial's artifacts resident for the life of the process. This is
+        safe since the reducer (given the same `random_state`), HDBSCAN, and
+        BERTopic's own refit are all fully deterministic given the same
+        inputs.
 
         The seed/repeat reproducibility sweep below still picks a winning
         seed/representative repeat via a plain HDBSCAN fit, unchanged; once
@@ -500,8 +504,6 @@ def run(
     storage_path = config.study_dir / f"{study_name}_study.journal"
     study = optuna_search.build_study(storage_path, study_name, config.sampler_seed, config.search_space)
 
-    trial_cache: dict[int, dict] = {}
-
     def objective(trial: optuna.Trial) -> float:
         hyperparams = {
             **optuna_search.suggest_hyperparams(trial, reducer_space),
@@ -509,10 +511,16 @@ def run(
         }
         record = evaluate_trial(hyperparams)
         reduction_sweep.log_config_candidate(trial.number, record["candidate"])
-        trial_cache[trial.number] = record
-        # Persisted to the study's storage (unlike trial_cache, which is this
-        # process's own memory) so count_trial_statuses reflects every trial
-        # across every resumed invocation, not just this one.
+        # `record`'s fit artifacts (reduced matrix/labels/probabilities/
+        # topics/dr_metrics/bertopic_quality) are deliberately not kept
+        # beyond this call -- only `status` is persisted, to the study's own
+        # storage (so `count_trial_statuses` reflects every trial across
+        # every resumed invocation, not just this one). Retaining every
+        # trial's full artifacts for the life of the process (as a
+        # same-process trial cache previously did) scales memory with
+        # `n_trials * seeds * repeats_per_seed`, for artifacts only the
+        # eventual winning trial ever needs again -- see `evaluate_trial`'s
+        # docstring.
         trial.set_user_attr("status", record["status"])
 
         if record["status"] == "invalid":
@@ -558,13 +566,10 @@ def run(
                 status_counts["ok"], status_counts["degenerate"], status_counts["invalid"],
             )
         return None
-    winner = trial_cache.get(best_trial.number)
-    if winner is None:
-        logger.info(
-            "run: best trial #%d for %r predates this process; re-evaluating its hyperparameters",
-            best_trial.number, label,
-        )
-        winner = evaluate_trial(best_trial.params)
+    logger.info(
+        "run: re-evaluating best trial #%d for %r to recover its fit artifacts", best_trial.number, label,
+    )
+    winner = evaluate_trial(best_trial.params)
     if winner["status"] != "ok":
         # Defensive only: `evaluate_trial` is deterministic given the same
         # hyperparameters, so a trial persisted with status "ok" should
