@@ -1,34 +1,42 @@
-"""Render an interactive 2D UMAP scatterplot of a reducer+HDBSCAN method's winning trial.
+"""Render an interactive 2D UMAP scatterplot of a reducer+HDBSCAN method's trial.
 
 Steps 4/5 (`umap_hdbscan_clustering.py`, `pacmap_hdbscan_clustering.py`)
 write only a metrics JSON — no cluster-assignments Parquet (see
 `reduction_hdbscan_pipeline.py`'s own docstring). So rather than reading a
-persisted per-row assignments file, this module re-fits the winning trial
+persisted per-row assignments file, this module re-fits the trial directly
+from the already-resumable Optuna study that run left behind — the same
+re-fit-on-demand approach `verify_trial_reproducibility.py`/
+`generate_cluster_labels.py` already use. By default that's the trial
 identified by `--metrics-path`'s own `optuna_study_summary.best_trial_number`
-directly from the already-resumable Optuna study that run left behind —
-the same re-fit-on-demand approach `verify_trial_reproducibility.py`/
-`generate_cluster_labels.py` already use. `refit_winning_trial` does this:
-hyperparameters are re-derived via `optuna_search.resolve_trial_hyperparams`
-(not `trial.params` directly — an `"int_ratio"`-kind hyperparameter holds
-its raw sampled ratio there, not the resolved integer the original fit
-used), then re-fit via `reduction_sweep.evaluate_config`'s own seed/repeat
-sweep, picking the same most-reproducible seed's representative repeat the
-original run would have. This never touches the Optuna study's own journal
-file or writes any new output besides the HTML below.
+(the winner); `--trial-number` substitutes any other recorded trial number
+for it instead, to inspect a trial that never won. `refit_winning_trial`
+does the re-fit itself: hyperparameters are re-derived via
+`optuna_search.resolve_trial_hyperparams` (not `trial.params` directly — an
+`"int_ratio"`-kind hyperparameter holds its raw sampled ratio there, not
+the resolved integer the original fit used), then re-fit via
+`reduction_sweep.evaluate_config`'s own seed/repeat sweep, picking the same
+most-reproducible seed's representative repeat the original run would
+have. This never touches the Optuna study's own journal file or writes any
+new output besides the HTML below.
 
 Before rendering the legend, this module also runs the same two-stage
 Anthropic-LLM relabeling pass (`llm_labeling.relabel_topics_with_llm`) that
-`reduction_hdbscan_pipeline.run` used to run itself, over the zero-shot
-topics recorded in the metrics JSON's own `topics` field (reconstructed via
-`build_topics_from_metrics`) -- the labeling logic itself is unchanged, only
-*where* it runs moved. Both re-fits are purely for this render: nothing is
-ever written back to `--metrics-path`, and a fresh LLM call/HDBSCAN re-fit
-happens every time this script runs. A failure in either (e.g. no
-`ANTHROPIC_API_KEY`, or the winning trial failing to re-evaluate to its
-recorded status) is handled the same way `reduction_hdbscan_pipeline.run`
-used to: the LLM failure falls back to the zero-shot labels and continues;
-a re-fit status mismatch raises, since there would be no valid cluster
-assignments left to plot.
+`reduction_hdbscan_pipeline.run` used to run itself, over that trial's own
+topics -- the labeling logic itself is unchanged, only *where* it runs
+moved. For the winning trial (the default), those topics are the real
+zero-shot ones recorded in the metrics JSON's own `topics` field
+(reconstructed via `build_topics_from_metrics`); for a `--trial-number`
+override, the metrics file's `topics` don't apply (they describe the
+winner's BERTopic result, not an arbitrary trial's), so fresh placeholder
+topics are built from that trial's own cluster sizes instead, the same way
+`generate_cluster_labels.py` does. Both re-fits are purely for this render:
+nothing is ever written back to `--metrics-path`, and a fresh LLM call/
+HDBSCAN re-fit happens every time this script runs. A failure in either
+(e.g. no `ANTHROPIC_API_KEY`, or the replayed trial failing to re-evaluate
+to status `"ok"`) is handled the same way `reduction_hdbscan_pipeline.run`
+used to: the LLM failure falls back to the zero-shot/placeholder labels and
+continues; a re-fit status mismatch raises, since there would be no valid
+cluster assignments left to plot.
 
 The 2-dimensional projection always reuses that method's own "optimal run"
 seed (`winning_seed`) rather than introducing new randomness, and is fit
@@ -177,23 +185,27 @@ def load_metrics(spec: VisualizationSpec, metrics_path: Path) -> dict:
 
 
 def refit_winning_trial(
-    spec: VisualizationSpec, metrics: dict, embeddings_path: Path, embedding_matrix: np.ndarray, config_path: Path
+    spec: VisualizationSpec,
+    metrics: dict,
+    embeddings_path: Path,
+    embedding_matrix: np.ndarray,
+    config_path: Path,
+    trial_number_override: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Re-fit this method's own winning Optuna trial directly, for display-time cluster assignments.
+    """Re-fit one of this method's Optuna trials directly, for display-time cluster assignments.
 
     Locates the same resumable Optuna study `reduction_hdbscan_pipeline.run`
     would have (derived from `embeddings_path`'s filename and `spec.plugin`,
-    under `config_path`'s own `study_dir`), loads the exact trial
-    `metrics["optuna_study_summary"]["best_trial_number"]` identifies as the
-    winner, and re-fits its hyperparameters via the same seed/repeat
-    reproducibility sweep every trial ran internally
-    (`reduction_sweep.evaluate_config`, using `config_path`'s own
-    `reproducibility.seeds`/`repeats_per_seed`).
+    under `config_path`'s own `study_dir`), loads the trial identified below,
+    and re-fits its hyperparameters via the same seed/repeat reproducibility
+    sweep every trial ran internally (`reduction_sweep.evaluate_config`,
+    using `config_path`'s own `reproducibility.seeds`/`repeats_per_seed`).
 
     Args:
         spec: The method's `VisualizationSpec`.
         metrics: That method's parsed metrics dict; its own
-            `optuna_study_summary.best_trial_number` identifies which trial to replay.
+            `optuna_study_summary.best_trial_number` identifies which trial
+            to replay, unless overridden by `trial_number_override`.
         embeddings_path: Embeddings Parquet path, used only to re-derive this
             run's study name (must be the same file steps 4/5 were
             originally pointed at).
@@ -202,17 +214,22 @@ def refit_winning_trial(
         config_path: Optuna search config YAML (search space, fixed params,
             reproducibility seeds/repeats, `study_dir`) — see
             `optuna_search.load_optuna_config`.
+        trial_number_override: If given, re-fits this trial instead of
+            `metrics["optuna_study_summary"]["best_trial_number"]` — lets a
+            caller inspect any recorded trial's clustering, not just the
+            study's current winner, the same way `--trial-number` already
+            does for `generate_cluster_labels.py`/`verify_trial_reproducibility.py`.
 
     Returns:
-        `(labels, probabilities)` — the winning trial's representative
+        `(labels, probabilities)` — the replayed trial's representative
         repeat's plain-HDBSCAN cluster assignments, row-aligned with
         `embedding_matrix`.
 
     Raises:
         FileNotFoundError: If no Optuna study journal is found for this method/input.
-        RuntimeError: If the winning trial's hyperparameters don't re-evaluate
-            to status `"ok"` (mirrors `generate_cluster_labels.py`'s own guard
-            -- there would be no valid cluster assignments left to plot).
+        RuntimeError: If the replayed trial's hyperparameters don't
+            re-evaluate to status `"ok"` (mirrors `generate_cluster_labels.py`'s
+            own guard -- there would be no valid cluster assignments left to plot).
     """
     config = optuna_search.load_optuna_config(config_path, require_reproducibility=True)
     slug = slug_from_filename(embeddings_path.name, "_trials_embeddings.parquet")
@@ -223,8 +240,16 @@ def refit_winning_trial(
     storage = optuna.storages.JournalStorage(optuna.storages.journal.JournalFileBackend(str(storage_path)))
     study = optuna.load_study(study_name=study_name, storage=storage)
 
-    best_trial_number = metrics["optuna_study_summary"]["best_trial_number"]
-    trial = optuna_search.find_trial_by_number(study, best_trial_number)
+    trial_number = (
+        trial_number_override if trial_number_override is not None
+        else metrics["optuna_study_summary"]["best_trial_number"]
+    )
+    logger.info(
+        "refit_winning_trial: re-fitting trial #%d for %s (%s)",
+        trial_number, spec.key,
+        "explicit --trial-number override" if trial_number_override is not None else "metrics' own best_trial_number",
+    )
+    trial = optuna_search.find_trial_by_number(study, trial_number)
     hyperparams = optuna_search.resolve_trial_hyperparams(trial, config.search_space)
 
     fixed_metric = config.fixed[spec.plugin.fixed_metric_config_key]
@@ -316,25 +341,31 @@ def build_topics_from_metrics(metrics: dict) -> list[TopicRepresentation]:
 
 
 def resolve_topic_labels(
-    metrics: dict,
+    topics: list[TopicRepresentation],
+    guide_labels: list[str],
     assignments_table: pa.Table,
     model: str,
     primary_prompt_path: Path,
     secondary_prompt_path: Path,
 ) -> dict[int, str]:
-    """Run the two-stage LLM relabeling pass over this run's zero-shot topics, for display only.
+    """Run the two-stage LLM relabeling pass over a trial's own topics, for display only.
 
     Mirrors what `reduction_hdbscan_pipeline.run` used to do for the winning
     trial, with the same fallback behavior: a failure here (LLM error,
-    missing `ANTHROPIC_API_KEY`, etc.) is logged and this method's original
-    zero-shot labels are used for the plot instead of aborting the render.
-    Never writes back to `metrics`/`assignments_table` -- the caller only
-    gets the resulting `{topic_id: label}` lookup to color/caption the plot.
+    missing `ANTHROPIC_API_KEY`, etc.) is logged and `topics`' own original
+    labels are used for the plot instead of aborting the render. Never
+    writes back to `assignments_table` -- the caller only gets the
+    resulting `{topic_id: label}` lookup to color/caption the plot.
 
     Args:
-        metrics: That method's parsed metrics dict (see `load_metrics`); its
-            own `topics`/`candidate_labels` fields are the inputs to the LLM
-            pass.
+        topics: The replayed trial's own topics -- either `metrics["topics"]`
+            reconstructed via `build_topics_from_metrics` (the winning
+            trial's real BERTopic/zero-shot result), or placeholder topics
+            built from the refit labels directly when `--trial-number`
+            overrides to a non-winning trial (see `run`), since the
+            metrics file's own `topics` only describes the winner.
+        guide_labels: The `--candidate-labels` list recorded in the metrics
+            JSON, reused here as soft guidance for both LLM calls.
         assignments_table: The in-memory table built by `run` from
             `refit_winning_trial`'s own output; its `criterion_text`/
             `cluster_id`/`cluster_probability` columns are the inputs to the
@@ -344,12 +375,10 @@ def resolve_topic_labels(
         secondary_prompt_path: `--secondary-summary-prompt-path` file.
 
     Returns:
-        `{topic_id: label}`, one entry per topic in `metrics["topics"]`
-        (including noise) -- LLM-relabeled where that succeeded, the
-        original zero-shot label otherwise.
+        `{topic_id: label}`, one entry per entry of `topics` (including
+        noise) -- LLM-relabeled where that succeeded, `topics`' own
+        original label otherwise.
     """
-    topics = build_topics_from_metrics(metrics)
-    guide_labels = metrics.get("candidate_labels", [])
     labels = np.array(assignments_table.column("cluster_id").to_pylist())
     probabilities = np.array(assignments_table.column("cluster_probability").to_pylist())
     criterion_texts = assignments_table.column("criterion_text").to_pylist()
@@ -489,8 +518,9 @@ def run(
     secondary_summary_prompt_path: Path,
     config_path: Path | None = None,
     seed_override: int | None = None,
+    trial_number: int | None = None,
 ) -> Path:
-    """Render and write a 2D UMAP scatterplot for one method's winning trial.
+    """Render and write a 2D UMAP scatterplot for one of a method's trials.
 
     Args:
         method: Which clustering method's output to visualize — one of
@@ -498,7 +528,7 @@ def run(
         metrics_path: That method's metrics JSON path.
         embeddings_path: The embeddings Parquet originally passed to that
             method's own `--input-path` — read once here, both to re-fit
-            the winning trial (see `refit_winning_trial`) and to fit the
+            the replayed trial (see `refit_winning_trial`) and to fit the
             fresh 2D projection (see `resolve_points`).
         output_path: Where to write the HTML.
         llm_model: Anthropic model id for the two-stage LLM relabeling pass
@@ -511,16 +541,24 @@ def run(
             defaults to that method's own reducer's default config.
         seed_override: If given, used instead of that method's own
             recorded/fallback seed.
+        trial_number: If given, re-fits and plots this specific Optuna trial
+            instead of `metrics_path`'s own recorded winner (see
+            `refit_winning_trial`'s `trial_number_override`). Since the
+            metrics file's own `topics` field only describes the winning
+            trial's real BERTopic/zero-shot result, a non-`None` value here
+            plots placeholder topics (built fresh from the replayed trial's
+            own cluster sizes) through the same LLM relabeling pass instead
+            of reusing the metrics file's topics.
 
     Returns:
         The path the scatterplot was written to.
 
     Raises:
         ValueError: If `method` isn't a recognized key in `VISUALIZATION_SPECS`.
-        FileNotFoundError: If `metrics_path` or the winning trial's Optuna
+        FileNotFoundError: If `metrics_path` or the replayed trial's Optuna
             study journal doesn't exist.
-        RuntimeError: If the winning trial fails to re-evaluate to its
-            recorded status (see `refit_winning_trial`).
+        RuntimeError: If the replayed trial fails to re-evaluate to status
+            `"ok"` (see `refit_winning_trial`).
     """
     if method not in VISUALIZATION_SPECS:
         raise ValueError(f"Unknown method {method!r}; expected one of {sorted(VISUALIZATION_SPECS)}")
@@ -535,7 +573,9 @@ def run(
     embedding_matrix = clustering_io.extract_embedding_matrix(filtered)
     traceability = clustering_io.extract_traceability_columns(filtered)
 
-    labels, probabilities = refit_winning_trial(spec, metrics, embeddings_path, embedding_matrix, resolved_config_path)
+    labels, probabilities = refit_winning_trial(
+        spec, metrics, embeddings_path, embedding_matrix, resolved_config_path, trial_number_override=trial_number
+    )
     assignments_table = pa.table(
         {
             "nct_id": traceability["nct_id"],
@@ -551,8 +591,25 @@ def run(
     else:
         seed, seed_explicit = resolve_seed(spec, metrics)
 
+    if trial_number is None:
+        topics = build_topics_from_metrics(metrics)
+    else:
+        # The metrics file's own `topics` describes the *winning* trial's
+        # BERTopic result, which doesn't apply to an arbitrary overridden
+        # trial -- build fresh placeholder topics from this trial's own
+        # cluster sizes instead, the same way `generate_cluster_labels.py`
+        # does for an explicit --trial-number.
+        cluster_sizes = clustering_io.compute_cluster_sizes(labels)
+        topics = [
+            TopicRepresentation(
+                topic_id=topic_id, keywords=[], label="Noise" if topic_id == -1 else "",
+                count=cluster_sizes[str(topic_id)],
+            )
+            for topic_id in sorted({int(x) for x in labels})
+        ]
+    guide_labels = metrics.get("candidate_labels", [])
     topic_labels_by_id = resolve_topic_labels(
-        metrics, assignments_table, llm_model, primary_summary_prompt_path, secondary_summary_prompt_path
+        topics, guide_labels, assignments_table, llm_model, primary_summary_prompt_path, secondary_summary_prompt_path
     )
     points_2d = resolve_points(embedding_matrix, seed)
     frame = build_plot_frame(assignments_table, points_2d, topic_labels_by_id)
@@ -574,12 +631,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     Returns:
         An ``argparse.ArgumentParser`` accepting a required ``--method``
         choice, required metrics/embeddings/output path flags, an optional
-        ``--config-path``/seed override, and the two-stage LLM relabeling
-        pass's own flags (``--llm-model``/``--primary-summary-prompt-path``/
-        ``--secondary-summary-prompt-path``).
+        ``--config-path``/seed/``--trial-number`` override, and the
+        two-stage LLM relabeling pass's own flags (``--llm-model``/
+        ``--primary-summary-prompt-path``/``--secondary-summary-prompt-path``).
     """
     parser = argparse.ArgumentParser(
-        description="Render an interactive 2D UMAP scatterplot of a reducer+HDBSCAN method's winning trial."
+        description="Render an interactive 2D UMAP scatterplot of a reducer+HDBSCAN method's trial."
     )
     parser.add_argument(
         "--method",
@@ -609,8 +666,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--config-path",
         type=Path,
         default=None,
-        help="Optuna search config YAML used to re-fit the winning trial; defaults to that method's "
+        help="Optuna search config YAML used to re-fit the replayed trial; defaults to that method's "
         "own reducer's default config",
+    )
+    parser.add_argument(
+        "--trial-number",
+        type=int,
+        default=None,
+        help="Re-fit and plot this specific Optuna trial instead of --metrics-path's own recorded "
+        "winner (see verify_trial_reproducibility.py for how to find one); its clusters are LLM-labeled "
+        "fresh rather than reusing --metrics-path's own (winner-only) topics",
     )
     parser.add_argument(
         "--seed",
@@ -652,7 +717,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    """CLI entry point: render and write a scatterplot for one method's winning trial."""
+    """CLI entry point: render and write a scatterplot for one of a method's trials."""
     args = build_arg_parser().parse_args()
     configure_logging(args.log_file)
     run(
@@ -665,6 +730,7 @@ def main() -> None:
         args.secondary_summary_prompt_path,
         config_path=args.config_path,
         seed_override=args.seed,
+        trial_number=args.trial_number,
     )
 
 

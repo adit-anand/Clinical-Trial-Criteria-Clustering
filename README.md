@@ -532,17 +532,27 @@ uv run python -m amia_2026.clustering.clustering_scatterplot \
 ```
 
 Steps 4-5 write no cluster-assignments Parquet of their own (see steps 4-5
-above), so this step re-fits the winning trial itself: it locates the same
+above), so this step re-fits the trial itself: it locates the same
 resumable Optuna study steps 4-5 would (derived from
 `--embeddings-path`'s filename and `--method`, under `--config-path`'s own
-`study_dir`; default config paths match steps 4-5's), loads the exact trial
-`--metrics-path`'s own `optuna_study_summary.best_trial_number` names as the
-winner, and re-fits its hyperparameters via the same seed/repeat
+`study_dir`; default config paths match steps 4-5's), loads the trial
+identified below, and re-fits its hyperparameters via the same seed/repeat
 reproducibility sweep every trial ran internally — the same re-fit-on-demand
 approach step 8 and the diagnostic below already use. If that re-fit
-doesn't come back with the same status the trial was originally recorded
-with, this step fails loudly rather than rendering a plot with no valid
-cluster assignments.
+doesn't come back with status `"ok"`, this step fails loudly rather than
+rendering a plot with no valid cluster assignments.
+
+By default, the trial re-fit is `--metrics-path`'s own
+`optuna_study_summary.best_trial_number` — the winner. `--trial-number`
+substitutes a specific Optuna trial number for that instead, so you can
+inspect a trial that never won (see the trial-history CSV or runtime log,
+e.g. `"Trial 42 finished"`). Since `--metrics-path`'s own `topics` field
+only describes the winning trial's real BERTopic/zero-shot result, using
+`--trial-number` to plot a different trial instead builds fresh
+placeholder topics from that trial's own cluster sizes and runs the same
+LLM relabeling pass (below) over those instead of the metrics file's
+topics — mirroring how `generate_cluster_labels.py` (step 8) and the
+diagnostic below already handle an explicit, non-winning trial number.
 
 It then writes an interactive HTML scatterplot of those criteria in a
 2-dimensional UMAP space to `--output-path`, with points colored by cluster
@@ -584,9 +594,10 @@ HTML file wholesale; there is no append/skip-if-exists/merge behavior.
 | ----------------- | -------- | ---------------------------------------------------------------------------- |
 | `--method`          | yes      | Which clustering method's output to visualize: `umap_hdbscan` or `pacmap_hdbscan`. |
 | `--metrics-path`    | yes      | That method's metrics JSON path. |
-| `--embeddings-path` | yes      | The same embeddings Parquet originally passed to that method's own `--input-path` — used both to re-fit the winning trial and to fit the fresh 2D projection. |
+| `--embeddings-path` | yes      | The same embeddings Parquet originally passed to that method's own `--input-path` — used both to re-fit the replayed trial and to fit the fresh 2D projection. |
 | `--output-path`     | yes      | Output HTML path. |
-| `--config-path`     | no       | Optuna search config YAML used to re-fit the winning trial; default: that method's own reducer's default config (same as steps 4-5). |
+| `--config-path`     | no       | Optuna search config YAML used to re-fit the replayed trial; default: that method's own reducer's default config (same as steps 4-5). |
+| `--trial-number`    | no       | Re-fit and plot this specific Optuna trial instead of `--metrics-path`'s own recorded winner; its clusters are LLM-labeled fresh rather than reusing `--metrics-path`'s own (winner-only) topics. |
 | `--seed`            | no       | Override the 2D UMAP projection's seed (default: reuse that method's own optimal-run seed). |
 | `--llm-model`       | no       | Anthropic model id for this step's own two-stage LLM cluster relabeling pass, run for display only (default: `claude-haiku-5-5`); requires `ANTHROPIC_API_KEY` in `.env`. |
 | `--primary-summary-prompt-path`   | no | Text file with the primary-summarization system prompt (default: `config/llm_prompts/primary_summary_prompt.txt`). |
