@@ -59,6 +59,16 @@ eligibility criterion regardless of `criterion_type` (`inclusion`,
    from the metrics JSON the report step already read — no
    `--method`/`--assignments-path`/`--embeddings-path` re-entry. Steps 3
    and 6 are untouched and still work standalone; this is purely additive.
+8. **`amia_2026/clustering/generate_cluster_labels.py`** — a standalone,
+   read-only script that re-fits a reducer's winning (or an explicitly
+   named) Optuna trial directly via its seed/repeat sweep, skipping
+   BERTopic/zero-shot entirely, then LLM-labels the resulting plain-HDBSCAN
+   clusters with the same two-stage prompts steps 4-5 use for their winning
+   trial's relabeling pass. Writes one Parquet of criterion text/embedding/
+   cluster assignment/cluster label to a given output directory. Does not
+   require steps 4-5 to have completed successfully for that trial — it
+   finds the trial via the already-existing resumable Optuna study and
+   fits it from scratch.
 
 ## Project structure
 
@@ -99,6 +109,7 @@ src/
         ├── pacmap_hdbscan_clustering.py      # step 5
         ├── clustering_scatterplot.py         # step 6
         ├── clustering_review.py              # step 7 (combines steps 3 and 6)
+        ├── generate_cluster_labels.py         # step 8 (standalone winning-trial LLM labeling)
         ├── optimization/                     # reducer-and-algorithm-agnostic Optuna search engine
         │   ├── optuna_search.py              #   config/search-space parsing, composite scoring, study lifecycle
         │   └── reduction_sweep.py            #   seed/repeat reproducibility engine
@@ -217,8 +228,8 @@ also set:
 HF_TOKEN=your-token-here
 ```
 
-Steps 4-5's winning-trial LLM relabeling (see below) requires an Anthropic
-API key:
+Steps 4-5's winning-trial LLM relabeling (see below) and step 8's standalone
+cluster labeling both require an Anthropic API key:
 
 ```
 ANTHROPIC_API_KEY=your-key-here
@@ -610,6 +621,77 @@ doesn't cover (such as visualizing the lower-scoring methodology on demand).
 | `--scatterplot-path` | yes      | Output HTML scatterplot path (written only if a methodology qualifies for selection). |
 | `--print`            | no       | Also print the generated report to stdout. |
 | `--log-file`         | no       | If given, also append logs to this file, in addition to the console. |
+
+## 8. Standalone cluster labeling
+
+```bash
+uv run python -m amia_2026.clustering.generate_cluster_labels \
+  --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
+  --reducer pacmap \
+  --output-dir data/clustering/pacmap_hdbscan \
+  --candidate-labels "oncology eligibility,treatment history,disease measurement"
+```
+
+This is a standalone, read-only alternative to steps 4-5's own LLM
+relabeling pass: it re-fits one reducer's already-tuned Optuna study's
+winning hyperparameter configuration directly, skipping BERTopic/zero-shot
+entirely, then LLM-labels the resulting plain-HDBSCAN clusters. Useful on
+its own (no need to re-run the full read-search-write pipeline just to get
+labels for a trial), and in particular for a trial whose own run through
+step 4/5 never wrote output (e.g. a re-evaluation failure) but is still
+on record in the study.
+
+It locates the same resumable Optuna study step 4/5 would (derived from
+`--input-path`'s filename and `--reducer`, under `--config-path`'s own
+`study_dir`; default config paths match steps 4/5's), and by default uses
+the study's current best trial whose own `status` is `"ok"`
+(`optuna_search.best_ok_trial_or_none` — never a degenerate trial, even if
+it out-scored every eligible one). `--trial-number` overrides this to use
+a specific trial instead. Either way, that trial's hyperparameters are
+re-derived from the study's own recorded `trial.params` via
+`optuna_search.resolve_trial_hyperparams` (not used as-is — an
+`"int_ratio"`-kind hyperparameter like `min_samples` is recorded as its raw
+sampled ratio, not the resolved integer the original fit used), then fit
+via the same seed/repeat reproducibility sweep every trial runs internally
+(`reduction_sweep.evaluate_config`, using `--config-path`'s own
+`reproducibility.seeds`/`repeats_per_seed`) to pick the most reproducible
+seed and a representative repeat. If that re-fit doesn't come back `"ok"`,
+the script fails loudly rather than writing a degenerate/partial result.
+
+The representative repeat's own plain-HDBSCAN clusters (not a BERTopic
+refit) are then labeled by the same two-stage Anthropic-LLM pass steps 4-5
+use for their winning trial's relabeling (`--llm-model`,
+`--primary-summary-prompt-path`/`--secondary-summary-prompt-path`, default
+prompts under `config/llm_prompts/`; `--candidate-labels` is reused as soft
+guidance for both calls): primary summarization labels each cluster from
+its own top criteria, then secondary summarization revises every label at
+once for cross-cluster distinctness. Noise (`cluster_id == -1`) is never
+sent to the LLM and is always labeled `"Noise"`.
+
+Writes one Parquet file, named after the study (`<study_name>_cluster_labels.parquet`),
+into `--output-dir` (created if missing) — one row per successfully-embedded
+criterion, containing only `criterion_text`, that row's original
+(pre-reduction) `embedding` vector, `cluster_id`, and `cluster_label`. This
+is deliberately a narrower schema than steps 4-5's own cluster-assignments
+Parquet (no `nct_id`/`cluster_probability`/etc.) — this script's own job is
+just criterion text, embedding, cluster assignment, and label. Re-running
+against the same `--output-dir`/study overwrites the existing file
+wholesale; the Optuna study's own journal file is never written to.
+
+### Arguments
+
+| Argument                           | Required | Description                                                                 |
+| ----------------------------------- | -------- | ---------------------------------------------------------------------------- |
+| `--input-path`                       | yes      | Input embeddings Parquet path (as written by `criteria_embedding.py`); also identifies which Optuna study to read. |
+| `--reducer`                          | yes      | Which reducer's study/search space to use: `pacmap` or `umap`. |
+| `--output-dir`                       | yes      | Directory to write the output cluster-labels Parquet into (created if missing). |
+| `--config-path`                      | no       | Optuna search config YAML; default: that reducer's own default config (same as steps 4-5). |
+| `--trial-number`                     | no       | Use a specific Optuna trial instead of the study's current best `"ok"` trial. |
+| `--candidate-labels`                 | yes      | Comma-separated candidate topic labels, reused as soft guidance for both LLM calls, e.g. `"oncology eligibility,treatment history,disease measurement"`. |
+| `--llm-model`                        | no       | Anthropic model id for cluster labeling (default: `claude-haiku-5-5`); requires `ANTHROPIC_API_KEY` in `.env`. |
+| `--primary-summary-prompt-path`      | no       | Text file with the primary-summarization system prompt (default: `config/llm_prompts/primary_summary_prompt.txt`). |
+| `--secondary-summary-prompt-path`    | no       | Text file with the secondary-summarization system prompt (default: `config/llm_prompts/secondary_summary_prompt.txt`). |
+| `--log-file`                         | no       | If given, also append logs to this file, in addition to the console. |
 
 ### Example: full pipeline for one condition
 

@@ -204,6 +204,10 @@ def evaluate_repeat(
         log_memory_usage(logger, f"evaluate_repeat: after MemoryError during reduction (seed={seed})", level=logging.ERROR)
         return RepeatResult(repeat_index=repeat_index, status="errored", detail=f"MEMORY ERROR during reduction: {exc}")
     except Exception as exc:  # noqa: BLE001 - a reducer-internal failure shouldn't abort the whole trial
+        logger.warning("evaluate_repeat: reduction failed (seed=%d, repeat=%d): %s", seed, repeat_index, exc)
+        logger.debug(
+            "evaluate_repeat: reduction failure traceback (seed=%d, repeat=%d)", seed, repeat_index, exc_info=True
+        )
         return RepeatResult(repeat_index=repeat_index, status="errored", detail=f"Reduction failed: {exc}")
 
     try:
@@ -217,6 +221,10 @@ def evaluate_repeat(
             repeat_index=repeat_index, status="errored", detail=f"MEMORY ERROR during HDBSCAN fit: {exc}"
         )
     except Exception as exc:  # noqa: BLE001 - an HDBSCAN-internal failure shouldn't abort the whole trial
+        logger.warning("evaluate_repeat: HDBSCAN fit failed (seed=%d, repeat=%d): %s", seed, repeat_index, exc)
+        logger.debug(
+            "evaluate_repeat: HDBSCAN fit failure traceback (seed=%d, repeat=%d)", seed, repeat_index, exc_info=True
+        )
         return RepeatResult(repeat_index=repeat_index, status="errored", detail=f"HDBSCAN fit failed: {exc}")
 
     labels = model.labels_

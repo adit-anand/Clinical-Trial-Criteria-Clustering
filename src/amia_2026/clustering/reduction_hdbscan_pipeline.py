@@ -585,7 +585,15 @@ def run(
     logger.info(
         "run: re-evaluating best trial #%d for %r to recover its fit artifacts", best_trial.number, label,
     )
-    winner = evaluate_trial(best_trial.params)
+    # `best_trial.params` (not fed to `evaluate_trial` directly) holds each
+    # hyperparameter's *raw* Optuna-suggested value -- for an `"int_ratio"`
+    # entry (e.g. `min_samples` swept as a ratio of `min_cluster_size`,
+    # see config/pacmap_hdbscan_optuna.yaml) that's the sampled ratio, not
+    # the resolved integer the original fit actually used. Re-deriving via
+    # `resolve_trial_hyperparams` is what makes the "evaluate_trial is
+    # deterministic given the same hyperparameters" assumption below true.
+    resolved_hyperparams = optuna_search.resolve_trial_hyperparams(best_trial, config.search_space)
+    winner = evaluate_trial(resolved_hyperparams)
     if winner["status"] != "ok":
         # Defensive only: `evaluate_trial` is deterministic given the same
         # hyperparameters, so a trial persisted with status "ok" should

@@ -364,6 +364,40 @@ def suggest_hyperparams(trial: "optuna.Trial", search_space: dict[str, Hyperpara
     return hyperparams
 
 
+def resolve_trial_hyperparams(
+    trial: "optuna.trial.FrozenTrial", search_space: dict[str, HyperparamSpec]
+) -> dict:
+    """Re-derive an already-recorded trial's *effective* hyperparameters.
+
+    `trial.params` (what Optuna itself records) holds each hyperparameter's
+    *raw* suggested value -- for an `"int_ratio"`-kind entry (e.g.
+    `min_samples` swept as a ratio of `min_cluster_size`), that's the sampled
+    ratio, not the resolved integer `suggest_hyperparams` actually handed to
+    the fit. Passing `trial.params` straight into a fit function silently
+    fits a *different* configuration than the one Optuna scored (confirmed:
+    `sklearn.cluster.HDBSCAN(min_samples=<a ratio like 0.22>)` raises
+    `InvalidParameterError` outright). This replays `trial.params` through
+    `optuna.trial.FixedTrial` + `suggest_hyperparams` instead, which resolves
+    every `"int_ratio"` entry exactly as the original `objective` closure did
+    (and passes every other kind through unchanged).
+
+    Args:
+        trial: The already-recorded trial to replay (e.g. from
+            `best_ok_trial_or_none`/`find_trial_by_number`).
+        search_space: The config's full search space (reducer + HDBSCAN
+            hyperparameter names together, in the same key order
+            `load_optuna_config` parsed them in -- `"int_ratio"` entries'
+            `relative_to` key must already be resolved, same ordering
+            requirement as `suggest_hyperparams` itself).
+
+    Returns:
+        The same hyperparams dict the original `objective` closure built for
+        this trial on its first evaluation.
+    """
+    fixed_trial = optuna.trial.FixedTrial(trial.params)
+    return suggest_hyperparams(fixed_trial, search_space)
+
+
 def compute_micro_cluster_fraction(labels: np.ndarray, min_cluster_size: int, multiplier: float) -> float:
     """Fraction of non-noise points sitting in "micro" clusters.
 
@@ -1017,3 +1051,20 @@ def best_ok_trial_or_none(study: "optuna.Study") -> "optuna.trial.FrozenTrial | 
     if not ok_trials:
         return None
     return max(ok_trials, key=lambda trial: trial.value)
+
+
+def find_trial_by_number(study: "optuna.Study", trial_number: int) -> "optuna.trial.FrozenTrial":
+    """Return the trial numbered `trial_number` from `study`.
+
+    Args:
+        study: The study to search.
+        trial_number: The `.number` of the trial to find (see the
+            trial-history CSV or a `"Trial %d finished"` runtime log line).
+
+    Raises:
+        ValueError: If no trial with that number exists in the study.
+    """
+    for trial in study.get_trials(deepcopy=False):
+        if trial.number == trial_number:
+            return trial
+    raise ValueError(f"Study {study.study_name!r} has no trial #{trial_number}")
