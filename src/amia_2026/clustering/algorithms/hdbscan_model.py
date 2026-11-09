@@ -9,42 +9,17 @@ noise-aware metrics, probability output) and `compute_relative_validity_index`
 """
 
 import math
-from datetime import datetime
-from typing import TYPE_CHECKING
 
 import numpy as np
-import pyarrow as pa
 from hdbscan import validity
 from sklearn.cluster import HDBSCAN
 from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score, silhouette_score
-
-from amia_2026.clustering import clustering_io
-
-if TYPE_CHECKING:
-    from amia_2026.clustering.algorithms.bertopic_model import TopicRepresentation
 
 # Shared with pacmap_hdbscan_clustering.py/umap_hdbscan_clustering.py: splits
 # a reducer-pipeline trial's combined search_space dict into HDBSCAN's own
 # hyperparameters vs. the reducer's.
 HDBSCAN_PARAM_NAMES = frozenset(
     {"min_cluster_size", "min_samples", "cluster_selection_epsilon", "cluster_selection_method", "alpha"}
-)
-
-HDBSCAN_CLUSTER_PARQUET_SCHEMA = pa.schema(
-    [
-        ("nct_id", pa.string()),
-        ("study_first_posted_date", pa.string()),
-        ("criterion_text", pa.string()),
-        ("criterion_type", pa.string()),
-        ("cluster_id", pa.int32()),
-        ("cluster_probability", pa.float32()),
-        ("embedding", pa.list_(pa.float32())),
-        ("embedding_backend", pa.string()),
-        ("embedding_model", pa.string()),
-        ("clustered_at", pa.timestamp("us", tz="UTC")),
-        ("topic_keywords", pa.list_(pa.string())),
-        ("topic_label", pa.string()),
-    ]
 )
 
 
@@ -304,60 +279,6 @@ class HDBSCANClusterer:
             "noise_fraction": noise_fraction,
             "metrics_valid": metrics_valid,
         }
-
-    def build_assignment_rows(
-        self,
-        table: pa.Table,
-        labels: np.ndarray,
-        probabilities: np.ndarray,
-        topics: list["TopicRepresentation"],
-        clustered_at: datetime,
-    ) -> list[dict]:
-        """Zip each surviving row's traceability columns with its cluster label, probability, and topic.
-
-        Args:
-            table: The table `labels`/`probabilities` were produced from (row
-                order must match).
-            labels: One cluster id per row of `table` (`-1` for noise).
-            probabilities: One cluster membership probability per row
-                (`0.0` for noise points).
-            topics: One `TopicRepresentation` per distinct cluster id present
-                in `labels` (including `-1`, BERTopic's own outlier topic),
-                as produced by `bertopic_model.fit_bertopic_topics`. Every row
-                sharing a cluster id gets that cluster's own keywords/label.
-            clustered_at: Wall-clock time this clustering run completed.
-
-        Returns:
-            One output dict per row, matching
-            `HDBSCAN_CLUSTER_PARQUET_SCHEMA`'s columns -- including each
-            row's original (pre-reduction) `embedding` vector, carried
-            through verbatim from `table`'s own `embedding` column, so the
-            assignments Parquet is independently usable without re-joining
-            the input embeddings file.
-        """
-        columns = clustering_io.extract_traceability_columns(table)
-        topics_by_id = {topic.topic_id: topic for topic in topics}
-
-        rows = []
-        for i in range(table.num_rows):
-            topic = topics_by_id[int(labels[i])]
-            rows.append(
-                {
-                    "nct_id": columns["nct_id"][i],
-                    "study_first_posted_date": columns["study_first_posted_date"][i],
-                    "criterion_text": columns["criterion_text"][i],
-                    "criterion_type": columns["criterion_type"][i],
-                    "cluster_id": int(labels[i]),
-                    "cluster_probability": float(probabilities[i]),
-                    "embedding": columns["embedding"][i],
-                    "embedding_backend": columns["embedding_backend"][i],
-                    "embedding_model": columns["embedding_model"][i],
-                    "clustered_at": clustered_at,
-                    "topic_keywords": topic.keywords,
-                    "topic_label": topic.label,
-                }
-            )
-        return rows
 
 
 def compute_relative_validity_index(embedding_matrix: np.ndarray, labels: np.ndarray, metric: str) -> float | None:

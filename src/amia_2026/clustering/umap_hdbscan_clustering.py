@@ -8,12 +8,13 @@ reduce-then-HDBSCAN orchestration in `reduction_hdbscan_pipeline.py`, which
 PaCMAP-specific pieces instead. See that module's docstring for the full
 read-search-write pipeline description (Optuna study setup/resumption,
 reproducibility seed/repeat handling via `reduction_sweep.py`, the composite
-objective via `optuna_search.score_reduction_candidate`, and the output
-artifacts written at the paths given via
-`--assignments-output-path`/`--metrics-output-path`).
+objective via `optuna_search.score_reduction_candidate`, and the metrics
+JSON written at the path given via `--metrics-output-path` — no
+cluster-assignments Parquet is written; `clustering_scatterplot.py` re-fits
+the winning trial on demand instead).
 
-Re-running this step against the same output paths overwrites both existing
-output files (and the trial-history CSV) wholesale; only the Optuna study's
+Re-running this step against the same output path overwrites the existing
+metrics file (and the trial-history CSV) wholesale; only the Optuna study's
 own file-based storage accumulates across runs.
 """
 

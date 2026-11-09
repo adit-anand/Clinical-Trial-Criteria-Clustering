@@ -3,7 +3,7 @@
 `clustering_report.py` and `clustering_scatterplot.py` are normally chained
 by hand: a person reads the report, decides by eye which methodology
 "won," then re-invokes the scatterplot CLI with that methodology's
-`--method`/`--metrics-path`/`--assignments-path` re-typed in. This module
+`--method`/`--metrics-path`/`--embeddings-path` re-typed in. This module
 automates that hand-off: it generates the report, then picks whichever
 methodology has the higher composite objective score (via
 `clustering_report.compute_best_algorithm_by_composite_score`, ties going
@@ -30,6 +30,7 @@ from pathlib import Path
 from amia_2026.logging_utils import configure_logging
 from amia_2026.paths import REPO_ROOT
 from amia_2026.clustering import clustering_report, clustering_scatterplot
+from amia_2026.clustering.algorithms import llm_labeling
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,9 @@ def run(
     metrics_paths: dict[str, Path | None],
     print_to_console: bool = False,
     generated_at: datetime | None = None,
+    llm_model: str = llm_labeling.DEFAULT_LLM_MODEL,
+    primary_summary_prompt_path: Path = llm_labeling.DEFAULT_PRIMARY_PROMPT_PATH,
+    secondary_summary_prompt_path: Path = llm_labeling.DEFAULT_SECONDARY_PROMPT_PATH,
 ) -> tuple[Path, Path | None]:
     """Generate the clustering report, then render a scatterplot for its composite-score winner.
 
@@ -67,6 +71,10 @@ def run(
         generated_at: Wall-clock time to record as the report's generation
             time. Defaults to `datetime.now(timezone.utc)` (see
             `clustering_report.generate_report`).
+        llm_model: Anthropic model id, passed through to
+            `clustering_scatterplot.run`'s own (display-only) LLM relabeling pass.
+        primary_summary_prompt_path: Passed through to `clustering_scatterplot.run`.
+        secondary_summary_prompt_path: Passed through to `clustering_scatterplot.run`.
 
     Returns:
         `(report_path, scatterplot_path_or_None)` — the second element is
@@ -90,18 +98,18 @@ def run(
 
     input_path = data.get("input_path")
     embeddings_path = _resolve_repo_relative_path(input_path) if input_path else None
-    assignments_output_path = data.get("assignments_output_path")
-    assignments_path = _resolve_repo_relative_path(assignments_output_path) if assignments_output_path else None
 
     try:
         clustering_scatterplot.run(
             spec.key,
             metrics_paths[spec.key],
-            assignments_path,
+            embeddings_path,
             scatterplot_path,
-            embeddings_path=embeddings_path,
+            llm_model,
+            primary_summary_prompt_path,
+            secondary_summary_prompt_path,
         )
-    except (FileNotFoundError, ValueError) as exc:
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
         logger.warning(
             "run: could not render a scatterplot for %s (composite score %.4f): %s; "
             "no scatterplot was generated",
@@ -158,6 +166,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Also print the generated report to stdout",
     )
     parser.add_argument(
+        "--llm-model",
+        type=str,
+        default=llm_labeling.DEFAULT_LLM_MODEL,
+        help="Anthropic model id for the scatterplot's own two-stage LLM cluster relabeling pass, "
+        f"run for display only (default: {llm_labeling.DEFAULT_LLM_MODEL}); requires "
+        "ANTHROPIC_API_KEY in .env",
+    )
+    parser.add_argument(
+        "--primary-summary-prompt-path",
+        type=Path,
+        default=llm_labeling.DEFAULT_PRIMARY_PROMPT_PATH,
+        help="Text file with the primary-summarization system prompt (default: "
+        f"{llm_labeling.DEFAULT_PRIMARY_PROMPT_PATH})",
+    )
+    parser.add_argument(
+        "--secondary-summary-prompt-path",
+        type=Path,
+        default=llm_labeling.DEFAULT_SECONDARY_PROMPT_PATH,
+        help="Text file with the secondary-summarization system prompt (default: "
+        f"{llm_labeling.DEFAULT_SECONDARY_PROMPT_PATH})",
+    )
+    parser.add_argument(
         "--log-file",
         type=Path,
         default=None,
@@ -178,6 +208,9 @@ def main() -> None:
         args.scatterplot_path,
         metrics_paths,
         print_to_console=args.print_to_console,
+        llm_model=args.llm_model,
+        primary_summary_prompt_path=args.primary_summary_prompt_path,
+        secondary_summary_prompt_path=args.secondary_summary_prompt_path,
     )
 
 

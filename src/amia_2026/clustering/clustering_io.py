@@ -1,11 +1,12 @@
 """Shared, algorithm-agnostic I/O for the clustering pipeline stages.
 
 `pacmap_hdbscan_clustering.py` and `umap_hdbscan_clustering.py` both read the
-same embeddings Parquet input format and write cluster assignments plus a
-metrics JSON in a similar shape. This module holds the logic that is
-genuinely common to both of them — reading/filtering/validating the input
-embeddings table and writing output artifacts — so no algorithm-specific
-module re-implements it.
+same embeddings Parquet input format and write a metrics JSON in a similar
+shape (neither writes a cluster-assignments Parquet of its own — see
+`reduction_hdbscan_pipeline.py`'s own docstring). This module holds the
+logic that is genuinely common to both of them — reading/filtering/
+validating the input embeddings table and writing output artifacts — so no
+algorithm-specific module re-implements it.
 
 Nothing here branches on "which algorithm am I"; algorithm-specific concerns
 (fitting, per-algorithm metrics, per-algorithm output columns) stay in each
@@ -13,8 +14,6 @@ algorithm's own module.
 """
 
 import json
-import logging
-import os
 from pathlib import Path
 
 import numpy as np
@@ -23,8 +22,6 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from amia_2026.paths import REPO_ROOT
-
-logger = logging.getLogger(__name__)
 
 
 def read_embeddings_parquet(input_path: Path) -> pa.Table:
@@ -119,7 +116,7 @@ def extract_embedding_matrix(table: pa.Table) -> np.ndarray:
 
 
 def extract_traceability_columns(table: pa.Table) -> dict[str, list]:
-    """Pull the columns common to both algorithms' assignment output, as parallel lists.
+    """Pull the columns common to both algorithms' per-criterion output, as parallel lists.
 
     Args:
         table: A table of successfully-embedded rows (row order defines the
@@ -128,10 +125,10 @@ def extract_traceability_columns(table: pa.Table) -> dict[str, list]:
     Returns:
         A dict with keys `nct_id`, `study_first_posted_date`,
         `criterion_text`, `criterion_type`, `embedding`, `embedding_backend`,
-        `embedding_model`, each a list of length `table.num_rows`. Each
-        algorithm's own `build_assignment_rows` zips these with its own
-        per-row cluster output (e.g. `cluster_id`, and for HDBSCAN also
-        `cluster_probability`).
+        `embedding_model`, each a list of length `table.num_rows`. Callers
+        zip these with their own per-row cluster output (e.g. `cluster_id`,
+        and for HDBSCAN also `cluster_probability`) — see
+        `generate_cluster_labels.py`/`verify_trial_reproducibility.py`.
     """
     return {
         "nct_id": table.column("nct_id").to_pylist(),
@@ -177,7 +174,6 @@ def compute_cluster_sizes(labels: np.ndarray) -> dict[str, int]:
 def build_base_metrics_dict(
     label: str,
     input_path: Path,
-    assignments_output_path: Path,
     n_samples: int,
     n_samples_excluded: int,
     embedding_dim: int,
@@ -198,7 +194,6 @@ def build_base_metrics_dict(
             recorded here only for traceability — no longer used to resolve
             any path.
         input_path: The embeddings Parquet path that was read.
-        assignments_output_path: Where cluster assignments were written.
         n_samples: Number of successfully-embedded rows clustered.
         n_samples_excluded: Number of input rows dropped for having failed
             embeddings.
@@ -215,7 +210,6 @@ def build_base_metrics_dict(
     return {
         "condition": label,
         "input_path": relative_to_repo_root(input_path),
-        "assignments_output_path": relative_to_repo_root(assignments_output_path),
         "n_samples": n_samples,
         "n_samples_excluded_failed_embeddings": n_samples_excluded,
         "embedding_dim": embedding_dim,
@@ -224,41 +218,6 @@ def build_base_metrics_dict(
         "cluster_sizes": cluster_sizes,
         "clustered_at": clustered_at.isoformat(),
     }
-
-
-def resolve_writable_path(output_path: Path) -> Path:
-    """Fall back to a `Path.cwd()` sibling if `output_path`'s directory can't be written to.
-
-    Tries to create `output_path`'s parent directory (if it doesn't already
-    exist) and confirms the result is writable. Only that specific class of
-    problem — the target directory missing and uncreatable, or existing but
-    not writable (e.g. a permissions issue, a read-only mount) — triggers
-    the fallback; any other failure (e.g. the disk filling up during the
-    actual write) is left to surface from the write call itself, not caught
-    here.
-
-    Args:
-        output_path: The originally intended output path.
-
-    Returns:
-        `output_path` unchanged if its directory is writable; otherwise
-        `Path.cwd() / output_path.name` (logged as a warning, never silently).
-    """
-    try:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        writable = os.access(output_path.parent, os.W_OK)
-    except OSError:
-        writable = False
-
-    if writable:
-        return output_path
-
-    fallback_path = Path.cwd() / output_path.name
-    logger.warning(
-        "resolve_writable_path: %s is missing/uncreatable or not writable; falling back to %s",
-        output_path.parent, fallback_path,
-    )
-    return fallback_path
 
 
 def write_parquet(rows: list[dict], schema: pa.Schema, output_path: Path) -> None:

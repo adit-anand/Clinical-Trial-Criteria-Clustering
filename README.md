@@ -33,9 +33,10 @@ eligibility criterion regardless of `criterion_type` (`inclusion`,
    UMAP step) to additionally compute per-cluster topic keywords plus a
    zero-shot-classification label against a caller-supplied candidate label
    set — BERTopic's own cluster assignments, not the earlier HDBSCAN fit,
-   are what the Optuna objective scores and what gets written. Writes
-   cluster assignments (including each row's original embedding) and metrics.
-   Read/validate/write logic shared between the clustering approaches lives
+   are what the Optuna objective scores and what gets written. Writes only
+   a metrics JSON — no cluster-assignments Parquet (`clustering_scatterplot.py`,
+   step 6, re-fits the winning trial on demand instead when it needs per-row
+   assignments). Read/validate/write logic shared between the clustering approaches lives
    in `amia_2026/clustering/clustering_io.py`; the HDBSCAN fitting/metrics code
    and BERTopic topic-representation layer shared by both reducer-based
    steps live in `amia_2026/clustering/algorithms/hdbscan_model.py` and
@@ -47,9 +48,10 @@ eligibility criterion regardless of `criterion_type` (`inclusion`,
    4, reducing with PaCMAP instead of UMAP. The seed/repeat reproducibility
    mechanics both steps share live in
    `amia_2026/clustering/optimization/reduction_sweep.py`.
-6. **`amia_2026/clustering/clustering_scatterplot.py`** — reads whichever
-   clustering method's output paths are passed to it and writes an
-   interactive HTML scatterplot of its criteria in a 2-dimensional UMAP
+6. **`amia_2026/clustering/clustering_scatterplot.py`** — re-fits whichever
+   clustering method's winning trial the given metrics JSON points to
+   (steps 4-5 write no cluster-assignments Parquet of their own) and writes
+   an interactive HTML scatterplot of its criteria in a 2-dimensional UMAP
    space (colored by cluster), reusing that method's own optimal-run seed
    for the projection.
 7. **`amia_2026/clustering/clustering_review.py`** — a combined step that runs
@@ -57,7 +59,7 @@ eligibility criterion regardless of `criterion_type` (`inclusion`,
    whichever methodology has the higher composite objective score (ties
    favor PaCMAP+HDBSCAN), resolving every path the scatterplot step needs
    from the metrics JSON the report step already read — no
-   `--method`/`--assignments-path`/`--embeddings-path` re-entry. Steps 3
+   `--method`/`--embeddings-path` re-entry. Steps 3
    and 6 are untouched and still work standalone; this is purely additive.
 8. **`amia_2026/clustering/generate_cluster_labels.py`** — a standalone,
    read-only script that re-fits a reducer's winning (or an explicitly
@@ -228,7 +230,7 @@ also set:
 HF_TOKEN=your-token-here
 ```
 
-Steps 4-5's winning-trial LLM relabeling (see below) and step 8's standalone
+Step 6's scatterplot LLM relabeling (see below) and step 8's standalone
 cluster labeling both require an Anthropic API key:
 
 ```
@@ -343,7 +345,6 @@ wholesale.
 ```bash
 uv run python -m amia_2026.clustering.umap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --assignments-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_clusters.parquet \
   --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
   --candidate-labels "oncology eligibility,treatment history,disease measurement"
 ```
@@ -383,21 +384,15 @@ metric (`relative_validity_index`/`bertopic_quality_metrics`, including
 `zeroshot_label_confidence_rate`) and the Optuna objective are scored from —
 nothing below changes any of that.
 
-Once the winning trial is already selected and scored, its topic *labels*
-only (not its cluster assignments, not its keywords) are overwritten by a
-second, two-stage Anthropic-LLM pass: **primary summarization** sends each
-cluster's own top-50 eligibility criteria (by `cluster_probability`,
-descending) to `--llm-model`, asking for a single overarching theme of 5
-words or fewer; **secondary summarization** then sends every cluster's
-primary theme together in one call, asking for final labels that are
-semantically distinct from each other (also 5 words or fewer) — distinctness
-can only be judged across clusters at once, so this stage is never split
-per-cluster. `--candidate-labels` is reused as soft guidance for both LLM
-calls. `--primary-summary-prompt-path`/`--secondary-summary-prompt-path`
-point at the system prompt used for each stage (defaults under
-`config/llm_prompts/`). If this pass fails for any reason, the run falls
-back to the zero-shot label rather than aborting. This is what the winning
-trial's output (below) actually reports.
+Once the winning trial is already selected and scored, its topics are
+written out exactly as `ZeroShotClassification` produced them — this step
+never calls out to an LLM itself. A second, two-stage Anthropic-LLM
+relabeling pass (**primary summarization** per cluster, then **secondary
+summarization** across all clusters for semantic distinctness) does exist,
+but it now runs inside step 6's scatterplot rendering instead, over this
+step's already-written output, purely for that plot's own legend — see
+step 6 below for its mechanics. This step's own output (below) always
+reports the plain zero-shot labels.
 
 Within one trial, two things happen nested:
 
@@ -425,22 +420,15 @@ study rather than starting over, and the configured `n_trials` (default
 every invocation. A full per-trial history CSV is written under the YAML
 file's `results_dir` (`data/clustering/reports/` by default) on every run.
 
-It writes cluster assignments and metrics to
-`--assignments-output-path`/`--metrics-output-path`.
+It writes a metrics JSON to `--metrics-output-path` — no cluster-assignments
+Parquet is written by this step. Per-row cluster assignments for the
+winning trial (criterion text/cluster id/cluster probability) are instead
+re-fit on demand, directly from this run's own resumable Optuna study, by
+whatever later needs them (`clustering_scatterplot.py`, see step 6 below;
+`generate_cluster_labels.py`/`verify_trial_reproducibility.py`, steps 8 and
+the diagnostic below, already worked this way).
 
-The cluster-assignments Parquet file has one row per successfully-embedded
-criterion, containing `nct_id`, `study_first_posted_date`, `criterion_text`,
-`criterion_type`, `cluster_id` (`-1` for BERTopic's own outlier/noise
-topic), `cluster_probability` (`0.0` for noise points), `embedding` (that
-row's original, pre-reduction embedding vector, carried through verbatim
-from the input Parquet — independently joinable/usable without re-reading
-the input embeddings file), `embedding_backend`, `embedding_model`,
-`clustered_at`, `topic_keywords` (BERTopic's own per-topic keywords,
-unaffected by LLM relabeling), and `topic_label` (the LLM-relabeled theme
-for the winning trial — see above; noise rows keep their original
-zero-shot-derived label, since noise is never sent to the LLM) — every row
-sharing a `cluster_id` carries that cluster's own topic representation,
-including noise rows. The metrics JSON reports run provenance (sample/cluster counts,
+The metrics JSON reports run provenance (sample/cluster counts,
 `noise_count`/`noise_fraction`) plus clustering performance metrics
 computed from BERTopic's own cluster assignments — silhouette score, the
 Davies-Bouldin index, the Calinski-Harabasz index (computed only over
@@ -448,13 +436,12 @@ non-noise points), `relative_validity_index` (DBCV), `winning_umap_config`,
 `winning_seed`, `winning_seed_noise_fraction_std`, `dr_metrics`
 (trustworthiness/continuity/steadiness/cohesiveness for the winning trial's
 UMAP output), `topics` (one entry per cluster/topic id, each with its
-keywords, LLM-relabeled label, and member count), `candidate_labels`/
+keywords, zero-shot label, and member count), `candidate_labels`/
 `zeroshot_model` (what the per-trial zero-shot layer was configured with —
-`candidate_labels` also doubles as the LLM relabeling pass's guidance
-list), `llm_relabeling` (the `--llm-model`/prompt-path values that pass was
-configured with), and `optuna_study_summary`/`objective_weights` (trial
-counts by status, the winning trial number/score, the study/trial-history
-file paths, and the weights actually used).
+`candidate_labels` is also what step 6 later reuses as its own LLM
+relabeling pass's guidance list), and `optuna_study_summary`/
+`objective_weights` (trial counts by status, the winning trial number/score,
+the study/trial-history file paths, and the weights actually used).
 
 A trial is only considered fully valid if its resulting cluster count
 falls between `HDBSCANClusterer.MIN_N_CLUSTERS` (`10`) and `MAX_N_CLUSTERS`
@@ -484,14 +471,10 @@ error before any trial runs.
 | Argument                           | Required | Description                                                                 |
 | ----------------------------------- | -------- | ---------------------------------------------------------------------------- |
 | `--input-path`                       | yes      | Input embeddings Parquet path (as written by `criteria_embedding.py`). |
-| `--assignments-output-path`          | yes      | Output cluster-assignments Parquet path. |
-| `--metrics-output-path`              | yes      | Output metrics JSON path. |
+| `--metrics-output-path`              | yes      | Output metrics JSON path (no cluster-assignments Parquet is written by this step). |
 | `--config-path`                      | no       | Optuna search config YAML (combined UMAP + HDBSCAN search space, objective weights, trial budget, reproducibility seeds/repeats); default: `config/umap_hdbscan_optuna.yaml`. |
-| `--candidate-labels`                 | yes      | Comma-separated candidate topic labels. Drives every trial's BERTopic zero-shot classification layer, and is reused as soft guidance for the winning trial's LLM relabeling, e.g. `"oncology eligibility,treatment history,disease measurement"`. |
+| `--candidate-labels`                 | yes      | Comma-separated candidate topic labels. Drives every trial's BERTopic zero-shot classification layer; also written to the metrics JSON, where step 6's scatterplot later reuses it as soft guidance for its own LLM relabeling pass, e.g. `"oncology eligibility,treatment history,disease measurement"`. |
 | `--zeroshot-model`                   | no       | HuggingFace zero-shot-classification model id for the per-trial layer (default: `facebook/bart-large-mnli`). |
-| `--llm-model`                        | no       | Anthropic model id for the winning trial's two-stage LLM relabeling pass (default: `claude-haiku-5-5`); requires `ANTHROPIC_API_KEY` in `.env`. |
-| `--primary-summary-prompt-path`      | no       | Text file with the primary-summarization system prompt (default: `config/llm_prompts/primary_summary_prompt.txt`). |
-| `--secondary-summary-prompt-path`    | no       | Text file with the secondary-summarization system prompt (default: `config/llm_prompts/secondary_summary_prompt.txt`). |
 | `--log-file`                         | no       | If given, also append logs to this file, in addition to the console. |
 
 ## 5. PaCMAP + HDBSCAN + BERTopic clustering
@@ -499,7 +482,6 @@ error before any trial runs.
 ```bash
 uv run python -m amia_2026.clustering.pacmap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --assignments-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_clusters.parquet \
   --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json \
   --candidate-labels "oncology eligibility,treatment history,disease measurement"
 ```
@@ -523,25 +505,20 @@ reproducibility mechanics, the BERTopic topic-representation layer, the
 composite objective (DBCV plus trustworthiness/continuity/steadiness/
 cohesiveness via `zadu` under cosine distance, folded with the same
 degenerate-result penalties), study resumability, trial-history export, and
-overwrite-on-rerun behavior — is identical to step 4. It writes cluster
-assignments and metrics to `--assignments-output-path`/`--metrics-output-path`,
-with the cluster-assignments schema and metrics JSON shape (as
-`winning_pacmap_config` instead of `winning_umap_config`) otherwise
-identical to step 4's.
+overwrite-on-rerun behavior — is identical to step 4. It writes a metrics
+JSON to `--metrics-output-path` (no cluster-assignments Parquet, same as
+step 4), with the metrics JSON shape (as `winning_pacmap_config` instead of
+`winning_umap_config`) otherwise identical to step 4's.
 
 ### Arguments
 
 | Argument                           | Required | Description                                                                 |
 | ----------------------------------- | -------- | ---------------------------------------------------------------------------- |
 | `--input-path`                       | yes      | Input embeddings Parquet path (as written by `criteria_embedding.py`). |
-| `--assignments-output-path`          | yes      | Output cluster-assignments Parquet path. |
-| `--metrics-output-path`              | yes      | Output metrics JSON path. |
+| `--metrics-output-path`              | yes      | Output metrics JSON path (no cluster-assignments Parquet is written by this step). |
 | `--config-path`                      | no       | Optuna search config YAML (combined PaCMAP + HDBSCAN search space, objective weights, trial budget, reproducibility seeds/repeats); default: `config/pacmap_hdbscan_optuna.yaml`. |
-| `--candidate-labels`                 | yes      | Comma-separated candidate topic labels. Drives every trial's BERTopic zero-shot classification layer, and is reused as soft guidance for the winning trial's LLM relabeling, e.g. `"oncology eligibility,treatment history,disease measurement"`. |
+| `--candidate-labels`                 | yes      | Comma-separated candidate topic labels. Drives every trial's BERTopic zero-shot classification layer; also written to the metrics JSON, where step 6's scatterplot later reuses it as soft guidance for its own LLM relabeling pass, e.g. `"oncology eligibility,treatment history,disease measurement"`. |
 | `--zeroshot-model`                   | no       | HuggingFace zero-shot-classification model id for the per-trial layer (default: `facebook/bart-large-mnli`). |
-| `--llm-model`                        | no       | Anthropic model id for the winning trial's two-stage LLM relabeling pass (default: `claude-haiku-5-5`); requires `ANTHROPIC_API_KEY` in `.env`. |
-| `--primary-summary-prompt-path`      | no       | Text file with the primary-summarization system prompt (default: `config/llm_prompts/primary_summary_prompt.txt`). |
-| `--secondary-summary-prompt-path`    | no       | Text file with the secondary-summarization system prompt (default: `config/llm_prompts/secondary_summary_prompt.txt`). |
 | `--log-file`                         | no       | If given, also append logs to this file, in addition to the console. |
 
 ## 6. Scatterplot visualization
@@ -550,21 +527,49 @@ identical to step 4's.
 uv run python -m amia_2026.clustering.clustering_scatterplot \
   --method umap_hdbscan \
   --metrics-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
-  --assignments-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_clusters.parquet \
   --embeddings-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_scatterplot.html
 ```
 
-This reads whichever clustering method's output paths are passed to it
-(`--method`, one of `umap_hdbscan`/`pacmap_hdbscan`, plus
-`--metrics-path`/`--assignments-path`) — it never re-runs clustering — and
-writes an interactive HTML scatterplot of those criteria in a 2-dimensional
-UMAP space to `--output-path`, with points colored by cluster (a distinct
-color for the two HDBSCAN-based methods' noise points), a legend mapping
-color to cluster, and a hover tooltip showing each point's criterion text.
-`--embeddings-path` (the original embeddings Parquet) is required — neither
-method persists a reusable 2D projection of its own, so a fresh one is
-always fit from it.
+Steps 4-5 write no cluster-assignments Parquet of their own (see steps 4-5
+above), so this step re-fits the winning trial itself: it locates the same
+resumable Optuna study steps 4-5 would (derived from
+`--embeddings-path`'s filename and `--method`, under `--config-path`'s own
+`study_dir`; default config paths match steps 4-5's), loads the exact trial
+`--metrics-path`'s own `optuna_study_summary.best_trial_number` names as the
+winner, and re-fits its hyperparameters via the same seed/repeat
+reproducibility sweep every trial ran internally — the same re-fit-on-demand
+approach step 8 and the diagnostic below already use. If that re-fit
+doesn't come back with the same status the trial was originally recorded
+with, this step fails loudly rather than rendering a plot with no valid
+cluster assignments.
+
+It then writes an interactive HTML scatterplot of those criteria in a
+2-dimensional UMAP space to `--output-path`, with points colored by cluster
+(a distinct color for the two HDBSCAN-based methods' noise points), a
+legend mapping color to cluster, and a hover tooltip showing each point's
+criterion text. `--embeddings-path` (the original embeddings Parquet) is
+read exactly once, both for the trial re-fit above and to fit this step's
+own fresh 2D projection — neither method persists a reusable projection of
+its own.
+
+Before building the legend, this step also runs the same two-stage
+Anthropic-LLM relabeling pass that used to live inside steps 4-5 themselves
+— **primary summarization** sends each cluster's own top-50 eligibility
+criteria (by `cluster_probability`, descending) to `--llm-model`, asking
+for a single overarching theme of 5 words or fewer; **secondary
+summarization** then sends every cluster's primary theme together in one
+call, asking for final labels that are semantically distinct from each
+other (also 5 words or fewer). It runs over the `topics`/`candidate_labels`
+already recorded in `--metrics-path` and the freshly re-fit cluster
+assignments above — `--metrics-path` is never written back to, so the
+underlying metrics JSON keeps its own plain zero-shot labels. A fresh LLM
+call (and a fresh trial re-fit) is made every time this step runs (nothing
+is cached), and an LLM-relabeling failure (e.g. missing
+`ANTHROPIC_API_KEY`) is logged and falls back to the zero-shot label for
+that cluster rather than aborting the render.
+`--primary-summary-prompt-path`/`--secondary-summary-prompt-path` point at
+the system prompt used for each stage (defaults under `config/llm_prompts/`).
 
 The 2D projection always reuses that method's own "optimal run" seed rather
 than introducing new randomness: `umap_hdbscan`/`pacmap_hdbscan`'s
@@ -579,10 +584,13 @@ HTML file wholesale; there is no append/skip-if-exists/merge behavior.
 | ----------------- | -------- | ---------------------------------------------------------------------------- |
 | `--method`          | yes      | Which clustering method's output to visualize: `umap_hdbscan` or `pacmap_hdbscan`. |
 | `--metrics-path`    | yes      | That method's metrics JSON path. |
-| `--assignments-path`| yes      | That method's cluster-assignments Parquet path (the file whose rows become the plotted points). |
+| `--embeddings-path` | yes      | The same embeddings Parquet originally passed to that method's own `--input-path` — used both to re-fit the winning trial and to fit the fresh 2D projection. |
 | `--output-path`     | yes      | Output HTML path. |
+| `--config-path`     | no       | Optuna search config YAML used to re-fit the winning trial; default: that method's own reducer's default config (same as steps 4-5). |
 | `--seed`            | no       | Override the 2D UMAP projection's seed (default: reuse that method's own optimal-run seed). |
-| `--embeddings-path` | yes      | Embeddings Parquet path to fit the fresh 2D projection from. |
+| `--llm-model`       | no       | Anthropic model id for this step's own two-stage LLM cluster relabeling pass, run for display only (default: `claude-haiku-5-5`); requires `ANTHROPIC_API_KEY` in `.env`. |
+| `--primary-summary-prompt-path`   | no | Text file with the primary-summarization system prompt (default: `config/llm_prompts/primary_summary_prompt.txt`). |
+| `--secondary-summary-prompt-path` | no | Text file with the secondary-summarization system prompt (default: `config/llm_prompts/secondary_summary_prompt.txt`). |
 | `--log-file`        | no       | If given, also append logs to this file, in addition to the console. |
 
 ## 7. Combined report + scatterplot
@@ -599,17 +607,21 @@ This chains steps 3 and 6 automatically: it generates the same report as
 step 3, then renders step 6's scatterplot for whichever methodology has the
 higher composite objective score (`optuna_study_summary.best_score`, already
 surfaced in the report's "Best by composite score" Summary line and Shared
-Metrics table), with ties resolved in favor of PaCMAP+HDBSCAN. Every path
-the scatterplot step needs (`--assignments-path`/`--embeddings-path`) is
-resolved automatically from the winning methodology's own metrics JSON —
-there is no `--method` or path flag to
-pass for the scatterplot half of this command. Pass only whichever
-`--<algorithm>-metrics-path` flag(s) you have; the report is always written
-even if no methodology qualifies for a scatterplot (e.g. both omitted, both
-invalid, or both from an older schema without a composite score) — a clear
-reason is logged and the command does not fail. Steps 3 and 6 themselves are
-untouched and remain usable standalone, including for cases this command
-doesn't cover (such as visualizing the lower-scoring methodology on demand).
+Metrics table), with ties resolved in favor of PaCMAP+HDBSCAN. The
+`--embeddings-path` the scatterplot step needs (for both its own winning-trial
+re-fit and its fresh 2D projection — see step 6 above) is resolved
+automatically from the winning methodology's own metrics JSON's `input_path`
+field — there is no `--method` or path flag to pass for the scatterplot half
+of this command. Pass only whichever `--<algorithm>-metrics-path` flag(s)
+you have; the report is always written even if no methodology qualifies for
+a scatterplot (e.g. both omitted, both invalid, or both from an older
+schema without a composite score), and even if the winning methodology's
+own trial re-fit fails — a clear reason is logged and the command does not
+fail. Steps 3 and 6 themselves are untouched and remain usable standalone,
+including for cases this command doesn't cover (such as visualizing the
+lower-scoring methodology on demand).
+`--llm-model`/`--primary-summary-prompt-path`/`--secondary-summary-prompt-path`
+are forwarded verbatim to step 6's own (display-only) LLM relabeling pass.
 
 ### Arguments
 
@@ -620,6 +632,9 @@ doesn't cover (such as visualizing the lower-scoring methodology on demand).
 | `--report-path`      | yes      | Output Markdown report path. |
 | `--scatterplot-path` | yes      | Output HTML scatterplot path (written only if a methodology qualifies for selection). |
 | `--print`            | no       | Also print the generated report to stdout. |
+| `--llm-model`        | no       | Anthropic model id, passed through to step 6's own (display-only) LLM relabeling pass (default: `claude-haiku-5-5`); requires `ANTHROPIC_API_KEY` in `.env`. |
+| `--primary-summary-prompt-path`   | no | Passed through to step 6 (default: `config/llm_prompts/primary_summary_prompt.txt`). |
+| `--secondary-summary-prompt-path` | no | Passed through to step 6 (default: `config/llm_prompts/secondary_summary_prompt.txt`). |
 | `--log-file`         | no       | If given, also append logs to this file, in addition to the console. |
 
 ## 8. Standalone cluster labeling
@@ -632,14 +647,16 @@ uv run python -m amia_2026.clustering.generate_cluster_labels \
   --candidate-labels "oncology eligibility,treatment history,disease measurement"
 ```
 
-This is a standalone, read-only alternative to steps 4-5's own LLM
-relabeling pass: it re-fits one reducer's already-tuned Optuna study's
+This is a standalone, read-only alternative to step 6's own (display-only)
+LLM relabeling pass: it re-fits one reducer's already-tuned Optuna study's
 winning hyperparameter configuration directly, skipping BERTopic/zero-shot
-entirely, then LLM-labels the resulting plain-HDBSCAN clusters. Useful on
-its own (no need to re-run the full read-search-write pipeline just to get
-labels for a trial), and in particular for a trial whose own run through
-step 4/5 never wrote output (e.g. a re-evaluation failure) but is still
-on record in the study.
+entirely, then LLM-labels the resulting plain-HDBSCAN clusters, and
+persists those labels to its own output Parquet (unlike step 6's pass,
+which is display-only and never written to disk). Useful on its own (no
+need to re-run the full read-search-write pipeline just to get labels for a
+trial), and in particular for a trial whose own run through step 4/5 never
+wrote output (e.g. a re-evaluation failure) but is still on record in the
+study.
 
 It locates the same resumable Optuna study step 4/5 would (derived from
 `--input-path`'s filename and `--reducer`, under `--config-path`'s own
@@ -693,6 +710,75 @@ wholesale; the Optuna study's own journal file is never written to.
 | `--secondary-summary-prompt-path`    | no       | Text file with the secondary-summarization system prompt (default: `config/llm_prompts/secondary_summary_prompt.txt`). |
 | `--log-file`                         | no       | If given, also append logs to this file, in addition to the console. |
 
+## Diagnostic: verifying trial reproducibility
+
+```bash
+uv run python -m amia_2026.clustering.verify_trial_reproducibility \
+  --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
+  --reducer pacmap \
+  --trial-number 87 \
+  --repeats 20 \
+  --output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_trial_87_reproducibility.parquet
+```
+
+`amia_2026/clustering/verify_trial_reproducibility.py` is a standalone
+diagnostic, not a pipeline step: it never writes to the study's journal
+file and never writes a metrics JSON. Steps 4-5 assume `evaluate_trial` is
+deterministic given the same hyperparameters, and rely on that assumption
+to re-fit the study's best trial once at the end of a run. When a trial
+that was persisted as `"ok"` re-evaluates to a different status, use this
+script to replay that same trial's seed/repeat sweep on demand, with
+`--repeats` repeats per seed instead of whatever the config originally
+used, to see exactly which repeats succeed/fail/disagree and why.
+
+It locates the same resumable Optuna study step 4/5/8 would (derived from
+`--input-path`'s filename and `--reducer`, under `--config-path`'s own
+`study_dir`), loads the trial identified by `--trial-number` from that
+study, and resolves its effective hyperparameters via
+`optuna_search.resolve_trial_hyperparams` rather than using `trial.params`
+directly — for an `"int_ratio"`-kind hyperparameter (e.g. `min_samples`
+relative to `min_cluster_size`), `trial.params` holds the raw sampled
+ratio, not the resolved integer the original fit actually used. It then
+re-runs that trial's seed/repeat sweep (`reduction_sweep.evaluate_config`)
+and logs, per seed, each repeat's status and noise fraction plus that
+seed's noise-fraction standard deviation, and finally the trial's overall
+status and how many repeats were usable across all seeds.
+
+If the trial's winning seed has a usable (`"ok"` or `"degenerate"`)
+representative repeat, this script also writes `--output-path`: one
+Parquet row per successfully-embedded criterion, containing `trial_number`,
+`criterion_text`, that row's original (pre-reduction) `embedding`, and
+`cluster_id` from that representative repeat's own plain-HDBSCAN fit (see
+`TRIAL_REPRODUCIBILITY_PARQUET_SCHEMA`). If every seed errored (no
+representative repeat exists at all), nothing is written to `--output-path`
+and a warning is logged instead.
+
+`--config-path` is the same Optuna search config YAML steps 4/5 use
+(default: that reducer's own default config, `config/umap_hdbscan_optuna.yaml`
+or `config/pacmap_hdbscan_optuna.yaml`) — it is not a place to hand-write
+hyperparameter values. It supplies the search-space definition needed to
+resolve the trial's `int_ratio` parameters correctly, the fixed parameters
+(`metric`/`alpha`/`cluster_selection_epsilon`) shared by every trial, and
+the `reproducibility.seeds`/`repeats_per_seed` this script falls back to
+when `--seeds`/`--repeats` are omitted. The actual hyperparameters being
+validated always come from the recorded trial in the study, identified by
+`--trial-number` — this script has no mode for validating an arbitrary,
+not-yet-recorded hyperparameter combination.
+
+### Arguments
+
+| Argument         | Required | Description                                                                 |
+| ----------------- | -------- | ---------------------------------------------------------------------------- |
+| `--input-path`      | yes      | Embeddings Parquet, the same one originally passed to the reducer pipeline's `--input-path`; also identifies which Optuna study to read. |
+| `--reducer`         | yes      | Which reducer's study/search space to replay against: `pacmap` or `umap`. |
+| `--trial-number`    | yes      | Optuna trial number to replay (see the trial-history CSV or runtime log, e.g. `"Trial 87 finished"`). |
+| `--output-path`     | yes      | Output Parquet path for this trial's own re-fit cluster assignments (`trial_number`/`criterion_text`/`embedding`/`cluster_id`); written only if the trial's winning seed has a usable representative repeat. |
+| `--config-path`     | no       | Optuna search config YAML; default: that reducer's own default config (same as steps 4/5/8). |
+| `--repeats`         | no       | Number of repeats per seed (default: `10`). |
+| `--seeds`           | no       | Comma-separated seeds to use instead of the config's own `reproducibility.seeds`, e.g. `"1,2,3"`. |
+| `--debug`           | no       | Log at DEBUG level, surfacing the full traceback for any repeat that errors. |
+| `--log-file`        | no       | If given, also append logs to this file, in addition to the console. |
+
 ### Example: full pipeline for one condition
 
 Retrieval and embedding run once per condition, covering all criteria types.
@@ -711,13 +797,11 @@ uv run python -m amia_2026.embeddings.criteria_embedding \
 
 uv run python -m amia_2026.clustering.umap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --assignments-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_clusters.parquet \
   --metrics-output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
   --candidate-labels "oncology eligibility,treatment history,disease measurement"
 
 uv run python -m amia_2026.clustering.pacmap_hdbscan_clustering \
   --input-path data/embeddings/breast_cancer_trials_embeddings.parquet \
-  --assignments-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_clusters.parquet \
   --metrics-output-path data/clustering/pacmap_hdbscan/breast_cancer_trials_pacmap_hdbscan_cluster_metrics.json \
   --candidate-labels "oncology eligibility,treatment history,disease measurement"
 
@@ -729,7 +813,6 @@ uv run python -m amia_2026.clustering.clustering_report \
 uv run python -m amia_2026.clustering.clustering_scatterplot \
   --method umap_hdbscan \
   --metrics-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_cluster_metrics.json \
-  --assignments-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_clusters.parquet \
   --embeddings-path data/embeddings/breast_cancer_trials_embeddings.parquet \
   --output-path data/clustering/umap_hdbscan/breast_cancer_trials_umap_hdbscan_scatterplot.html
 ```

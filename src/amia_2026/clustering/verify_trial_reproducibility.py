@@ -22,9 +22,10 @@ into `HDBSCANClusterer` fits a different configuration than the one Optuna
 actually scored; `reduction_hdbscan_pipeline.run` had exactly this bug when
 re-evaluating the study's best trial (now fixed via the same helper).
 
-Read-only: never writes to the study's journal file, never writes
-assignments/metrics output. Only reads the embeddings Parquet and the
-already-existing study.
+Never writes to the study's journal file, and never writes a metrics JSON.
+Reads the embeddings Parquet and the already-existing study; optionally
+writes one Parquet of this trial's own re-fit cluster assignments (see
+`--output-path`/`TRIAL_REPRODUCIBILITY_PARQUET_SCHEMA`).
 """
 
 import argparse
@@ -32,6 +33,7 @@ import logging
 from pathlib import Path
 
 import optuna
+import pyarrow as pa
 
 from amia_2026.logging_utils import configure_logging
 from amia_2026.paths import slug_from_filename
@@ -52,6 +54,19 @@ REDUCER_PLUGINS: dict[str, tuple[ReducerPlugin, Path]] = {
     "pacmap": (pacmap_hdbscan_clustering.PLUGIN, pacmap_hdbscan_clustering.DEFAULT_CONFIG_PATH),
     "umap": (umap_hdbscan_clustering.PLUGIN, umap_hdbscan_clustering.DEFAULT_CONFIG_PATH),
 }
+
+# One row per successfully-embedded criterion: this trial's own re-fit
+# plain-HDBSCAN cluster assignment (see `--output-path`), from the winning
+# seed's representative repeat (the same repeat `reduction_sweep`'s own
+# seed/repeat sweep would pick as "the" result for this trial).
+TRIAL_REPRODUCIBILITY_PARQUET_SCHEMA = pa.schema(
+    [
+        ("trial_number", pa.int32()),
+        ("criterion_text", pa.string()),
+        ("embedding", pa.list_(pa.float32())),
+        ("cluster_id", pa.int32()),
+    ]
+)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -74,6 +89,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config-path", type=Path, default=None,
         help="Optuna search config YAML; defaults to this reducer's own default config",
+    )
+    parser.add_argument(
+        "--output-path", type=Path, required=True,
+        help="Output Parquet path for this trial's own re-fit cluster assignments (trial_number, "
+        "criterion_text, embedding, cluster_id) -- written only if the trial's winning seed has a "
+        "usable ('ok' or 'degenerate') representative repeat",
     )
     parser.add_argument("--repeats", type=int, default=10, help="Number of repeats per seed (default: 10)")
     parser.add_argument(
@@ -102,6 +123,7 @@ def main() -> None:
     filtered = clustering_io.filter_successful_rows(table)
     n_samples = filtered.num_rows
     embedding_matrix = clustering_io.extract_embedding_matrix(filtered)
+    traceability = clustering_io.extract_traceability_columns(filtered)
 
     slug = slug_from_filename(args.input_path.name, "_trials_embeddings.parquet")
     study_name = f"{slug}_{plugin.name}_hdbscan"
@@ -159,6 +181,31 @@ def main() -> None:
     logger.info(
         "verify_trial_reproducibility: trial #%d -> overall status=%s (%d/%d repeat(s) usable across %d seed(s))",
         trial.number, candidate.status, n_usable, n_total, len(seeds),
+    )
+
+    if candidate.winning_seed is None:
+        logger.warning(
+            "verify_trial_reproducibility: trial #%d has no usable seed to re-fit; writing nothing to %s",
+            trial.number, args.output_path,
+        )
+        return
+
+    representative = reduction_sweep.representative_repeat(candidate)
+    criterion_texts = traceability["criterion_text"]
+    embeddings = traceability["embedding"]
+    output_rows = [
+        {
+            "trial_number": trial.number,
+            "criterion_text": criterion_texts[i],
+            "embedding": embeddings[i],
+            "cluster_id": int(representative.labels[i]),
+        }
+        for i in range(n_samples)
+    ]
+    clustering_io.write_parquet(output_rows, TRIAL_REPRODUCIBILITY_PARQUET_SCHEMA, args.output_path)
+    logger.info(
+        "verify_trial_reproducibility: wrote %d row(s) for trial #%d (representative repeat status=%r) -> %s",
+        n_samples, trial.number, representative.status, args.output_path,
     )
 
 

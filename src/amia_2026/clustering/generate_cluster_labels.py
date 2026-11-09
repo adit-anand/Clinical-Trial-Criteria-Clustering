@@ -1,16 +1,17 @@
 """Standalone script: LLM-label one reducer's winning clustering configuration.
 
-Unlike `reduction_hdbscan_pipeline.run` (which fits BERTopic's own
-zero-shot-classification topic layer per trial, then LLM-relabels only the
-winning trial's topics on top of that), this script skips BERTopic/zero-shot
-entirely: it re-fits the winning (or a given) Optuna trial's reducer+HDBSCAN
-configuration directly via `reduction_sweep.evaluate_config`, then runs
-`llm_labeling`'s two-stage Anthropic-LLM pass (prompts under
-`config/llm_prompts/`) straight over the resulting plain-HDBSCAN clusters.
-Useful for getting LLM cluster labels for a trial that never made it through
-the full pipeline's own write step (e.g. its BERTopic refit failed, or -- see
-`reduction_hdbscan_pipeline.run`'s now-fixed re-evaluation step -- its
-hyperparameters were temporarily mis-resolved).
+Unlike `clustering_scatterplot.py` (which runs the same two-stage LLM pass
+over `reduction_hdbscan_pipeline.run`'s already-written BERTopic/zero-shot
+topics, purely for its own plot's display -- never writing the result back
+to disk), this script skips BERTopic/zero-shot entirely: it re-fits the
+winning (or a given) Optuna trial's reducer+HDBSCAN configuration directly
+via `reduction_sweep.evaluate_config`, then runs `llm_labeling`'s two-stage
+Anthropic-LLM pass (prompts under `config/llm_prompts/`) straight over the
+resulting plain-HDBSCAN clusters, and persists the result to its own output
+Parquet. Useful for getting LLM cluster labels for a trial that never made
+it through the full pipeline's own write step (e.g. its BERTopic refit
+failed, or -- see `reduction_hdbscan_pipeline.run`'s now-fixed
+re-evaluation step -- its hyperparameters were temporarily mis-resolved).
 
 Winning-trial resolution mirrors `reduction_hdbscan_pipeline.run`: the
 highest-scoring trial whose own `status` user-attribute is `"ok"`

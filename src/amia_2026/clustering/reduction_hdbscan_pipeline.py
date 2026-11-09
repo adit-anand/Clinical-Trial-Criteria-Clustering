@@ -22,13 +22,18 @@ assignments — not the sweep's earlier plain-HDBSCAN fit — are what the
 Optuna objective scores and what gets written for the winning trial, per
 `_specs/bertopic-clustering.md`.
 
-Once the winning trial is resolved, `run` additionally relabels its topics
-via `llm_labeling.relabel_topics_with_llm` — a two-stage Anthropic-LLM pass
-that overwrites each non-noise topic's `.label` only (never `.keywords`,
-never the Optuna-scored cluster assignments themselves). This pass runs
-exactly once, for the winner alone; every trial's own BERTopic fit (and the
-`zeroshot_label_confidence_rate` term in the Optuna objective) keeps using
-`ZeroShotClassification` completely unaffected by it.
+The winning trial's topics are written with their `ZeroShotClassification`
+labels as-is — this module never calls the two-stage Anthropic-LLM
+relabeling pass. That pass now lives in `clustering_scatterplot.py`, run
+at scatterplot-render time, purely for display; it never writes back to
+this module's own output files (see that module's own docstring).
+
+This module writes only the metrics JSON (and its `KeyBERTInspired`
+sibling) — no cluster-assignments Parquet. Anything needing per-row
+cluster assignments (currently only `clustering_scatterplot.py`) re-fits
+the winning trial on demand from the Optuna study this run leaves behind,
+the same way `verify_trial_reproducibility.py`/`generate_cluster_labels.py`
+already did.
 
 Nothing here branches on which reducer is in use outside of reading from
 `ReducerPlugin` — adding a further reducer means adding one new sibling
@@ -37,7 +42,7 @@ module with its own plugin, not touching this one.
 
 import argparse
 import logging
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -48,12 +53,10 @@ import optuna
 from amia_2026.logging_utils import configure_logging, log_memory_usage
 from amia_2026.paths import label_from_slug, slug_from_filename
 from amia_2026.clustering.algorithms import bertopic_model
-from amia_2026.clustering.algorithms import llm_labeling
 from amia_2026.clustering import clustering_io
 from amia_2026.clustering.optimization import optuna_search
 from amia_2026.clustering.optimization import reduction_sweep
 from amia_2026.clustering.algorithms.hdbscan_model import (
-    HDBSCAN_CLUSTER_PARQUET_SCHEMA,
     HDBSCAN_PARAM_NAMES,
     HDBSCANClusterer,
     compute_relative_validity_index,
@@ -122,7 +125,6 @@ def build_metrics_dict(
     plugin: ReducerPlugin,
     label: str,
     input_path: Path,
-    assignments_output_path: Path,
     n_samples: int,
     n_samples_excluded: int,
     embedding_dim: int,
@@ -145,7 +147,6 @@ def build_metrics_dict(
         plugin: This reducer's `ReducerPlugin`.
         label: Human-readable label for this run, derived from `input_path`'s filename.
         input_path: The embeddings Parquet path that was read.
-        assignments_output_path: Where cluster assignments were written.
         n_samples: Number of successfully-embedded rows reduced/clustered.
         n_samples_excluded: Number of input rows dropped for having failed embeddings.
         embedding_dim: Original (non-reduced) embedding dimensionality.
@@ -171,7 +172,6 @@ def build_metrics_dict(
     base = clustering_io.build_base_metrics_dict(
         label=label,
         input_path=input_path,
-        assignments_output_path=assignments_output_path,
         n_samples=n_samples,
         n_samples_excluded=n_samples_excluded,
         embedding_dim=embedding_dim,
@@ -208,7 +208,6 @@ def build_keybert_metrics_dict(
     plugin: ReducerPlugin,
     label: str,
     input_path: Path,
-    assignments_output_path: Path,
     n_samples: int,
     n_samples_excluded: int,
     embedding_dim: int,
@@ -241,9 +240,6 @@ def build_keybert_metrics_dict(
         plugin: This reducer's `ReducerPlugin`.
         label: Human-readable label for this run, derived from `input_path`'s filename.
         input_path: The embeddings Parquet path that was read.
-        assignments_output_path: Where cluster assignments were written (the
-            same assignments Parquet `build_metrics_dict` points to -- this
-            representation never gets its own).
         n_samples: Number of successfully-embedded rows reduced/clustered.
         n_samples_excluded: Number of input rows dropped for having failed embeddings.
         embedding_dim: Original (non-reduced) embedding dimensionality.
@@ -274,7 +270,6 @@ def build_keybert_metrics_dict(
     base = clustering_io.build_base_metrics_dict(
         label=label,
         input_path=input_path,
-        assignments_output_path=assignments_output_path,
         n_samples=n_samples,
         n_samples_excluded=n_samples_excluded,
         embedding_dim=embedding_dim,
@@ -315,50 +310,45 @@ def build_keybert_metrics_dict(
 def run(
     plugin: ReducerPlugin,
     input_path: Path,
-    assignments_output_path: Path,
     metrics_output_path: Path,
     config_path: Path,
     candidate_labels: list[str],
     zeroshot_model: str,
-    llm_model: str,
-    primary_summary_prompt_path: Path,
-    secondary_summary_prompt_path: Path,
-) -> tuple[Path, Path, Path] | None:
+) -> tuple[Path, Path] | None:
     """Run the full read-search-write pipeline for one reducer.
+
+    No cluster-assignments Parquet is written by this pipeline — only the
+    metrics JSON described below. `clustering_scatterplot.py` (and anything
+    else that needs per-row cluster assignments) re-fits the winning trial
+    itself directly from the Optuna study this run leaves behind, rather
+    than reading a persisted assignments file (see that module's own
+    docstring); `verify_trial_reproducibility.py`/`generate_cluster_labels.py`
+    already followed this same re-fit-on-demand pattern.
 
     Args:
         plugin: This reducer's `ReducerPlugin`.
         input_path: Embeddings Parquet to read.
-        assignments_output_path: Where to write cluster assignments.
         metrics_output_path: Where to write metrics.
         config_path: YAML config (combined reducer + HDBSCAN search space,
             objective weights, trial budget, reproducibility seeds/repeats,
             study/report directories) — see `optuna_search.load_optuna_config`.
         candidate_labels: Candidate topic labels for BERTopic's zero-shot
             classification layer (see `bertopic_model.parse_candidate_labels`);
-            every Optuna trial is still scored against these exactly as
-            before, and the winning trial's final relabeling pass (below)
-            also reuses this same list as soft guidance for both LLM calls.
+            every Optuna trial is scored against these. Also written verbatim
+            to the metrics JSON's own `candidate_labels` field, where
+            `clustering_scatterplot.py` reads it back as soft guidance for its
+            own (display-only) LLM relabeling pass.
         zeroshot_model: HuggingFace zero-shot-classification model id for
             that same per-trial layer.
-        llm_model: Anthropic model id for the winning trial's two-stage LLM
-            relabeling pass (see `llm_labeling.relabel_topics_with_llm`).
-        primary_summary_prompt_path: File containing the primary-summarization
-            system prompt (see `llm_labeling.primary_summarize`).
-        secondary_summary_prompt_path: File containing the secondary-summarization
-            system prompt (see `llm_labeling.secondary_summarize`).
 
     Returns:
-        `(assignments_output_path, metrics_output_path,
-        keybert_metrics_output_path)` — the actual paths written, i.e. each
-        `*_output_path` argument of the same name, plus the sibling path the
-        second (`KeyBERTInspired`-representation) metrics JSON was written
-        to (or was meant to be written to, if that pass itself failed -- see
-        this function's body). Cluster assignments (including each row's
-        original embedding -- see `HDBSCANClusterer.build_assignment_rows`)
-        are always written for the winning configuration. The whole tuple is
-        `None` if every trial in the study was invalid (nothing ever fit --
-        nothing is written in that case).
+        `(metrics_output_path, keybert_metrics_output_path)` — the actual
+        paths written, i.e. `metrics_output_path` itself plus the sibling
+        path the second (`KeyBERTInspired`-representation) metrics JSON was
+        written to (or was meant to be written to, if that pass itself
+        failed -- see this function's body). `None` if every trial in the
+        study was invalid (nothing ever fit -- nothing is written in that
+        case).
 
     Raises:
         FileNotFoundError: If the input Parquet or `config_path` does not exist.
@@ -611,51 +601,14 @@ def run(
     bertopic_result: bertopic_model.BERTopicFitResult = winner["bertopic_result"]
     hdbscan_clusterer = build_hdbscan_clusterer(winner["hyperparams"])
 
-    # Two-stage LLM relabeling of the winning trial's topics only -- never
-    # run per-trial, and never touches `metrics_result`/`relative_validity`/
-    # `bertopic_quality` (already computed above from the original
-    # zero-shot-scored `.labels`/`.probabilities`, which this leaves
-    # untouched). Only `.topics[].label` is replaced; a failure here falls
-    # back to the zero-shot labels rather than aborting the whole run.
-    try:
-        new_topics = llm_labeling.relabel_topics_with_llm(
-            criterion_texts, bertopic_result.labels, bertopic_result.probabilities, bertopic_result.topics,
-            candidate_labels, llm_model, primary_summary_prompt_path, secondary_summary_prompt_path,
-        )
-        bertopic_result = replace(bertopic_result, topics=new_topics)
-    except MemoryError:
-        logger.error("run: LLM-based cluster relabeling raised MemoryError for %r; keeping zero-shot labels", label)
-        log_memory_usage(logger, "run: after MemoryError during LLM relabeling", level=logging.ERROR)
-    except Exception:
-        logger.exception("run: LLM-based cluster relabeling failed for %r; keeping zero-shot labels", label)
-
     clustered_at = datetime.now(timezone.utc)
-
-    # Cluster assignments are always written for the winning configuration --
-    # every downstream consumer (the report, the scatter plot's points/
-    # labels, the KeyBERT-representation pass) needs per-data-point
-    # assignments. Each row's original (pre-reduction) embedding is written
-    # alongside it (see `HDBSCANClusterer.build_assignment_rows`), so this
-    # file is independently usable without re-joining the input embeddings
-    # file. If the configured --assignments-output-path's directory is
-    # missing/uncreatable or not writable, fall back to the current working
-    # directory rather than losing this artifact entirely -- every later
-    # reference to `assignments_output_path` (the metrics JSON, run()'s
-    # return value, the log line below) uses this same, possibly-reassigned
-    # path.
-    assignments_output_path = clustering_io.resolve_writable_path(assignments_output_path)
-    assignment_rows = hdbscan_clusterer.build_assignment_rows(
-        filtered, bertopic_result.labels, bertopic_result.probabilities, bertopic_result.topics, clustered_at
-    )
-    clustering_io.write_parquet(assignment_rows, HDBSCAN_CLUSTER_PARQUET_SCHEMA, assignments_output_path)
 
     # A second, directly comparable topic-representation result for this same
     # winning partition -- `KeyBERTInspired` + an English-stop-word-filtered
     # vocabulary, via `update_topics()`, instead of `ZeroShotClassification`.
     # Never affects scoring/the Optuna objective (this runs exactly once, for
     # the already-finalized winner) and never changes `labels`/`probabilities`
-    # -- only a second metrics JSON is written; the assignments Parquet above
-    # is shared by both representations.
+    # -- only a second metrics JSON is written.
     keybert_metrics_output_path = metrics_output_path.with_stem(metrics_output_path.stem + "_keybert_representation")
     try:
         keybert_result = bertopic_model.fit_bertopic_topics_keybert(
@@ -688,7 +641,6 @@ def run(
         plugin,
         label=label,
         input_path=input_path,
-        assignments_output_path=assignments_output_path,
         n_samples=n_samples,
         n_samples_excluded=n_excluded,
         embedding_dim=embedding_dim,
@@ -721,11 +673,6 @@ def run(
         "best_score": best_trial.value,
     }
     metrics_dict["objective_weights"] = asdict(config.objective_weights)
-    metrics_dict["llm_relabeling"] = {
-        "model": llm_model,
-        "primary_summary_prompt_path": clustering_io.relative_to_repo_root(primary_summary_prompt_path),
-        "secondary_summary_prompt_path": clustering_io.relative_to_repo_root(secondary_summary_prompt_path),
-    }
     if keybert_result is not None:
         metrics_dict["keybert_representation_metrics_output_path"] = clustering_io.relative_to_repo_root(
             keybert_metrics_output_path
@@ -737,7 +684,6 @@ def run(
             plugin,
             label=label,
             input_path=input_path,
-            assignments_output_path=assignments_output_path,
             n_samples=n_samples,
             n_samples_excluded=n_excluded,
             embedding_dim=embedding_dim,
@@ -764,17 +710,16 @@ def run(
         clustering_io.write_json(keybert_metrics_dict, keybert_metrics_output_path)
 
     logger.info(
-        "run: best trial #%d %s config %s (seed=%d) clustered %d row(s) into %d topic(s) for %r -> %s, %s "
+        "run: best trial #%d %s config %s (seed=%d) clustered %d row(s) into %d topic(s) for %r -> %s "
         "(noise=%d/%d (%.1f%%), silhouette=%s, excluded=%d failed-embedding row(s), "
         "trials: %d ok, %d degenerate, %d invalid)",
         best_trial.number, plugin.display_name, candidate.hyperparams, candidate.winning_seed.seed, n_samples,
         winner["metrics_result"]["n_clusters_actual"], label,
-        assignments_output_path, metrics_output_path, winner["metrics_result"]["noise_count"], n_samples,
+        metrics_output_path, winner["metrics_result"]["noise_count"], n_samples,
         winner["metrics_result"]["noise_fraction"] * 100, winner["metrics_result"]["metrics"]["silhouette_score"],
         n_excluded, status_counts["ok"], status_counts["degenerate"], status_counts["invalid"],
     )
     return (
-        assignments_output_path,
         metrics_output_path,
         keybert_metrics_output_path,
     )
@@ -800,12 +745,6 @@ def build_arg_parser(description: str, default_config_path: Path) -> argparse.Ar
         help="Input embeddings Parquet path (as written by criteria_embedding.py)",
     )
     parser.add_argument(
-        "--assignments-output-path",
-        type=Path,
-        required=True,
-        help="Output cluster-assignments Parquet path",
-    )
-    parser.add_argument(
         "--metrics-output-path",
         type=Path,
         required=True,
@@ -822,8 +761,8 @@ def build_arg_parser(description: str, default_config_path: Path) -> argparse.Ar
         type=str,
         required=True,
         help="Comma-separated candidate topic labels. Drives every Optuna trial's BERTopic "
-        "zero-shot classification layer, and is also reused as soft guidance for the winning "
-        "trial's two-stage LLM relabeling (see --llm-model) "
+        "zero-shot classification layer, and is written to the metrics JSON for "
+        "clustering_scatterplot.py's own (display-only) LLM relabeling pass to reuse "
         "(e.g. 'oncology eligibility,treatment history,disease measurement')",
     )
     parser.add_argument(
@@ -832,29 +771,6 @@ def build_arg_parser(description: str, default_config_path: Path) -> argparse.Ar
         default=bertopic_model.DEFAULT_ZEROSHOT_MODEL,
         help="HuggingFace zero-shot-classification model id for BERTopic's per-trial topic-labeling "
         f"layer (default: {bertopic_model.DEFAULT_ZEROSHOT_MODEL})",
-    )
-    parser.add_argument(
-        "--llm-model",
-        type=str,
-        default=llm_labeling.DEFAULT_LLM_MODEL,
-        help="Anthropic model id for the winning trial's two-stage LLM cluster relabeling pass "
-        f"(default: {llm_labeling.DEFAULT_LLM_MODEL}); requires ANTHROPIC_API_KEY in .env",
-    )
-    parser.add_argument(
-        "--primary-summary-prompt-path",
-        type=Path,
-        default=llm_labeling.DEFAULT_PRIMARY_PROMPT_PATH,
-        help="Text file containing the system prompt for primary summarization (one LLM call per "
-        f"cluster, over its own top-{llm_labeling.TOP_N_CRITERIA_PER_CLUSTER} criteria by "
-        f"cluster_probability); default: {llm_labeling.DEFAULT_PRIMARY_PROMPT_PATH}",
-    )
-    parser.add_argument(
-        "--secondary-summary-prompt-path",
-        type=Path,
-        default=llm_labeling.DEFAULT_SECONDARY_PROMPT_PATH,
-        help="Text file containing the system prompt for secondary summarization (one LLM call "
-        f"across every cluster's primary label, for semantic distinctness); default: "
-        f"{llm_labeling.DEFAULT_SECONDARY_PROMPT_PATH}",
     )
     parser.add_argument(
         "--log-file",
@@ -866,7 +782,7 @@ def build_arg_parser(description: str, default_config_path: Path) -> argparse.Ar
 
 
 def main(plugin: ReducerPlugin, description: str, default_config_path: Path) -> None:
-    """Shared CLI entry point: run the Optuna search and write cluster assignments/metrics."""
+    """Shared CLI entry point: run the Optuna search and write metrics."""
     args = build_arg_parser(description, default_config_path).parse_args()
     configure_logging(args.log_file)
     candidate_labels = bertopic_model.parse_candidate_labels(args.candidate_labels)
@@ -874,14 +790,10 @@ def main(plugin: ReducerPlugin, description: str, default_config_path: Path) -> 
     result = run(
         plugin,
         args.input_path,
-        args.assignments_output_path,
         args.metrics_output_path,
         args.config_path,
         candidate_labels,
         args.zeroshot_model,
-        args.llm_model,
-        args.primary_summary_prompt_path,
-        args.secondary_summary_prompt_path,
     )
     if result is None:
         # `run` already logged why (see its own "writing nothing" warnings);
